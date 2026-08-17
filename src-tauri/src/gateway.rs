@@ -49,7 +49,7 @@ async fn not_found() -> Response<Body> {
 }
 
 async fn models(State(core): State<Arc<AppCore>>, headers: HeaderMap) -> Response<Body> {
-    if !is_authorized(&core, &headers) {
+    if authenticated_key_id(&core, &headers).await.is_none() {
         return unauthorized();
     }
     match core.store.routes().await {
@@ -76,9 +76,9 @@ async fn proxy(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response<Body> {
-    if !is_authorized(&core, &headers) {
+    let Some(api_key_id) = authenticated_key_id(&core, &headers).await else {
         return unauthorized();
-    }
+    };
     let started = Instant::now();
     let request_id = Uuid::new_v4().to_string();
     let content_type = headers
@@ -223,11 +223,25 @@ async fn proxy(
                             continue;
                         }
                     };
+                    let stream_core = core.clone();
+                    let stream_request_id = request_id.clone();
                     let stream = async_stream::stream! {
                         let _permit = local_permit;
+                        let mut usage_buffer = Vec::new();
+                        if let Some((input_tokens, output_tokens)) = extract_sse_usage(&mut usage_buffer, &first_chunk) {
+                            let _ = stream_core.store.update_log_usage(&stream_request_id, input_tokens, output_tokens).await;
+                        }
                         yield Ok::<_, std::io::Error>(first_chunk);
                         while let Some(chunk) = upstream_stream.next().await {
-                            yield chunk.map_err(std::io::Error::other);
+                            match chunk {
+                                Ok(chunk) => {
+                                    if let Some((input_tokens, output_tokens)) = extract_sse_usage(&mut usage_buffer, &chunk) {
+                                        let _ = stream_core.store.update_log_usage(&stream_request_id, input_tokens, output_tokens).await;
+                                    }
+                                    yield Ok(chunk);
+                                }
+                                Err(error) => yield Err(std::io::Error::other(error)),
+                            }
                         }
                     };
                     response_from_body(status, content_type, Body::from_stream(stream), &request_id)
@@ -251,21 +265,7 @@ async fn proxy(
                         }
                     };
                     if let Ok(value) = serde_json::from_slice::<Value>(&bytes) {
-                        let usage_value = value.get("usage");
-                        usage.0 = usage_value
-                            .and_then(|usage| {
-                                usage
-                                    .get("prompt_tokens")
-                                    .or_else(|| usage.get("input_tokens"))
-                            })
-                            .and_then(Value::as_i64);
-                        usage.1 = usage_value
-                            .and_then(|usage| {
-                                usage
-                                    .get("completion_tokens")
-                                    .or_else(|| usage.get("output_tokens"))
-                            })
-                            .and_then(Value::as_i64);
+                        usage = usage_from_value(&value);
                         error_code = value
                             .get("error")
                             .and_then(|error| error.get("code"))
@@ -278,6 +278,7 @@ async fn proxy(
                     &core,
                     LogMetadata {
                         id: &request_id,
+                        api_key_id: &api_key_id,
                         endpoint: uri.path(),
                         alias: Some(&alias),
                         target: Some(&target.name),
@@ -302,6 +303,7 @@ async fn proxy(
                         &core,
                         LogMetadata {
                             id: &request_id,
+                            api_key_id: &api_key_id,
                             endpoint: uri.path(),
                             alias: Some(&alias),
                             target: Some(&target.name),
@@ -330,6 +332,7 @@ async fn proxy(
                         &core,
                         LogMetadata {
                             id: &request_id,
+                            api_key_id: &api_key_id,
                             endpoint: uri.path(),
                             alias: Some(&alias),
                             target: Some(&target.name),
@@ -389,6 +392,59 @@ fn join_api_url(base: &str, path: &str) -> String {
     }
 }
 
+fn usage_from_value(value: &Value) -> (Option<i64>, Option<i64>) {
+    let usage = value.get("usage").or_else(|| {
+        value
+            .get("response")
+            .and_then(|response| response.get("usage"))
+    });
+    let input = usage
+        .and_then(|usage| {
+            usage
+                .get("prompt_tokens")
+                .or_else(|| usage.get("input_tokens"))
+        })
+        .and_then(Value::as_i64);
+    let output = usage
+        .and_then(|usage| {
+            usage
+                .get("completion_tokens")
+                .or_else(|| usage.get("output_tokens"))
+        })
+        .and_then(Value::as_i64);
+    (input, output)
+}
+
+fn extract_sse_usage(buffer: &mut Vec<u8>, chunk: &[u8]) -> Option<(Option<i64>, Option<i64>)> {
+    buffer.extend_from_slice(chunk);
+    let mut found = None;
+    while let Some(newline) = buffer.iter().position(|byte| *byte == b'\n') {
+        let mut line = buffer.drain(..=newline).collect::<Vec<_>>();
+        while matches!(line.last(), Some(b'\n' | b'\r')) {
+            line.pop();
+        }
+        let Ok(line) = std::str::from_utf8(&line) else {
+            continue;
+        };
+        let Some(payload) = line.strip_prefix("data:").map(str::trim) else {
+            continue;
+        };
+        if payload == "[DONE]" {
+            continue;
+        }
+        if let Ok(value) = serde_json::from_str::<Value>(payload) {
+            let usage = usage_from_value(&value);
+            if usage.0.is_some() || usage.1.is_some() {
+                found = Some(usage);
+            }
+        }
+    }
+    if buffer.len() > 1024 * 1024 {
+        buffer.clear();
+    }
+    found
+}
+
 fn endpoint_capability(path: &str) -> &'static str {
     match path {
         "/v1/chat/completions" | "/v1/responses" | "/v1/completions" => "chat",
@@ -400,12 +456,13 @@ fn endpoint_capability(path: &str) -> &'static str {
     }
 }
 
-fn is_authorized(core: &AppCore, headers: &HeaderMap) -> bool {
+async fn authenticated_key_id(core: &AppCore, headers: &HeaderMap) -> Option<String> {
     core.authorized(
         headers
             .get(header::AUTHORIZATION)
             .and_then(|value| value.to_str().ok()),
     )
+    .await
 }
 
 fn unauthorized() -> Response<Body> {
@@ -449,6 +506,7 @@ fn response_from_body(
 
 struct LogMetadata<'a> {
     id: &'a str,
+    api_key_id: &'a str,
     endpoint: &'a str,
     alias: Option<&'a str>,
     target: Option<&'a str>,
@@ -474,6 +532,8 @@ async fn log_request(core: &AppCore, metadata: LogMetadata<'_>) {
             input_tokens: metadata.usage.0,
             output_tokens: metadata.usage.1,
             error_code: metadata.error_code.map(str::to_owned),
+            api_key_id: Some(metadata.api_key_id.into()),
+            api_key_name: None,
         })
         .await;
 }
@@ -496,7 +556,9 @@ mod tests {
         let store = Store::memory().await.unwrap();
         let secrets: Arc<dyn SecretStore> = Arc::new(MemorySecrets::default());
         secrets.set(LOCAL_API_KEY, "test-token").unwrap();
-        router(Arc::new(AppCore::new(store, secrets).unwrap()))
+        let core = AppCore::new(store, secrets).unwrap();
+        core.migrate_legacy_local_api_key().await.unwrap();
+        router(Arc::new(core))
     }
 
     #[tokio::test]
@@ -538,6 +600,31 @@ mod tests {
         let rewritten = rewrite_multipart_model(body, "whisper-1");
         assert_eq!(extract_multipart_model(&rewritten), Some("whisper-1"));
         assert!(rewritten.windows(3).any(|window| window == [0, 255, 16]));
+    }
+
+    #[test]
+    fn streaming_usage_parser_handles_split_sse_events() {
+        let mut buffer = Vec::new();
+        assert_eq!(
+            extract_sse_usage(
+                &mut buffer,
+                br#"data: {"choices":[],"usage":{"prompt_tokens":3,"completion"#,
+            ),
+            None
+        );
+        assert_eq!(
+            extract_sse_usage(&mut buffer, b"_tokens\":5}}\n\ndata: [DONE]\n\n"),
+            Some((Some(3), Some(5)))
+        );
+
+        let mut responses_buffer = Vec::new();
+        assert_eq!(
+            extract_sse_usage(
+                &mut responses_buffer,
+                b"data: {\"response\":{\"usage\":{\"input_tokens\":7,\"output_tokens\":11}}}\n\n",
+            ),
+            Some((Some(7), Some(11)))
+        );
     }
 
     #[test]
@@ -627,6 +714,7 @@ mod tests {
         let secrets: Arc<dyn SecretStore> = Arc::new(MemorySecrets::default());
         secrets.set(LOCAL_API_KEY, "test-token").unwrap();
         let core = AppCore::new(store.clone(), secrets).unwrap();
+        core.migrate_legacy_local_api_key().await.unwrap();
         core.local_activity()
             .set_token("first", "runtime-token".into());
         core.local_activity()
@@ -636,6 +724,8 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::OK);
         let logs = store.logs(10).await.unwrap();
+        assert_eq!(logs[0].api_key_id.as_deref(), Some("default"));
+        assert_eq!(logs[0].api_key_name.as_deref(), Some("Default"));
         assert_eq!(logs[0].attempts, 2);
         assert_eq!(logs[0].target.as_deref(), Some("fallback"));
         assert_eq!(

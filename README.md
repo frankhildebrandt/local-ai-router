@@ -10,12 +10,13 @@ A private, OpenAI-compatible model gateway for Apple Silicon Macs. Local AI Rout
 - Stable model aliases with ordered transient-error fallbacks
 - `/v1/models`, Chat Completions, Responses, legacy Completions and Embeddings routing
 - Cloud proxying for Images, Audio and Moderations, including multipart uploads
-- Metadata-only request logs, CSV export and automatic 30-day retention
+- Named local client keys with per-key usage attribution
+- Usage dashboard plus filterable metadata-only request logs, filtered CSV export and automatic 30-day retention
 - Managed MLX/GGUF imports and resumable Hugging Face downloads
 - Resident local model management with a configurable memory budget and idle unloading
 - Native MLX and Metal-enabled llama.cpp sidecars
 
-The gateway listens only on `http://127.0.0.1:11435/v1`. Every `/v1` request requires the local bearer token shown under Settings.
+The gateway listens only on `http://127.0.0.1:11435/v1`. Every `/v1` request requires one of the local bearer tokens managed under Settings.
 
 ## Development
 
@@ -59,7 +60,7 @@ Only configured aliases appear in `client.models.list()`. The alias must adverti
 
 - Provider, Hugging Face and local API tokens are stored only in Keychain.
 - SQLite stores configuration and request metadata, never request/response bodies or authorization headers.
-- The local bearer token is compared in constant time and can be rotated immediately.
+- Local bearer tokens are stored in Keychain, compared in constant time and can be rotated or revoked immediately.
 - The gateway never binds to a LAN address.
 - Imported models are copied into the app-managed Application Support directory.
 
