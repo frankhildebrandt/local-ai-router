@@ -34,7 +34,6 @@ pub fn run() {
                 &database,
                 secrets::shared_keychain(),
             ))?;
-            core.ensure_local_token()?;
             tauri::async_runtime::block_on(core.store.reset_local_runtime_states())?;
             let port = tauri::async_runtime::block_on(core.store.setting("port"))?
                 .and_then(|value| value.parse().ok())
@@ -159,8 +158,12 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             commands::dashboard,
-            commands::get_local_api_key,
+            commands::list_local_api_keys,
+            commands::create_local_api_key,
+            commands::reveal_local_api_key,
+            commands::rename_local_api_key,
             commands::rotate_local_api_key,
+            commands::revoke_local_api_key,
             commands::list_providers,
             commands::save_provider,
             commands::delete_provider,
@@ -177,6 +180,8 @@ pub fn run() {
             commands::save_route,
             commands::delete_route,
             commands::list_logs,
+            commands::get_usage,
+            commands::get_log_facets,
             commands::clear_logs,
             commands::export_logs_csv,
             commands::get_settings,

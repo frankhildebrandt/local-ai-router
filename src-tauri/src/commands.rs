@@ -9,8 +9,10 @@ use crate::{
     domain::{ModelRoute, TargetKind},
     library,
     runtime::{RuntimeManager, RuntimeStatus},
-    secrets::{provider_account, HF_ACCOUNT, LOCAL_API_KEY},
-    storage::{ModelTarget, Provider, RequestLog},
+    secrets::{local_api_key_account, provider_account, HF_ACCOUNT, LOCAL_API_KEY},
+    storage::{
+        LocalApiKey, LogFacets, LogQuery, LogResult, ModelTarget, Provider, Store, UsageData,
+    },
 };
 
 pub struct AppServices {
@@ -29,6 +31,13 @@ pub struct Dashboard {
     pub route_count: usize,
     pub recent_requests: usize,
     pub runtimes: Vec<RuntimeStatus>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct LocalApiKeyWithToken {
+    #[serde(flatten)]
+    pub key: LocalApiKey,
+    pub token: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -85,13 +94,63 @@ pub async fn dashboard(state: State<'_, AppServices>) -> Result<Dashboard, Strin
 }
 
 #[tauri::command]
-pub fn get_local_api_key(state: State<'_, AppServices>) -> Result<String, String> {
-    state.core.ensure_local_token().map_err(err)
+pub async fn list_local_api_keys(
+    state: State<'_, AppServices>,
+) -> Result<Vec<LocalApiKey>, String> {
+    state.core.store.local_api_keys().await.map_err(err)
 }
 
 #[tauri::command]
-pub fn rotate_local_api_key(state: State<'_, AppServices>) -> Result<String, String> {
-    state.core.rotate_local_token().map_err(err)
+pub async fn create_local_api_key(
+    state: State<'_, AppServices>,
+    name: String,
+) -> Result<LocalApiKeyWithToken, String> {
+    let (key, token) = state.core.create_local_api_key(&name).await.map_err(err)?;
+    Ok(LocalApiKeyWithToken { key, token })
+}
+
+#[tauri::command]
+pub async fn reveal_local_api_key(
+    state: State<'_, AppServices>,
+    id: String,
+) -> Result<String, String> {
+    let key = state
+        .core
+        .store
+        .local_api_key(&id)
+        .await
+        .map_err(err)?
+        .ok_or("local API key not found")?;
+    if key.revoked_at.is_some() {
+        return Err("local API key is revoked".into());
+    }
+    state.core.reveal_local_api_key(&id).map_err(err)
+}
+
+#[tauri::command]
+pub async fn rename_local_api_key(
+    state: State<'_, AppServices>,
+    id: String,
+    name: String,
+) -> Result<LocalApiKey, String> {
+    state
+        .core
+        .rename_local_api_key(&id, &name)
+        .await
+        .map_err(err)
+}
+
+#[tauri::command]
+pub async fn rotate_local_api_key(
+    state: State<'_, AppServices>,
+    id: String,
+) -> Result<String, String> {
+    state.core.rotate_local_api_key(&id).await.map_err(err)
+}
+
+#[tauri::command]
+pub async fn revoke_local_api_key(state: State<'_, AppServices>, id: String) -> Result<(), String> {
+    state.core.revoke_local_api_key(&id).await.map_err(err)
 }
 
 #[tauri::command]
@@ -354,14 +413,24 @@ pub async fn delete_route(state: State<'_, AppServices>, alias: String) -> Resul
 #[tauri::command]
 pub async fn list_logs(
     state: State<'_, AppServices>,
-    limit: Option<i64>,
-) -> Result<Vec<RequestLog>, String> {
+    query: Option<LogQuery>,
+) -> Result<LogResult, String> {
     state
         .core
         .store
-        .logs(limit.unwrap_or(250))
+        .query_logs(&query.unwrap_or_default())
         .await
         .map_err(err)
+}
+
+#[tauri::command]
+pub async fn get_usage(state: State<'_, AppServices>, period: String) -> Result<UsageData, String> {
+    state.core.store.usage(&period).await.map_err(err)
+}
+
+#[tauri::command]
+pub async fn get_log_facets(state: State<'_, AppServices>) -> Result<LogFacets, String> {
+    state.core.store.log_facets().await.map_err(err)
 }
 
 #[tauri::command]
@@ -370,13 +439,38 @@ pub async fn clear_logs(state: State<'_, AppServices>) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub async fn export_logs_csv(state: State<'_, AppServices>, path: String) -> Result<(), String> {
-    let logs = state.core.store.logs(1000).await.map_err(err)?;
-    let mut csv = String::from("id,created_at,endpoint,alias,target,attempts,status,latency_ms,input_tokens,output_tokens,error_code\n");
+pub async fn export_logs_csv(
+    state: State<'_, AppServices>,
+    path: String,
+    query: Option<LogQuery>,
+) -> Result<(), String> {
+    let csv = logs_csv(&state.core.store, query.unwrap_or_default())
+        .await
+        .map_err(err)?;
+    tokio::fs::write(path, csv).await.map_err(err)
+}
+
+async fn logs_csv(store: &Store, mut query: LogQuery) -> anyhow::Result<String> {
+    query.limit = Some(500);
+    query.offset = Some(0);
+    let mut logs = Vec::new();
+    loop {
+        let page = store.query_logs(&query).await?;
+        let page_len = page.items.len();
+        logs.extend(page.items);
+        if logs.len() as i64 >= page.total || page_len == 0 {
+            break;
+        }
+        query.offset = Some(logs.len() as i64);
+    }
+    let mut csv = String::from("id,created_at,api_key_id,api_key_name,endpoint,alias,target,attempts,status,latency_ms,input_tokens,output_tokens,error_code\n");
     for log in logs {
         let values = [
             log.id,
             log.created_at.to_rfc3339(),
+            log.api_key_id.unwrap_or_default(),
+            log.api_key_name
+                .unwrap_or_else(|| "Unknown / Legacy".into()),
             log.endpoint,
             log.alias.unwrap_or_default(),
             log.target.unwrap_or_default(),
@@ -396,7 +490,7 @@ pub async fn export_logs_csv(state: State<'_, AppServices>, path: String) -> Res
         );
         csv.push('\n');
     }
-    tokio::fs::write(path, csv).await.map_err(err)
+    Ok(csv)
 }
 
 #[tauri::command]
@@ -465,7 +559,9 @@ fn csv_cell(mut value: String) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::csv_cell;
+    use super::{csv_cell, logs_csv};
+    use crate::storage::{LogQuery, RequestLog, Store};
+    use chrono::Utc;
 
     #[test]
     fn csv_export_neutralizes_spreadsheet_formulas() {
@@ -473,6 +569,61 @@ mod tests {
             csv_cell("=HYPERLINK(\"bad\")".into()),
             "\"'=HYPERLINK(\"\"bad\"\")\""
         );
+    }
+
+    #[tokio::test]
+    async fn csv_export_uses_filters_and_is_not_limited_to_one_page() {
+        let store = Store::memory().await.unwrap();
+        for index in 0..501 {
+            store
+                .insert_log(&RequestLog {
+                    id: format!("kept-{index}"),
+                    created_at: Utc::now(),
+                    endpoint: "/v1/chat/completions".into(),
+                    alias: Some("keep".into()),
+                    target: Some("cloud".into()),
+                    attempts: 1,
+                    status: 200,
+                    latency_ms: 5,
+                    input_tokens: Some(1),
+                    output_tokens: Some(1),
+                    error_code: None,
+                    api_key_id: None,
+                    api_key_name: None,
+                })
+                .await
+                .unwrap();
+        }
+        store
+            .insert_log(&RequestLog {
+                id: "excluded".into(),
+                created_at: Utc::now(),
+                endpoint: "/v1/embeddings".into(),
+                alias: Some("drop".into()),
+                target: Some("cloud".into()),
+                attempts: 1,
+                status: 500,
+                latency_ms: 5,
+                input_tokens: None,
+                output_tokens: None,
+                error_code: None,
+                api_key_id: None,
+                api_key_name: None,
+            })
+            .await
+            .unwrap();
+
+        let csv = logs_csv(
+            &store,
+            LogQuery {
+                alias: Some("keep".into()),
+                ..LogQuery::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(csv.lines().count(), 502);
+        assert!(!csv.contains("excluded"));
     }
 }
 
@@ -497,6 +648,21 @@ pub async fn forget_all_credentials(state: State<'_, AppServices>) -> Result<(),
             .secrets
             .delete(&provider_account(&provider.id))
             .map_err(err)?;
+    }
+    for key in state.core.store.local_api_keys().await.map_err(err)? {
+        state
+            .core
+            .secrets
+            .delete(&local_api_key_account(&key.id))
+            .map_err(err)?;
+        if key.revoked_at.is_none() {
+            state
+                .core
+                .store
+                .revoke_local_api_key(&key.id)
+                .await
+                .map_err(err)?;
+        }
     }
     state.core.secrets.delete(HF_ACCOUNT).map_err(err)?;
     state.core.secrets.delete(LOCAL_API_KEY).map_err(err)

@@ -59,6 +59,7 @@ async fn main() -> anyhow::Result<()> {
     let secrets: Arc<dyn SecretStore> = Arc::new(MemorySecrets::default());
     secrets.set(LOCAL_API_KEY, "contract-token")?;
     let core = AppCore::new(store, secrets)?;
+    core.migrate_legacy_local_api_key().await?;
     core.local_activity()
         .set_token("contract-target", "runtime-token".into());
     let core = Arc::new(core);

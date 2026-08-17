@@ -16,8 +16,10 @@ use subtle::ConstantTimeEq;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::{
-    secrets::{generate_local_token, provider_account, SecretStore, LOCAL_API_KEY},
-    storage::{ModelTarget, Provider, Store},
+    secrets::{
+        generate_local_token, local_api_key_account, provider_account, SecretStore, LOCAL_API_KEY,
+    },
+    storage::{LocalApiKey, ModelTarget, Provider, Store},
 };
 
 #[derive(Clone)]
@@ -114,7 +116,13 @@ pub struct ServerStatus {
 impl AppCore {
     pub async fn open(path: &Path, secrets: Arc<dyn SecretStore>) -> anyhow::Result<Self> {
         let store = Store::open(path).await?;
-        Self::new(store, secrets)
+        let core = Self::new(store, secrets)?;
+        core.migrate_legacy_local_api_key().await?;
+        if core.store.local_api_keys().await?.is_empty() {
+            core.create_local_api_key("Default").await?;
+        }
+        core.cleanup_revoked_local_api_key_secrets().await;
+        Ok(core)
     }
 
     pub fn new(store: Store, secrets: Arc<dyn SecretStore>) -> anyhow::Result<Self> {
@@ -136,31 +144,143 @@ impl AppCore {
         }
     }
 
-    pub fn ensure_local_token(&self) -> anyhow::Result<String> {
-        if let Some(token) = self.secrets.get(LOCAL_API_KEY)? {
-            return Ok(token);
+    pub async fn migrate_legacy_local_api_key(&self) -> anyhow::Result<()> {
+        if self.store.local_api_key("default").await?.is_some() {
+            return Ok(());
         }
+        let Some(token) = self.secrets.get(LOCAL_API_KEY)? else {
+            return Ok(());
+        };
+        let key = LocalApiKey {
+            id: "default".into(),
+            name: "Default".into(),
+            created_at: chrono::Utc::now(),
+            last_used_at: None,
+            revoked_at: None,
+        };
+        let account = local_api_key_account(&key.id);
+        self.secrets.set(&account, &token)?;
+        if let Err(error) = self
+            .store
+            .insert_local_api_key(&key, &token_hash(&token))
+            .await
+        {
+            let _ = self.secrets.delete(&account);
+            return Err(error);
+        }
+        self.secrets.delete(LOCAL_API_KEY)?;
+        Ok(())
+    }
+
+    pub async fn create_local_api_key(&self, name: &str) -> anyhow::Result<(LocalApiKey, String)> {
+        let name = validated_key_name(name)?;
+        let key = LocalApiKey {
+            id: uuid::Uuid::new_v4().to_string(),
+            name,
+            created_at: chrono::Utc::now(),
+            last_used_at: None,
+            revoked_at: None,
+        };
         let token = generate_local_token();
-        self.secrets.set(LOCAL_API_KEY, &token)?;
+        let account = local_api_key_account(&key.id);
+        self.secrets.set(&account, &token)?;
+        if let Err(error) = self
+            .store
+            .insert_local_api_key(&key, &token_hash(&token))
+            .await
+        {
+            let _ = self.secrets.delete(&account);
+            return Err(error);
+        }
+        Ok((key, token))
+    }
+
+    pub fn reveal_local_api_key(&self, id: &str) -> anyhow::Result<String> {
+        self.secrets
+            .get(&local_api_key_account(id))?
+            .context("local API key is revoked or missing")
+    }
+
+    pub async fn rename_local_api_key(&self, id: &str, name: &str) -> anyhow::Result<LocalApiKey> {
+        let name = validated_key_name(name)?;
+        if !self.store.rename_local_api_key(id, &name).await? {
+            anyhow::bail!("local API key not found");
+        }
+        self.store
+            .local_api_key(id)
+            .await?
+            .context("local API key not found")
+    }
+
+    pub async fn rotate_local_api_key(&self, id: &str) -> anyhow::Result<String> {
+        let key = self
+            .store
+            .local_api_key(id)
+            .await?
+            .context("local API key not found")?;
+        if key.revoked_at.is_some() {
+            anyhow::bail!("revoked local API keys cannot be rotated");
+        }
+        let account = local_api_key_account(id);
+        let previous = self.secrets.get(&account)?;
+        let token = generate_local_token();
+        self.secrets.set(&account, &token)?;
+        if let Err(error) = self
+            .store
+            .rotate_local_api_key(id, &token_hash(&token))
+            .await
+        {
+            if let Some(previous) = previous {
+                let _ = self.secrets.set(&account, &previous);
+            }
+            return Err(error);
+        }
         Ok(token)
     }
 
-    pub fn rotate_local_token(&self) -> anyhow::Result<String> {
-        let token = generate_local_token();
-        self.secrets.set(LOCAL_API_KEY, &token)?;
-        Ok(token)
+    pub async fn revoke_local_api_key(&self, id: &str) -> anyhow::Result<()> {
+        let key = self
+            .store
+            .local_api_key(id)
+            .await?
+            .context("local API key not found")?;
+        if key.revoked_at.is_none() && !self.store.revoke_local_api_key(id).await? {
+            anyhow::bail!("active local API key not found");
+        }
+        let account = local_api_key_account(id);
+        self.secrets.delete(&account)
     }
 
-    pub fn authorized(&self, authorization: Option<&str>) -> bool {
+    async fn cleanup_revoked_local_api_key_secrets(&self) {
+        if let Ok(keys) = self.store.local_api_keys().await {
+            for key in keys.into_iter().filter(|key| key.revoked_at.is_some()) {
+                let _ = self.secrets.delete(&local_api_key_account(&key.id));
+            }
+        }
+    }
+
+    pub async fn authorized(&self, authorization: Option<&str>) -> Option<String> {
         let Some(candidate) = authorization.and_then(|value| value.strip_prefix("Bearer ")) else {
-            return false;
+            return None;
         };
-        let Ok(Some(expected)) = self.secrets.get(LOCAL_API_KEY) else {
-            return false;
+        let Ok(keys) = self.store.active_local_api_key_hashes().await else {
+            return None;
         };
-        let left = Sha256::digest(candidate.as_bytes());
-        let right = Sha256::digest(expected.as_bytes());
-        left.as_slice().ct_eq(right.as_slice()).into()
+        let candidate_hash = token_hash(candidate);
+        let mut matched = None;
+        for (id, expected_hash) in keys {
+            if candidate_hash
+                .as_slice()
+                .ct_eq(expected_hash.as_slice())
+                .into()
+            {
+                matched = Some(id);
+            }
+        }
+        if let Some(id) = matched.as_deref() {
+            let _ = self.store.touch_local_api_key(id).await;
+        }
+        matched
     }
 
     pub async fn target_endpoint(
@@ -284,10 +404,28 @@ impl AppCore {
     }
 }
 
+fn token_hash(token: &str) -> Vec<u8> {
+    Sha256::digest(token.as_bytes()).to_vec()
+}
+
+fn validated_key_name(name: &str) -> anyhow::Result<String> {
+    let name = name.trim();
+    if name.is_empty() {
+        anyhow::bail!("local API key name is required");
+    }
+    if name.chars().count() > 80 {
+        anyhow::bail!("local API key name must be at most 80 characters");
+    }
+    Ok(name.to_owned())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{domain::TargetKind, secrets::MemorySecrets};
+    use crate::{
+        domain::TargetKind,
+        secrets::{local_api_key_account, MemorySecrets, SecretStore, LOCAL_API_KEY},
+    };
 
     fn local_target() -> ModelTarget {
         ModelTarget {
@@ -303,6 +441,66 @@ mod tests {
             state: "ready".into(),
             size_bytes: None,
         }
+    }
+
+    #[tokio::test]
+    async fn legacy_token_is_migrated_and_multiple_keys_authenticate_independently() {
+        let store = Store::memory().await.unwrap();
+        let secrets: Arc<dyn SecretStore> = Arc::new(MemorySecrets::default());
+        secrets.set(LOCAL_API_KEY, "legacy-token").unwrap();
+        let core = AppCore::new(store, secrets.clone()).unwrap();
+
+        core.migrate_legacy_local_api_key().await.unwrap();
+        core.migrate_legacy_local_api_key().await.unwrap();
+        assert_eq!(core.store.local_api_keys().await.unwrap().len(), 1);
+        let (second, second_token) = core.create_local_api_key("Automation").await.unwrap();
+
+        assert_eq!(
+            core.authorized(Some("Bearer legacy-token"))
+                .await
+                .as_deref(),
+            Some("default")
+        );
+        assert_eq!(
+            core.authorized(Some(&format!("Bearer {second_token}")))
+                .await
+                .as_deref(),
+            Some(second.id.as_str())
+        );
+        assert!(core.authorized(Some("Bearer invalid")).await.is_none());
+
+        let rotated_token = core.rotate_local_api_key(&second.id).await.unwrap();
+        assert!(core
+            .authorized(Some(&format!("Bearer {second_token}")))
+            .await
+            .is_none());
+        assert_eq!(
+            core.authorized(Some(&format!("Bearer {rotated_token}")))
+                .await
+                .as_deref(),
+            Some(second.id.as_str())
+        );
+        assert_eq!(
+            core.reveal_local_api_key(&second.id).unwrap(),
+            rotated_token
+        );
+        assert_eq!(
+            core.rename_local_api_key(&second.id, "Renamed automation")
+                .await
+                .unwrap()
+                .name,
+            "Renamed automation"
+        );
+
+        core.revoke_local_api_key(&second.id).await.unwrap();
+        assert!(core
+            .authorized(Some(&format!("Bearer {rotated_token}")))
+            .await
+            .is_none());
+        assert!(secrets
+            .get(&local_api_key_account(&second.id))
+            .unwrap()
+            .is_none());
     }
 
     #[tokio::test]

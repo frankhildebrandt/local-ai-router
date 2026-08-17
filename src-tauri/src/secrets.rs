@@ -76,6 +76,9 @@ pub fn generate_local_token() -> String {
 }
 
 pub const LOCAL_API_KEY: &str = "local-api-key";
+pub fn local_api_key_account(id: &str) -> String {
+    format!("local-api-key:{id}")
+}
 pub fn provider_account(id: &str) -> String {
     format!("provider:{id}")
 }

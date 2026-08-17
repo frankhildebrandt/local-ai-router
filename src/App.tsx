@@ -2,18 +2,19 @@ import { useCallback, useEffect, useMemo, useState, type FormEvent, type ReactNo
 import { open, save } from "@tauri-apps/plugin-dialog";
 import { enable, disable, isEnabled } from "@tauri-apps/plugin-autostart";
 import {
-  Activity, BookOpen, Box, Check, ChevronRight, CircleAlert, Cloud, Copy, Database,
-  Download, FileDown, Gauge, KeyRound, Layers3, ListRestart, LoaderCircle, Menu,
-  Play, Plus, RefreshCw, Route, Search, Server, Settings, ShieldCheck, Square,
+  Activity, BarChart3, BookOpen, Box, Check, ChevronRight, CircleAlert, Cloud, Copy, Database,
+  Download, Eye, EyeOff, FileDown, Gauge, KeyRound, Layers3, ListRestart, LoaderCircle, Menu,
+  Pencil, Play, Plus, RefreshCw, Route, Search, Server, Settings, ShieldCheck, Square,
   Trash2, X,
 } from "lucide-react";
 import { command, errorMessage, isTauri } from "./api";
-import type { DashboardData, ModelRoute, ModelTarget, Provider, RequestLog, TargetKind } from "./types";
+import type { DashboardData, LocalApiKey, LocalApiKeyWithToken, LogFacets, LogQuery, LogResult, ModelRoute, ModelTarget, Provider, RequestLog, TargetKind, UsageData } from "./types";
 
-type Page = "overview" | "providers" | "cloud" | "local" | "routes" | "logs" | "settings";
+type Page = "overview" | "usage" | "providers" | "cloud" | "local" | "routes" | "logs" | "settings";
 
 const nav: Array<{ page: Page; label: string; icon: typeof Activity }> = [
   { page: "overview", label: "Overview", icon: Gauge },
+  { page: "usage", label: "Usage", icon: BarChart3 },
   { page: "providers", label: "Providers", icon: KeyRound },
   { page: "cloud", label: "Cloud models", icon: Cloud },
   { page: "local", label: "Local models", icon: Box },
@@ -31,6 +32,7 @@ export default function App() {
   const [targets, setTargets] = useState<ModelTarget[]>([]);
   const [routes, setRoutes] = useState<ModelRoute[]>([]);
   const [logs, setLogs] = useState<RequestLog[]>([]);
+  const [localKeys, setLocalKeys] = useState<LocalApiKey[]>([]);
   const [settings, setSettings] = useState<Record<string, string>>({});
   const [notice, setNotice] = useState<{ type: "error" | "success"; text: string } | null>(null);
   const [loading, setLoading] = useState(true);
@@ -39,20 +41,20 @@ export default function App() {
   const refresh = useCallback(async () => {
     if (!isTauri()) { setLoading(false); return; }
     try {
-      const [dash, p, t, r, l, s] = await Promise.all([
+      const [dash, p, t, r, l, s, k] = await Promise.all([
         command<DashboardData>("dashboard"), command<Provider[]>("list_providers"), command<ModelTarget[]>("list_targets"),
-        command<ModelRoute[]>("list_routes"), command<RequestLog[]>("list_logs", { limit: 250 }), command<Record<string, string>>("get_settings"),
+        command<ModelRoute[]>("list_routes"), command<LogResult>("list_logs", { query: { limit: 100 } }), command<Record<string, string>>("get_settings"), command<LocalApiKey[]>("list_local_api_keys"),
       ]);
-      setDashboard(dash); setProviders(p); setTargets(t); setRoutes(r); setLogs(l); setSettings(s);
+      setDashboard(dash); setProviders(p); setTargets(t); setRoutes(r); setLogs(l.items); setSettings(s); setLocalKeys(k);
     } catch (error) { setNotice({ type: "error", text: errorMessage(error) }); }
     finally { setLoading(false); }
   }, []);
 
-  useEffect(() => { void refresh(); const timer = window.setInterval(() => { if (page === "overview" || page === "logs") void refresh(); }, 10_000); return () => clearInterval(timer); }, [refresh, page]);
+  useEffect(() => { void refresh(); const timer = window.setInterval(() => { if (page === "overview" || page === "usage" || page === "logs") void refresh(); }, 10_000); return () => clearInterval(timer); }, [refresh, page]);
 
   const success = (text: string) => { setNotice({ type: "success", text }); window.setTimeout(() => setNotice(null), 3500); };
   const fail = (error: unknown) => setNotice({ type: "error", text: errorMessage(error) });
-  const common = { providers, targets, routes, logs, settings, refresh, success, fail };
+  const common = { providers, targets, routes, logs, localKeys, settings, refresh, success, fail };
 
   return <div className="shell">
     <aside className={sidebar ? "sidebar" : "sidebar collapsed"}>
@@ -68,6 +70,7 @@ export default function App() {
       {notice && <div className={`toast ${notice.type}`}>{notice.type === "success" ? <Check size={17} /> : <CircleAlert size={17} />}<span>{notice.text}</span><button onClick={() => setNotice(null)}><X size={15} /></button></div>}
       <div className="content">
         {loading ? <Loading /> : page === "overview" ? <Overview dashboard={dashboard} targets={targets} routes={routes} onNavigate={setPage} />
+          : page === "usage" ? <UsagePage />
           : page === "providers" ? <ProvidersPage {...common} />
           : page === "cloud" ? <CloudPage {...common} />
           : page === "local" ? <LocalPage {...common} />
@@ -79,7 +82,7 @@ export default function App() {
   </div>;
 }
 
-type Common = { providers: Provider[]; targets: ModelTarget[]; routes: ModelRoute[]; logs: RequestLog[]; settings: Record<string, string>; refresh: () => Promise<void>; success: (text: string) => void; fail: (error: unknown) => void };
+type Common = { providers: Provider[]; targets: ModelTarget[]; routes: ModelRoute[]; logs: RequestLog[]; localKeys: LocalApiKey[]; settings: Record<string, string>; refresh: () => Promise<void>; success: (text: string) => void; fail: (error: unknown) => void };
 
 function PageHead({ eyebrow, title, description, action }: { eyebrow: string; title: string; description: string; action?: ReactNode }) {
   return <div className="page-head"><div><span className="eyebrow">{eyebrow}</span><h1>{title}</h1><p>{description}</p></div>{action}</div>;
@@ -103,6 +106,38 @@ function Overview({ dashboard, targets, routes, onNavigate }: { dashboard: Dashb
         <div className="stack-list">{local.length ? local.slice(0, 4).map(model => <ModelRow key={model.id} model={model} compact />) : <Empty icon={<Box />} title="No local models" text="Import an MLX folder or GGUF file." />}</div>
       </section>
     </div>
+  </>;
+}
+
+const emptyUsage: UsageData = { request_count: 0, success_count: 0, average_latency_ms: 0, input_tokens: 0, output_tokens: 0, unknown_usage_count: 0, buckets: [], by_key: [] };
+
+function UsagePage() {
+  const [period, setPeriod] = useState<"24h" | "7d" | "30d" | "all">("7d");
+  const [usage, setUsage] = useState<UsageData>(emptyUsage);
+  const [loading, setLoading] = useState(true);
+  useEffect(() => {
+    if (!isTauri()) { setLoading(false); return; }
+    let active = true;
+    const load = async () => { try { const data = await command<UsageData>("get_usage", { period }); if (active) setUsage(data); } finally { if (active) setLoading(false); } };
+    void load(); const timer = window.setInterval(() => void load(), 10_000); return () => { active = false; clearInterval(timer); };
+  }, [period]);
+  const maxRequests = Math.max(1, ...usage.buckets.map(bucket => bucket.request_count));
+  const maxTokens = Math.max(1, ...usage.buckets.map(bucket => bucket.input_tokens + bucket.output_tokens));
+  const successRate = usage.request_count ? `${Math.round(usage.success_count / usage.request_count * 100)}%` : "—";
+  return <>
+    <PageHead eyebrow="Observability" title="Usage" description="Provider-reported token usage and request health, without storing request content." action={<div className="segmented small period-picker">{(["24h", "7d", "30d", "all"] as const).map(value => <button key={value} className={period === value ? "selected" : ""} onClick={() => setPeriod(value)}>{value === "all" ? "All" : value}</button>)}</div>} />
+    <div className="metric-grid usage-metrics">
+      <Metric icon={<Activity />} value={formatNumber(usage.request_count)} label="Requests" />
+      <Metric icon={<Check />} value={successRate} label="Success rate" />
+      <Metric icon={<Gauge />} value={`${Math.round(usage.average_latency_ms)} ms`} label="Average latency" />
+      <Metric icon={<Download />} value={formatNumber(usage.input_tokens)} label="Input tokens" />
+      <Metric icon={<BarChart3 />} value={formatNumber(usage.output_tokens)} label="Output tokens" />
+      <Metric icon={<CircleAlert />} value={formatNumber(usage.unknown_usage_count)} label="Incomplete usage" />
+    </div>
+    <section className="panel usage-chart-panel"><div className="panel-title"><div><h3>Usage over time</h3><p><i className="legend requests" /> Requests <i className="legend tokens" /> Tokens</p></div><small>{usage.unknown_usage_count} request{usage.unknown_usage_count === 1 ? "" : "s"} without complete usage</small></div>
+      {loading ? <Loading /> : usage.buckets.length ? <div className="usage-chart">{usage.buckets.map(bucket => <div className="usage-column" key={bucket.start} title={`${new Date(bucket.start).toLocaleString()} · ${bucket.request_count} requests · ${formatNumber(bucket.input_tokens + bucket.output_tokens)} tokens`}><div className="bars"><i className="request-bar" style={{ height: `${Math.max(3, bucket.request_count / maxRequests * 100)}%` }} /><i className="token-bar" style={{ height: `${Math.max(3, (bucket.input_tokens + bucket.output_tokens) / maxTokens * 100)}%` }} /></div><span>{new Date(bucket.start).toLocaleDateString(undefined, { month: "short", day: "numeric", ...(period === "24h" ? { hour: "2-digit" } : {}) })}</span></div>)}</div> : <Empty icon={<BarChart3 />} title="No usage yet" text="Authenticated inference requests will appear here." />}
+    </section>
+    <section className="panel"><div className="panel-title"><div><h3>Usage by API key</h3><p>Revoked keys and legacy traffic remain attributable.</p></div></div><div className="usage-table"><div className="usage-head"><span>API key</span><span>Requests</span><span>Success</span><span>Latency</span><span>Input</span><span>Output</span></div>{usage.by_key.map(item => <div className="usage-row" key={item.api_key_id ?? "legacy"}><strong>{item.api_key_name}</strong><span>{formatNumber(item.request_count)}</span><span>{item.request_count ? `${Math.round(item.success_count / item.request_count * 100)}%` : "—"}</span><span>{Math.round(item.average_latency_ms)} ms</span><span>{formatNumber(item.input_tokens)}</span><span>{formatNumber(item.output_tokens)}</span></div>)}</div>{!usage.by_key.length && <Empty icon={<KeyRound />} title="No key usage" text="Usage will be grouped by the authenticating local key." />}</section>
   </>;
 }
 
@@ -166,28 +201,59 @@ function RouteModal({ route, targets, close, done, fail }: { route: ModelRoute |
   return <Modal title={route ? "Edit alias" : "Create alias"} close={close}><form className="form" onSubmit={submit}><Field label="Public model name"><input value={alias} onChange={e => setAlias(e.target.value.replace(/\s+/g, "-"))} placeholder="my-assistant" required disabled={!!route} /></Field><Field label="Targets in fallback order"><div className="target-picker">{selected.map((id, index) => <div className="picker-row" key={`${id}-${index}`}><span>{index ? `Fallback ${index}` : "Primary"}</span><select value={id} onChange={e => setSelected(selected.map((item, itemIndex) => itemIndex === index ? e.target.value : item))}>{targets.map(target => <option value={target.id} key={target.id}>{target.name} · {target.kind}</option>)}</select>{selected.length > 1 && <button type="button" className="icon-button" onClick={() => setSelected(selected.filter((_, itemIndex) => itemIndex !== index))}><X size={15} /></button>}</div>)}<button type="button" className="text-button" onClick={() => setSelected([...selected, targets[0].id])}><Plus size={15} />Add fallback</button></div></Field><div><span className="field-label">Shared capabilities</span><CapabilityList items={availableCapabilities} /></div><div className="security-note"><ListRestart size={17} /><span>Fallbacks run only for network errors, timeouts, 429 and 5xx responses—never after streaming has started.</span></div><ModalActions close={close} busy={busy} label="Save alias" /></form></Modal>;
 }
 
-function LogsPage({ logs, refresh, success, fail }: Common) {
-  const [query, setQuery] = useState(""); const filtered = logs.filter(log => `${log.endpoint} ${log.alias} ${log.target} ${log.status}`.toLowerCase().includes(query.toLowerCase()));
-  const clear = async () => { if (!confirm("Delete all request metadata?")) return; try { await command("clear_logs"); await refresh(); success("Logs cleared"); } catch (e) { fail(e); } };
-  const exportCsv = async () => { const path = await save({ defaultPath: "local-ai-router-logs.csv", filters: [{ name: "CSV", extensions: ["csv"] }] }); if (!path) return; try { await command("export_logs_csv", { path }); success("CSV exported"); } catch (e) { fail(e); } };
-  return <><PageHead eyebrow="Observability" title="Request logs" description="Metadata only. Prompt and response content is never stored." action={<div className="button-row"><button className="secondary" onClick={() => void exportCsv()}><FileDown size={16} />Export CSV</button><button className="secondary danger-text" onClick={() => void clear()}><Trash2 size={16} />Clear</button></div>} />
-    <div className="search"><Search size={17} /><input value={query} onChange={e => setQuery(e.target.value)} placeholder="Filter endpoint, alias, target, status…" /></div><div className="log-table"><div className="log-head"><span>Time</span><span>Endpoint</span><span>Route</span><span>Status</span><span>Latency</span><span>Attempts</span></div>{filtered.map(log => <div className="log-row" key={log.id}><span>{new Date(log.created_at).toLocaleString()}</span><code>{log.endpoint.replace("/v1/", "")}</code><span><strong>{log.alias ?? "—"}</strong><small>{log.target ?? "No target"}</small></span><Badge tone={log.status < 400 ? "good" : log.status < 500 ? "warn" : "bad"}>{log.status}</Badge><span>{log.latency_ms} ms</span><span>{log.attempts}</span></div>)}</div>{!filtered.length && <Empty icon={<Activity />} title="No matching requests" text="Requests will appear here without their content." />}
+function LogsPage({ localKeys, refresh, success, fail }: Common) {
+  const [items, setItems] = useState<RequestLog[]>([]); const [total, setTotal] = useState(0); const [page, setPage] = useState(0); const [reload, setReload] = useState(0);
+  const [facets, setFacets] = useState<LogFacets>({ aliases: [], targets: [], endpoints: [] });
+  const [text, setText] = useState(""); const [keyFilter, setKeyFilter] = useState(""); const [alias, setAlias] = useState(""); const [target, setTarget] = useState(""); const [endpoint, setEndpoint] = useState(""); const [status, setStatus] = useState(""); const [from, setFrom] = useState(""); const [to, setTo] = useState("");
+  const logQuery = (withPage = true): LogQuery => ({
+    query: text || null, api_key_id: keyFilter && keyFilter !== "legacy" ? keyFilter : null, legacy_only: keyFilter === "legacy",
+    alias: alias || null, target: target || null, endpoint: endpoint || null, status_class: (status || null) as LogQuery["status_class"],
+    from: from ? new Date(from).toISOString() : null, to: to ? new Date(to).toISOString() : null,
+    ...(withPage ? { limit: 50, offset: page * 50 } : {}),
+  });
+  useEffect(() => { if (!isTauri()) return; void command<LogFacets>("get_log_facets").then(setFacets).catch(fail); }, [reload]);
+  useEffect(() => { if (!isTauri()) return; const timer = window.setTimeout(() => { void command<LogResult>("list_logs", { query: logQuery() }).then(result => { setItems(result.items); setTotal(result.total); }).catch(fail); }, 180); return () => clearTimeout(timer); }, [text, keyFilter, alias, target, endpoint, status, from, to, page, reload]);
+  const updateFilter = (setter: (value: string) => void, value: string) => { setter(value); setPage(0); };
+  const reset = () => { setText(""); setKeyFilter(""); setAlias(""); setTarget(""); setEndpoint(""); setStatus(""); setFrom(""); setTo(""); setPage(0); };
+  const clear = async () => { if (!confirm("Delete all request metadata?")) return; try { await command("clear_logs"); setReload(value => value + 1); await refresh(); success("Logs cleared"); } catch (e) { fail(e); } };
+  const exportCsv = async () => { const path = await save({ defaultPath: "local-ai-router-logs.csv", filters: [{ name: "CSV", extensions: ["csv"] }] }); if (!path) return; try { await command("export_logs_csv", { path, query: logQuery(false) }); success(`${total} matching logs exported`); } catch (e) { fail(e); } };
+  return <><PageHead eyebrow="Observability" title="Request logs" description="Metadata only. Prompt and response content is never stored." action={<div className="button-row"><button className="secondary" onClick={() => void exportCsv()}><FileDown size={16} />Export filtered CSV</button><button className="secondary danger-text" onClick={() => void clear()}><Trash2 size={16} />Clear</button></div>} />
+    <section className="panel log-filters"><div className="search"><Search size={17} /><input value={text} onChange={e => updateFilter(setText, e.target.value)} placeholder="Search endpoint, key, alias, target, status or error…" /></div><div className="filter-grid">
+      <select aria-label="API key" value={keyFilter} onChange={e => updateFilter(setKeyFilter, e.target.value)}><option value="">All API keys</option><option value="legacy">Unknown / Legacy</option>{localKeys.map(key => <option key={key.id} value={key.id}>{key.name}{key.revoked_at ? " (revoked)" : ""}</option>)}</select>
+      <select aria-label="Alias" value={alias} onChange={e => updateFilter(setAlias, e.target.value)}><option value="">All aliases</option>{facets.aliases.map(value => <option key={value}>{value}</option>)}</select>
+      <select aria-label="Target" value={target} onChange={e => updateFilter(setTarget, e.target.value)}><option value="">All targets</option>{facets.targets.map(value => <option key={value}>{value}</option>)}</select>
+      <select aria-label="Endpoint" value={endpoint} onChange={e => updateFilter(setEndpoint, e.target.value)}><option value="">All endpoints</option>{facets.endpoints.map(value => <option key={value} value={value}>{value.replace("/v1/", "")}</option>)}</select>
+      <select aria-label="Status" value={status} onChange={e => updateFilter(setStatus, e.target.value)}><option value="">All statuses</option><option value="success">Success</option><option value="4xx">4xx</option><option value="5xx">5xx</option></select>
+      <label className="date-filter"><span>From</span><input type="datetime-local" value={from} onChange={e => updateFilter(setFrom, e.target.value)} /></label><label className="date-filter"><span>To</span><input type="datetime-local" value={to} onChange={e => updateFilter(setTo, e.target.value)} /></label><button className="secondary" onClick={reset}><X size={15} />Reset</button>
+    </div></section>
+    <div className="result-meta"><span>{total} matching request{total === 1 ? "" : "s"}</span><span>Page {page + 1} of {Math.max(1, Math.ceil(total / 50))}</span></div>
+    <div className="log-table"><div className="log-head"><span>Time</span><span>API key</span><span>Endpoint</span><span>Route</span><span>Status</span><span>Latency</span><span>Tokens</span><span>Attempts</span></div>{items.map(log => <div className="log-row" key={log.id}><span>{new Date(log.created_at).toLocaleString()}</span><strong>{log.api_key_name ?? "Unknown / Legacy"}</strong><code>{log.endpoint.replace("/v1/", "")}</code><span><strong>{log.alias ?? "—"}</strong><small>{log.target ?? "No target"}</small></span><Badge tone={statusTone(log.status)}>{log.status}</Badge><span>{log.latency_ms} ms</span><span>{log.input_tokens == null || log.output_tokens == null ? "—" : formatNumber(log.input_tokens + log.output_tokens)}</span><span>{log.attempts}</span></div>)}</div>{!items.length && <Empty icon={<Activity />} title="No matching requests" text="Adjust the filters or make an authenticated request." />}
+    {total > 50 && <div className="pagination"><button className="secondary" disabled={page === 0} onClick={() => setPage(page - 1)}>Previous</button><button className="secondary" disabled={(page + 1) * 50 >= total} onClick={() => setPage(page + 1)}>Next</button></div>}
   </>;
 }
 
-function SettingsPage({ settings, dashboard, refresh, success, fail }: Common & { dashboard: DashboardData }) {
-  const [token, setToken] = useState(""); const [showToken, setShowToken] = useState(false); const [autostart, setAutostart] = useState(false); const [hf, setHf] = useState("");
-  useEffect(() => { if (isTauri()) { void command<string>("get_local_api_key").then(setToken).catch(fail); void isEnabled().then(setAutostart).catch(() => {}); } }, []);
-  const rotate = async () => { if (!confirm("Rotate the local API key? Existing clients will stop working immediately.")) return; try { setToken(await command("rotate_local_api_key")); setShowToken(true); success("Local API key rotated"); } catch (e) { fail(e); } };
+function SettingsPage({ settings, dashboard, localKeys, refresh, success, fail }: Common & { dashboard: DashboardData }) {
+  const [autostart, setAutostart] = useState(false); const [hf, setHf] = useState("");
+  useEffect(() => { if (isTauri()) { void isEnabled().then(setAutostart).catch(() => {}); } }, []);
   const toggleAutostart = async () => { try { autostart ? await disable() : await enable(); setAutostart(!autostart); success(`Launch at login ${autostart ? "disabled" : "enabled"}`); } catch (e) { fail(e); } };
   const saveNumber = async (key: string, value: string) => { try { await command("save_setting", { key, value }); await refresh(); success("Setting saved; runtime changes apply after restart"); } catch (e) { fail(e); } };
   return <><PageHead eyebrow="Application" title="Settings" description="Security, resources and background behavior." />
-    <div className="settings-list"><Setting title="Local endpoint" description="The gateway is bound to 127.0.0.1 and is not reachable from your network."><code>{dashboard.base_url}</code></Setting><Setting title="Local API key" description="Stored in macOS Keychain. Rotation immediately invalidates the old key."><div className="secret"><code>{showToken ? token : "••••••••••••••••••••••••"}</code><button className="icon-button" onClick={() => setShowToken(!showToken)}><KeyRound size={16} /></button><CopyButton value={token} /><button className="secondary" onClick={() => void rotate()}>Rotate</button></div></Setting><Setting title="Launch at login" description="Keep the menu bar gateway available after signing in."><Toggle checked={autostart} onChange={() => void toggleAutostart()} /></Setting><Setting title="Memory budget" description="Maximum share of physical memory reserved for resident models."><NumberSetting value={settings.memory_budget_percent ?? "70"} suffix="%" onSave={value => void saveNumber("memory_budget_percent", value)} /></Setting><Setting title="Idle unload" description="Unload an inactive local model after this period."><NumberSetting value={settings.idle_unload_minutes ?? "15"} suffix="min" onSave={value => void saveNumber("idle_unload_minutes", value)} /></Setting><Setting title="Log retention" description="Metadata older than this is removed automatically."><NumberSetting value={settings.log_retention_days ?? "30"} suffix="days" onSave={value => void saveNumber("log_retention_days", value)} /></Setting><Setting title="Hugging Face token" description="Optional for gated and private model repositories."><div className="inline-form"><input type="password" value={hf} onChange={e => setHf(e.target.value)} placeholder={settings.has_hf_token === "true" ? "Token stored in Keychain" : "hf_…"} /><button className="secondary" onClick={async () => { try { await command("save_hugging_face_token", { token: hf }); setHf(""); await refresh(); success("Hugging Face token saved"); } catch (e) { fail(e); } }}>Save</button></div></Setting></div>
+    <div className="settings-list"><Setting title="Local endpoint" description="The gateway is bound to 127.0.0.1 and is not reachable from your network."><code>{dashboard.base_url}</code></Setting><section className="setting api-key-setting"><div><h3>Local API keys</h3><p>Named client keys are stored in macOS Keychain and can be attributed in usage and logs.</p></div><ApiKeysSetting keys={localKeys} refresh={refresh} success={success} fail={fail} /></section><Setting title="Launch at login" description="Keep the menu bar gateway available after signing in."><Toggle checked={autostart} onChange={() => void toggleAutostart()} /></Setting><Setting title="Memory budget" description="Maximum share of physical memory reserved for resident models."><NumberSetting value={settings.memory_budget_percent ?? "70"} suffix="%" onSave={value => void saveNumber("memory_budget_percent", value)} /></Setting><Setting title="Idle unload" description="Unload an inactive local model after this period."><NumberSetting value={settings.idle_unload_minutes ?? "15"} suffix="min" onSave={value => void saveNumber("idle_unload_minutes", value)} /></Setting><Setting title="Log retention" description="Metadata older than this is removed automatically."><NumberSetting value={settings.log_retention_days ?? "30"} suffix="days" onSave={value => void saveNumber("log_retention_days", value)} /></Setting><Setting title="Hugging Face token" description="Optional for gated and private model repositories."><div className="inline-form"><input type="password" value={hf} onChange={e => setHf(e.target.value)} placeholder={settings.has_hf_token === "true" ? "Token stored in Keychain" : "hf_…"} /><button className="secondary" onClick={async () => { try { await command("save_hugging_face_token", { token: hf }); setHf(""); await refresh(); success("Hugging Face token saved"); } catch (e) { fail(e); } }}>Save</button></div></Setting></div>
   </>;
 }
 
+function ApiKeysSetting({ keys, refresh, success, fail }: { keys: LocalApiKey[] } & Pick<Common, "refresh" | "success" | "fail">) {
+  const [name, setName] = useState(""); const [tokens, setTokens] = useState<Record<string, string>>({}); const [busy, setBusy] = useState(false);
+  const create = async () => { if (!name.trim()) return; setBusy(true); try { const result = await command<LocalApiKeyWithToken>("create_local_api_key", { name }); setTokens(current => ({ ...current, [result.id]: result.token })); setName(""); await refresh(); success("Local API key created"); } catch (e) { fail(e); } finally { setBusy(false); } };
+  const reveal = async (key: LocalApiKey) => { if (tokens[key.id]) { setTokens(current => { const next = { ...current }; delete next[key.id]; return next; }); return; } try { const token = await command<string>("reveal_local_api_key", { id: key.id }); setTokens(current => ({ ...current, [key.id]: token })); } catch (e) { fail(e); } };
+  const rename = async (key: LocalApiKey) => { const next = prompt("API key name", key.name)?.trim(); if (!next || next === key.name) return; try { await command("rename_local_api_key", { id: key.id, name: next }); await refresh(); success("API key renamed"); } catch (e) { fail(e); } };
+  const rotate = async (key: LocalApiKey) => { if (!confirm(`Rotate “${key.name}”? The current token will stop working immediately.`)) return; try { const token = await command<string>("rotate_local_api_key", { id: key.id }); setTokens(current => ({ ...current, [key.id]: token })); await refresh(); success("API key rotated"); } catch (e) { fail(e); } };
+  const revoke = async (key: LocalApiKey) => { if (!confirm(`Revoke “${key.name}”? This cannot be undone.`)) return; try { await command("revoke_local_api_key", { id: key.id }); setTokens(current => { const next = { ...current }; delete next[key.id]; return next; }); await refresh(); success("API key revoked"); } catch (e) { fail(e); } };
+  return <div className="api-key-manager"><div className="inline-form"><input value={name} onChange={event => setName(event.target.value)} placeholder="New key name" maxLength={80} /><button className="primary" disabled={!name.trim() || busy} onClick={() => void create()}><Plus size={16} />Create key</button></div><div className="api-key-list">{keys.map(key => <article className={`api-key-row ${key.revoked_at ? "revoked" : ""}`} key={key.id}><div className="api-key-title"><div><strong>{key.name}</strong><Badge tone={key.revoked_at ? "neutral" : "good"}>{key.revoked_at ? "Revoked" : "Active"}</Badge></div><small>Created {new Date(key.created_at).toLocaleDateString()} · {key.last_used_at ? `Last used ${new Date(key.last_used_at).toLocaleString()}` : "Never used"}</small></div>{!key.revoked_at && <><div className="secret"><code>{tokens[key.id] ?? "••••••••••••••••••••••••"}</code><button className="icon-button" title={tokens[key.id] ? "Hide" : "Reveal"} onClick={() => void reveal(key)}>{tokens[key.id] ? <EyeOff size={15} /> : <Eye size={15} />}</button>{tokens[key.id] && <CopyButton value={tokens[key.id]} />}</div><div className="api-key-actions"><button className="icon-button" title="Rename" onClick={() => void rename(key)}><Pencil size={15} /></button><button className="secondary" onClick={() => void rotate(key)}><RefreshCw size={15} />Rotate</button><button className="icon-button danger" title="Revoke" onClick={() => void revoke(key)}><Trash2 size={15} /></button></div></>}</article>)}</div></div>;
+}
+
 function ModelRow({ model, compact }: { model: ModelTarget; compact?: boolean }) { return <div className="model-row"><div className="model-icon small"><Box size={17} /></div><div className="grow"><strong>{model.name}</strong><span>{model.kind.toUpperCase()} {model.size_bytes ? `· ${formatBytes(model.size_bytes)}` : ""}</span></div><Badge tone={model.state === "ready" ? "good" : "neutral"}>{compact && model.state === "stopped" ? "Installed" : model.state}</Badge></div>; }
-function Metric({ icon, value, label }: { icon: ReactNode; value: number; label: string }) { return <div className="metric"><span>{icon}</span><div><strong>{value}</strong><small>{label}</small></div></div>; }
+function Metric({ icon, value, label }: { icon: ReactNode; value: ReactNode; label: string }) { return <div className="metric"><span>{icon}</span><div><strong>{value}</strong><small>{label}</small></div></div>; }
 function CapabilityList({ items }: { items: string[] }) { return <div className="capabilities">{items.slice(0, 4).map(item => <span key={item}>{item}</span>)}</div>; }
 function Badge({ children, tone }: { children: ReactNode; tone: "good" | "warn" | "bad" | "neutral" }) { return <span className={`badge ${tone}`}>{children}</span>; }
 function Field({ label, children }: { label: string; children: ReactNode }) { return <label className="field"><span>{label}</span>{children}</label>; }
@@ -201,3 +267,5 @@ function DeleteTarget({ id, refresh, success, fail }: Pick<Common, "refresh" | "
 function Toggle({ checked, onChange }: { checked: boolean; onChange: () => void }) { return <button className={`toggle ${checked ? "on" : ""}`} onClick={onChange}><i /></button>; }
 function NumberSetting({ value: initial, suffix, onSave }: { value: string; suffix: string; onSave: (value: string) => void }) { const [value, setValue] = useState(initial); return <div className="number-setting"><input type="number" min="1" max="95" value={value} onChange={e => setValue(e.target.value)} onBlur={() => onSave(value)} /><span>{suffix}</span></div>; }
 function formatBytes(value: number | null) { if (!value) return "Size unknown"; const units = ["B", "KB", "MB", "GB", "TB"]; const index = Math.min(Math.floor(Math.log(value) / Math.log(1024)), units.length - 1); return `${(value / 1024 ** index).toFixed(index > 2 ? 1 : 0)} ${units[index]}`; }
+function formatNumber(value: number) { return new Intl.NumberFormat().format(value); }
+function statusTone(status: number): "good" | "warn" | "bad" | "neutral" { if (status >= 200 && status < 300) return "good"; if (status >= 400 && status < 500) return "warn"; if (status >= 500) return "bad"; return "neutral"; }
