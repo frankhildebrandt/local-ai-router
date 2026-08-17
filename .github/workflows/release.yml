@@ -21,7 +21,31 @@ jobs:
       - run: npm ci
       - run: xcodebuild -downloadComponent MetalToolchain
       - run: ./scripts/build-sidecars.sh
+      - name: Configure Apple signing
+        env:
+          APPLE_SIGNING_IDENTITY_SECRET: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID_SECRET: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD_SECRET: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID_SECRET: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          if [[ "$APPLE_SIGNING_IDENTITY_SECRET" == "Developer ID Application"* ]]; then
+            echo "Using Developer ID for a signed, notarized release"
+            {
+              echo "APPLE_SIGNED=true"
+              echo "APPLE_SIGNING_IDENTITY=$APPLE_SIGNING_IDENTITY_SECRET"
+              echo "APPLE_ID=$APPLE_ID_SECRET"
+              echo "APPLE_TEAM_ID=$APPLE_TEAM_ID_SECRET"
+              echo "APPLE_PASSWORD<<ENDOFPASSWORD"
+              echo "$APPLE_PASSWORD_SECRET"
+              echo "ENDOFPASSWORD"
+            } >> "$GITHUB_ENV"
+          else
+            echo "No Developer ID Application certificate configured; building unsigned"
+            echo "APPLE_SIGNED=false" >> "$GITHUB_ENV"
+            echo "APPLE_SIGNING_IDENTITY=-" >> "$GITHUB_ENV"
+          fi
       - name: Import Apple signing certificate
+        if: env.APPLE_SIGNED == 'true'
         env:
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
@@ -37,10 +61,6 @@ jobs:
       - uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
@@ -48,4 +68,3 @@ jobs:
           releaseName: Local AI Router ${{ github.ref_name }}
           releaseDraft: true
           prerelease: false
-

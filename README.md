@@ -138,13 +138,14 @@ Local chat models accept OpenAI `input_audio` and the Local AI Router extension 
 
 ## Release setup
 
-The release workflow expects these GitHub Actions secrets:
+Tags matching `v*` build an Apple-Silicon DMG. Without a Developer ID Application certificate the app is ad-hoc signed (unsigned for Gatekeeper). Users must right-click Open the first time.
+
+Apple notarization is enabled only when `APPLE_SIGNING_IDENTITY` starts with `Developer ID Application`. Development certificates are ignored so the workflow does not attempt notarization with invalid credentials. When you have a real Developer ID, set:
 
 - `APPLE_CERTIFICATE`, `APPLE_CERTIFICATE_PASSWORD`, `APPLE_SIGNING_IDENTITY`
 - `APPLE_ID`, `APPLE_PASSWORD`, `APPLE_TEAM_ID`
-- `TAURI_SIGNING_PRIVATE_KEY`, `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`
 
-Before the first public build, replace the updater public-key placeholder in `src-tauri/tauri.conf.json`. Tags matching `v*` build a notarized Apple-Silicon DMG and signed updater artifacts.
+Updater archives are signed with `TAURI_SIGNING_PRIVATE_KEY` and `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`. The matching public key lives in `src-tauri/tauri.conf.json`.
 
 ## Runtime notes
 
