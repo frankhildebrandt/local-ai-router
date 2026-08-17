@@ -19,6 +19,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - run: brew install cmake
       - run: npm ci
+      - run: xcodebuild -downloadComponent MetalToolchain
       - run: ./scripts/build-sidecars.sh
       - name: Import Apple signing certificate
         env:

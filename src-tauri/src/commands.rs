@@ -1,5 +1,6 @@
-use std::{path::PathBuf, sync::Arc};
+use std::{collections::HashSet, path::PathBuf, sync::Arc};
 
+use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use tauri::State;
 use uuid::Uuid;
@@ -8,10 +9,20 @@ use crate::{
     core::AppCore,
     domain::{ModelRoute, TargetKind},
     library,
+    providers::{
+        provider_preset, provider_presets, validate_cloud_base_url, AuthMode, ProviderPreset,
+        WireProtocol,
+    },
+    resource::{ResourceOverrides, ResourcePolicy, ResourceProfile},
+    routing::{
+        builtin_tasks, evaluate_route, RoutingAttemptRecord, RoutingConfigExport, RoutingPolicy,
+        RoutingTaskDefinition, TargetRoutingProfile,
+    },
     runtime::{RuntimeManager, RuntimeStatus},
     secrets::{local_api_key_account, provider_account, HF_ACCOUNT, LOCAL_API_KEY},
     storage::{
-        LocalApiKey, LogFacets, LogQuery, LogResult, ModelTarget, Provider, Store, UsageData,
+        LocalApiKey, LogFacets, LogQuery, LogResult, ModelTarget, Provider, ProviderModel, Store,
+        UsageData,
     },
 };
 
@@ -20,6 +31,7 @@ pub struct AppServices {
     pub runtimes: Arc<RuntimeManager>,
     pub model_library: PathBuf,
     pub port: u16,
+    pub install: Arc<crate::install::InstallManager>,
 }
 
 #[derive(Debug, Serialize)]
@@ -40,12 +52,35 @@ pub struct LocalApiKeyWithToken {
     pub token: String,
 }
 
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClientChatMessage {
+    pub role: String,
+    pub content: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClientChatInput {
+    pub model: String,
+    pub messages: Vec<ClientChatMessage>,
+    pub session_id: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ClientChatResponse {
+    pub content: String,
+    pub model: String,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SaveProviderInput {
     pub id: Option<String>,
     pub name: String,
-    pub kind: TargetKind,
+    pub preset_id: String,
+    #[serde(default)]
+    pub auth_mode: AuthMode,
     pub base_url: String,
     pub enabled: bool,
     pub api_key: Option<String>,
@@ -154,8 +189,95 @@ pub async fn revoke_local_api_key(state: State<'_, AppServices>, id: String) -> 
 }
 
 #[tauri::command]
+pub async fn client_chat(
+    state: State<'_, AppServices>,
+    input: ClientChatInput,
+) -> Result<ClientChatResponse, String> {
+    let model = input.model.trim();
+    if model.is_empty() {
+        return Err("a model alias is required".into());
+    }
+    if input.messages.is_empty() || input.messages.len() > 200 {
+        return Err("a chat must contain between 1 and 200 messages".into());
+    }
+    let total_chars = input.messages.iter().try_fold(0usize, |total, message| {
+        if !matches!(message.role.as_str(), "system" | "user" | "assistant") {
+            return Err("chat messages must use the system, user, or assistant role");
+        }
+        total
+            .checked_add(message.content.len())
+            .ok_or("chat request is too large")
+    })?;
+    if total_chars > 512_000 {
+        return Err("chat request is too large".into());
+    }
+
+    let key = state
+        .core
+        .store
+        .local_api_keys()
+        .await
+        .map_err(err)?
+        .into_iter()
+        .filter(|key| key.revoked_at.is_none())
+        .find_map(|key| state.core.reveal_local_api_key(&key.id).ok())
+        .ok_or("no active local API key is available")?;
+    let mut request = state
+        .core
+        .client
+        .post(format!(
+            "http://127.0.0.1:{}/v1/chat/completions",
+            state.port
+        ))
+        .bearer_auth(key);
+    if let Some(session_id) = input.session_id.as_deref() {
+        request = request.header("X-Local-AI-Session", session_id);
+    }
+    let response = request
+        .json(&serde_json::json!({
+            "model": model,
+            "messages": input.messages,
+            "stream": false
+        }))
+        .send()
+        .await
+        .map_err(err)?;
+    let status = response.status();
+    let bytes = response.bytes().await.map_err(err)?;
+    if bytes.len() > 8 * 1024 * 1024 {
+        return Err("chat response is too large".into());
+    }
+    let payload: serde_json::Value = serde_json::from_slice(&bytes)
+        .map_err(|_| format!("gateway returned an invalid response ({status})"))?;
+    if !status.is_success() {
+        let message = payload
+            .pointer("/error/message")
+            .and_then(|value| value.as_str())
+            .unwrap_or("the gateway rejected the chat request");
+        return Err(message.into());
+    }
+    let content = payload
+        .pointer("/choices/0/message/content")
+        .and_then(|value| value.as_str())
+        .ok_or("gateway response did not contain assistant text")?;
+    Ok(ClientChatResponse {
+        content: content.into(),
+        model: payload
+            .get("model")
+            .and_then(|value| value.as_str())
+            .unwrap_or(model)
+            .into(),
+    })
+}
+
+#[tauri::command]
 pub async fn list_providers(state: State<'_, AppServices>) -> Result<Vec<Provider>, String> {
     state.core.providers_with_credentials().await.map_err(err)
+}
+
+#[tauri::command]
+pub fn list_provider_presets() -> Vec<ProviderPreset> {
+    provider_presets()
 }
 
 #[tauri::command]
@@ -163,29 +285,50 @@ pub async fn save_provider(
     state: State<'_, AppServices>,
     input: SaveProviderInput,
 ) -> Result<Provider, String> {
-    if !matches!(input.kind, TargetKind::OpenAi | TargetKind::OpenRouter) {
-        return Err("provider must be OpenAI or OpenRouter".into());
+    let preset = provider_preset(&input.preset_id).ok_or("unknown provider preset")?;
+    if input.auth_mode != preset.auth_mode {
+        return Err("authentication mode does not match provider preset".into());
     }
     let id = input.id.unwrap_or_else(|| Uuid::new_v4().to_string());
+    if let Some(previous) = state.core.store.provider(&id).await.map_err(err)? {
+        if previous.auth_mode != input.auth_mode {
+            state
+                .core
+                .secrets
+                .delete(&provider_account(&id))
+                .map_err(err)?;
+        }
+    }
+    let base_url = if preset.editable_base_url {
+        validate_cloud_base_url(&input.base_url, preset.id == "custom_openai").map_err(err)?
+    } else {
+        preset
+            .base_url
+            .context("provider preset has no base URL")
+            .map_err(err)?
+            .to_owned()
+    };
     let provider = Provider {
         id: id.clone(),
         name: input.name,
-        kind: input.kind,
-        base_url: input.base_url.trim_end_matches('/').to_owned(),
+        preset_id: input.preset_id,
+        auth_mode: input.auth_mode,
+        base_url,
         enabled: input.enabled,
         has_credential: input.api_key.as_ref().is_some_and(|key| !key.is_empty()),
     };
     if let Some(key) = input.api_key.filter(|key| !key.trim().is_empty()) {
         state
             .core
-            .validate_provider(&provider, &key)
-            .await
+            .save_provider_api_key(&id, key.trim())
             .map_err(err)?;
-        state
-            .core
-            .secrets
-            .set(&provider_account(&id), key.trim())
-            .map_err(err)?;
+    } else if provider.auth_mode == AuthMode::ApiKey {
+        if let Ok(existing) = state.core.provider_api_key(&id) {
+            state
+                .core
+                .save_provider_api_key(&id, &existing)
+                .map_err(err)?;
+        }
     }
     state
         .core
@@ -204,6 +347,64 @@ pub async fn save_provider(
 }
 
 #[tauri::command]
+pub async fn test_provider_connection(
+    state: State<'_, AppServices>,
+    id: String,
+) -> Result<Vec<String>, String> {
+    let provider = state
+        .core
+        .store
+        .provider(&id)
+        .await
+        .map_err(err)?
+        .ok_or("provider not found")?;
+    if provider.auth_mode == AuthMode::OpenAiSubscription {
+        state.core.oauth.access_token(&id).await.map_err(err)?;
+        return Ok(vec!["subscription".into()]);
+    }
+    let credential = state.core.provider_api_key(&id).map_err(err)?;
+    state
+        .core
+        .validate_provider(&provider, &credential)
+        .await
+        .map_err(err)
+}
+
+#[tauri::command]
+pub async fn begin_openai_subscription(
+    state: State<'_, AppServices>,
+    id: String,
+) -> Result<crate::oauth::OAuthStart, String> {
+    let provider = state
+        .core
+        .store
+        .provider(&id)
+        .await
+        .map_err(err)?
+        .ok_or("provider not found")?;
+    if provider.auth_mode != AuthMode::OpenAiSubscription {
+        return Err("provider is not configured for subscription OAuth".into());
+    }
+    state.core.oauth.begin(&id).await.map_err(err)
+}
+
+#[tauri::command]
+pub async fn openai_subscription_status(
+    state: State<'_, AppServices>,
+    id: String,
+) -> Result<crate::oauth::OAuthStatus, String> {
+    state.core.oauth.status(&id).await.map_err(err)
+}
+
+#[tauri::command]
+pub async fn logout_openai_subscription(
+    state: State<'_, AppServices>,
+    id: String,
+) -> Result<(), String> {
+    state.core.oauth.logout(&id).await.map_err(err)
+}
+
+#[tauri::command]
 pub async fn delete_provider(state: State<'_, AppServices>, id: String) -> Result<(), String> {
     state.core.store.delete_provider(&id).await.map_err(err)?;
     state
@@ -217,7 +418,7 @@ pub async fn delete_provider(state: State<'_, AppServices>, id: String) -> Resul
 pub async fn sync_provider_models(
     state: State<'_, AppServices>,
     id: String,
-) -> Result<Vec<String>, String> {
+) -> Result<Vec<ProviderModel>, String> {
     let provider = state
         .core
         .store
@@ -225,17 +426,41 @@ pub async fn sync_provider_models(
         .await
         .map_err(err)?
         .ok_or("provider not found")?;
-    let credential = state
-        .core
-        .secrets
-        .get(&provider_account(&id))
-        .map_err(err)?
-        .ok_or("provider credential missing")?;
-    let models = state
-        .core
-        .validate_provider(&provider, &credential)
-        .await
-        .map_err(err)?;
+    let model_ids = if provider.auth_mode == AuthMode::OpenAiSubscription {
+        vec![
+            "gpt-5.6-sol".into(),
+            "gpt-5.6-terra".into(),
+            "gpt-5.6-luna".into(),
+        ]
+    } else {
+        let credential = state.core.provider_api_key(&id).map_err(err)?;
+        state
+            .core
+            .validate_provider(&provider, &credential)
+            .await
+            .map_err(err)?
+    };
+    let trusted_capabilities = provider.preset_id == "openai_subscription";
+    let models = model_ids
+        .into_iter()
+        .filter(|_| provider.preset_id != "opencode_zen")
+        .map(|model_id| ProviderModel {
+            wire_protocol: crate::providers::inferred_protocol(&provider.preset_id, &model_id),
+            id: model_id,
+            capabilities: if trusted_capabilities {
+                vec![
+                    "chat".into(),
+                    "streaming".into(),
+                    "tools".into(),
+                    "vision".into(),
+                    "reasoning".into(),
+                    "structured_output".into(),
+                ]
+            } else {
+                vec!["chat".into(), "streaming".into()]
+            },
+        })
+        .collect::<Vec<_>>();
     state
         .core
         .store
@@ -249,8 +474,208 @@ pub async fn sync_provider_models(
 pub async fn cached_provider_models(
     state: State<'_, AppServices>,
     id: String,
-) -> Result<Vec<String>, String> {
+) -> Result<Vec<ProviderModel>, String> {
     state.core.store.provider_models(&id).await.map_err(err)
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SearchCatalogInput {
+    pub query: Option<String>,
+    pub cursor: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InspectModelInput {
+    pub repo_id: String,
+    pub revision: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InstallCatalogInput {
+    pub repo_id: String,
+    pub revision: Option<String>,
+    pub catalog_id: Option<String>,
+    #[serde(default)]
+    pub confirm_over_budget: bool,
+    pub name: Option<String>,
+}
+
+fn memory_budget_bytes(percent: u8) -> u64 {
+    let mut system = sysinfo::System::new();
+    system.refresh_memory();
+    crate::catalog::memory_budget(system.total_memory(), percent)
+}
+
+async fn budget_from_store(store: &Store) -> anyhow::Result<(u8, u64)> {
+    let percent = store
+        .setting("memory_budget_percent")
+        .await?
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(70);
+    Ok((percent, memory_budget_bytes(percent)))
+}
+
+async fn hub_client(state: &AppServices) -> Result<crate::hub::HubClient, String> {
+    Ok(crate::hub::HubClient::new(
+        crate::hub::hub_http_client().map_err(err)?,
+        "https://huggingface.co",
+        state.core.secrets.get(HF_ACCOUNT).map_err(err)?,
+    ))
+}
+
+#[tauri::command]
+pub async fn list_local_catalog(
+    state: State<'_, AppServices>,
+) -> Result<crate::catalog::LocalCatalog, String> {
+    let (percent, budget) = budget_from_store(&state.core.store).await.map_err(err)?;
+    Ok(crate::catalog::LocalCatalog {
+        platform: crate::catalog::mac_compatibility(),
+        memory_budget_bytes: budget,
+        memory_budget_percent: percent,
+        entries: crate::catalog::catalog_views(budget),
+    })
+}
+
+#[tauri::command]
+pub async fn search_mlx_catalog(
+    state: State<'_, AppServices>,
+    input: SearchCatalogInput,
+) -> Result<crate::hub::SearchPage, String> {
+    let (_, budget) = budget_from_store(&state.core.store).await.map_err(err)?;
+    hub_client(&state)
+        .await?
+        .search(
+            input.query.as_deref().unwrap_or(""),
+            input.cursor.as_deref(),
+            budget,
+        )
+        .await
+        .map_err(err)
+}
+
+#[tauri::command]
+pub async fn inspect_mlx_model(
+    state: State<'_, AppServices>,
+    input: InspectModelInput,
+) -> Result<crate::hub::ModelInspection, String> {
+    let (_, budget) = budget_from_store(&state.core.store).await.map_err(err)?;
+    let has_token = state.core.secrets.get(HF_ACCOUNT).map_err(err)?.is_some();
+    hub_client(&state)
+        .await?
+        .inspect(&input.repo_id, input.revision.as_deref(), budget, has_token)
+        .await
+        .map_err(err)
+}
+
+#[tauri::command]
+pub async fn install_catalog_model(
+    state: State<'_, AppServices>,
+    input: InstallCatalogInput,
+) -> Result<crate::storage::InstallJob, String> {
+    let (_, budget) = budget_from_store(&state.core.store).await.map_err(err)?;
+    let has_token = state.core.secrets.get(HF_ACCOUNT).map_err(err)?.is_some();
+    let curated = input
+        .catalog_id
+        .as_deref()
+        .and_then(crate::catalog::curated_by_id);
+    if let Some(model) = &curated {
+        if !model.installable {
+            return Err(model
+                .lock_reason
+                .unwrap_or("this catalog entry is locked")
+                .into());
+        }
+    }
+    let inspection = hub_client(&state)
+        .await?
+        .inspect(&input.repo_id, input.revision.as_deref(), budget, has_token)
+        .await
+        .map_err(err)?;
+    let (engine, task, capabilities, estimated, name) = if let Some(model) = curated {
+        (
+            model.runtime_engine.to_string(),
+            model.task.to_string(),
+            model
+                .capabilities
+                .iter()
+                .map(|item| (*item).to_string())
+                .collect(),
+            model.measured_peak_bytes,
+            input.name.unwrap_or_else(|| model.name.to_string()),
+        )
+    } else {
+        (
+            inspection
+                .runtime_engine
+                .clone()
+                .unwrap_or_else(|| "mlx_chat".into()),
+            inspection.task.clone().unwrap_or_else(|| "chat".into()),
+            inspection.capabilities.clone(),
+            inspection.estimated_memory_bytes,
+            input.name.unwrap_or_else(|| {
+                input
+                    .repo_id
+                    .split('/')
+                    .next_back()
+                    .unwrap_or("model")
+                    .into()
+            }),
+        )
+    };
+    state
+        .install
+        .start(
+            inspection,
+            input.catalog_id,
+            input.confirm_over_budget,
+            budget,
+            name,
+            capabilities,
+            engine,
+            task,
+            estimated,
+        )
+        .await
+        .map_err(err)
+}
+
+#[tauri::command]
+pub async fn list_install_jobs(
+    state: State<'_, AppServices>,
+) -> Result<Vec<crate::storage::InstallJob>, String> {
+    state.install.list().await.map_err(err)
+}
+
+#[tauri::command]
+pub async fn pause_install_job(
+    state: State<'_, AppServices>,
+    id: String,
+) -> Result<crate::storage::InstallJob, String> {
+    state.install.pause(&id).await.map_err(err)
+}
+
+#[tauri::command]
+pub async fn resume_install_job(
+    state: State<'_, AppServices>,
+    id: String,
+) -> Result<crate::storage::InstallJob, String> {
+    state.install.resume(&id).await.map_err(err)
+}
+
+#[tauri::command]
+pub async fn cancel_install_job(
+    state: State<'_, AppServices>,
+    id: String,
+) -> Result<crate::storage::InstallJob, String> {
+    state.install.cancel(&id).await.map_err(err)
+}
+
+#[tauri::command]
+pub async fn clear_install_job(state: State<'_, AppServices>, id: String) -> Result<(), String> {
+    state.install.clear(&id).await.map_err(err)
 }
 
 #[tauri::command]
@@ -293,10 +718,12 @@ pub async fn import_local_model(
         provider_model: input.alias_model,
         local_path: Some(imported.path),
         runtime_url: None,
+        wire_protocol: WireProtocol::OpenAiChat,
         capabilities: input.capabilities,
         enabled: true,
         state: "stopped".into(),
         size_bytes: Some(imported.size_bytes as i64),
+        local: crate::storage::LocalModelMeta::default(),
     };
     state.core.store.upsert_target(&target).await.map_err(err)?;
     Ok(target)
@@ -308,7 +735,7 @@ pub async fn download_local_model(
     input: DownloadModelInput,
 ) -> Result<ModelTarget, String> {
     let imported = library::download_hugging_face(
-        &state.core.client,
+        &crate::hub::hub_http_client().map_err(err)?,
         state.core.secrets.clone(),
         &input.repo_id,
         input.filename.as_deref(),
@@ -325,10 +752,12 @@ pub async fn download_local_model(
         provider_model: input.alias_model,
         local_path: Some(imported.path),
         runtime_url: None,
+        wire_protocol: WireProtocol::OpenAiChat,
         capabilities: input.capabilities,
         enabled: true,
         state: "stopped".into(),
         size_bytes: Some(imported.size_bytes as i64),
+        local: crate::storage::LocalModelMeta::default(),
     };
     state.core.store.upsert_target(&target).await.map_err(err)?;
     Ok(target)
@@ -396,11 +825,36 @@ pub async fn list_routes(state: State<'_, AppServices>) -> Result<Vec<ModelRoute
 #[tauri::command]
 pub async fn save_route(
     state: State<'_, AppServices>,
-    route: ModelRoute,
+    mut route: ModelRoute,
 ) -> Result<ModelRoute, String> {
     if route.alias.trim().is_empty() || route.alias.contains(char::is_whitespace) {
         return Err("alias must be non-empty and contain no whitespace".into());
     }
+    let mut shared: Option<Vec<String>> = None;
+    for route_target in route.targets.iter().filter(|target| target.enabled) {
+        let target = state
+            .core
+            .store
+            .target(&route_target.id)
+            .await
+            .map_err(err)?
+            .ok_or("route target not found")?;
+        let mut capabilities = target.capabilities.clone();
+        if target.wire_protocol == WireProtocol::AnthropicMessages {
+            capabilities.retain(|item| item != "structured_output");
+        }
+        if target.wire_protocol == WireProtocol::GeminiGenerateContent {
+            capabilities.retain(|item| item != "reasoning");
+        }
+        shared = Some(match shared {
+            Some(current) => current
+                .into_iter()
+                .filter(|item| capabilities.contains(item))
+                .collect(),
+            None => capabilities,
+        });
+    }
+    route.capabilities = shared.ok_or("route must have at least one enabled target")?;
     state.core.store.upsert_route(&route).await.map_err(err)?;
     Ok(route)
 }
@@ -408,6 +862,421 @@ pub async fn save_route(
 #[tauri::command]
 pub async fn delete_route(state: State<'_, AppServices>, alias: String) -> Result<(), String> {
     state.core.store.delete_route(&alias).await.map_err(err)
+}
+
+#[tauri::command]
+pub async fn list_routing_policies(
+    state: State<'_, AppServices>,
+) -> Result<Vec<RoutingPolicy>, String> {
+    state.core.store.routing_policies().await.map_err(err)
+}
+
+#[tauri::command]
+pub async fn save_routing_policy(
+    state: State<'_, AppServices>,
+    policy: RoutingPolicy,
+) -> Result<RoutingPolicy, String> {
+    let route = state
+        .core
+        .store
+        .route(&policy.alias)
+        .await
+        .map_err(err)?
+        .ok_or("route not found")?;
+    let mut tasks = builtin_tasks();
+    tasks.extend(state.core.store.custom_routing_tasks().await.map_err(err)?);
+    let known = tasks.into_iter().map(|task| task.id).collect::<Vec<_>>();
+    policy.validate(&known)?;
+    if let Some(target_id) = policy
+        .candidate_target_ids
+        .iter()
+        .find(|id| !route.targets.iter().any(|target| target.id == id.as_str()))
+    {
+        return Err(format!(
+            "candidate target is not part of alias: {target_id}"
+        ));
+    }
+    state
+        .core
+        .store
+        .upsert_routing_policy(&policy)
+        .await
+        .map_err(err)?;
+    Ok(policy)
+}
+
+#[tauri::command]
+pub async fn list_target_routing_profiles(
+    state: State<'_, AppServices>,
+) -> Result<Vec<TargetRoutingProfile>, String> {
+    state
+        .core
+        .store
+        .target_routing_profiles()
+        .await
+        .map_err(err)
+}
+
+#[tauri::command]
+pub async fn save_target_routing_profile(
+    state: State<'_, AppServices>,
+    profile: TargetRoutingProfile,
+) -> Result<TargetRoutingProfile, String> {
+    if state
+        .core
+        .store
+        .target(&profile.target_id)
+        .await
+        .map_err(err)?
+        .is_none()
+    {
+        return Err("model target not found".into());
+    }
+    profile.validate()?;
+    let mut known = builtin_tasks()
+        .into_iter()
+        .map(|task| task.id)
+        .collect::<Vec<_>>();
+    known.extend(
+        state
+            .core
+            .store
+            .custom_routing_tasks()
+            .await
+            .map_err(err)?
+            .into_iter()
+            .map(|task| task.id),
+    );
+    if let Some(task) = profile
+        .task_quality
+        .keys()
+        .find(|task| !known.contains(task))
+    {
+        return Err(format!("unknown task in routing profile: {task}"));
+    }
+    state
+        .core
+        .store
+        .upsert_target_routing_profile(&profile)
+        .await
+        .map_err(err)?;
+    Ok(profile)
+}
+
+#[tauri::command]
+pub async fn list_routing_tasks(
+    state: State<'_, AppServices>,
+) -> Result<Vec<RoutingTaskDefinition>, String> {
+    let mut tasks = builtin_tasks();
+    tasks.extend(state.core.store.custom_routing_tasks().await.map_err(err)?);
+    Ok(tasks)
+}
+
+#[tauri::command]
+pub async fn save_routing_task(
+    state: State<'_, AppServices>,
+    mut task: RoutingTaskDefinition,
+) -> Result<RoutingTaskDefinition, String> {
+    task.id = task
+        .id
+        .trim()
+        .to_lowercase()
+        .replace(char::is_whitespace, "_");
+    task.label = task.label.trim().to_owned();
+    task.builtin = false;
+    if task.id.is_empty()
+        || !task
+            .id
+            .chars()
+            .all(|value| value.is_ascii_alphanumeric() || matches!(value, '_' | '-'))
+        || task.label.is_empty()
+        || builtin_tasks().iter().any(|builtin| builtin.id == task.id)
+    {
+        return Err(
+            "custom task id and label must be non-empty and must not replace a built-in task"
+                .into(),
+        );
+    }
+    state
+        .core
+        .store
+        .upsert_routing_task(&task)
+        .await
+        .map_err(err)?;
+    Ok(task)
+}
+
+#[tauri::command]
+pub async fn delete_routing_task(state: State<'_, AppServices>, id: String) -> Result<(), String> {
+    if builtin_tasks().iter().any(|task| task.id == id) {
+        return Err("built-in routing tasks cannot be deleted".into());
+    }
+    if state
+        .core
+        .store
+        .routing_policies()
+        .await
+        .map_err(err)?
+        .iter()
+        .any(|policy| policy.default_task == id || policy.rules.iter().any(|rule| rule.task == id))
+        || state
+            .core
+            .store
+            .target_routing_profiles()
+            .await
+            .map_err(err)?
+            .iter()
+            .any(|profile| profile.task_quality.contains_key(&id))
+    {
+        return Err("routing task is still referenced by a policy or target profile".into());
+    }
+    state.core.store.delete_routing_task(&id).await.map_err(err)
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RoutingSimulationInput {
+    pub alias: String,
+    pub policy: Option<RoutingPolicy>,
+    pub task: Option<String>,
+    pub endpoint: Option<String>,
+    pub text: Option<String>,
+    #[serde(default)]
+    pub has_tools: bool,
+    #[serde(default)]
+    pub reasoning: bool,
+    #[serde(default)]
+    pub modalities: Vec<String>,
+    pub max_output_tokens: Option<u64>,
+}
+
+#[tauri::command]
+pub async fn simulate_routing(
+    state: State<'_, AppServices>,
+    input: RoutingSimulationInput,
+) -> Result<crate::routing::RoutingEvaluation, String> {
+    let route = state
+        .core
+        .store
+        .route(&input.alias)
+        .await
+        .map_err(err)?
+        .ok_or("route not found")?;
+    let policy = match input.policy {
+        Some(policy) => policy,
+        None => state
+            .core
+            .store
+            .routing_policy(&input.alias)
+            .await
+            .map_err(err)?
+            .unwrap_or_else(|| RoutingPolicy::new(&input.alias)),
+    };
+    let mut canonical = crate::protocol::CanonicalRequest {
+        system: input
+            .text
+            .map(|text| vec![crate::protocol::ContentBlock::Text { text }])
+            .unwrap_or_default(),
+        messages: vec![],
+        tools: vec![],
+        tool_choice: None,
+        parallel_tool_calls: None,
+        max_tokens: input.max_output_tokens,
+        temperature: None,
+        top_p: None,
+        stop: None,
+        reasoning: input
+            .reasoning
+            .then(|| serde_json::json!({"effort":"medium"})),
+        response_format: None,
+        stream: false,
+    };
+    if input.has_tools {
+        canonical.tools.push(crate::protocol::CanonicalTool {
+            name: "simulated_tool".into(),
+            description: None,
+            input_schema: serde_json::json!({"type":"object"}),
+        });
+    }
+    for modality in input.modalities {
+        let block = match modality.as_str() {
+            "vision" => crate::protocol::ContentBlock::Image {
+                url: "simulated".into(),
+                media_type: None,
+            },
+            "audio" => crate::protocol::ContentBlock::Audio {
+                url: "simulated".into(),
+                media_type: None,
+            },
+            "video" => crate::protocol::ContentBlock::Video {
+                url: "simulated".into(),
+                media_type: None,
+            },
+            _ => continue,
+        };
+        canonical.system.push(block);
+    }
+    let mut required = vec!["chat".into()];
+    if input.has_tools {
+        required.push("tools".into());
+    }
+    if input.reasoning {
+        required.push("reasoning".into());
+    }
+    evaluate_route(
+        &state.core.store,
+        &route,
+        crate::routing::RouteEvaluationInput {
+            policy: Some(&policy),
+            explicit_task: input.task.as_deref(),
+            endpoint: input.endpoint.as_deref().unwrap_or("/v1/chat/completions"),
+            canonical: Some(&canonical),
+            required_capabilities: required,
+            streaming: false,
+        },
+    )
+    .await
+    .map_err(err)
+}
+
+#[tauri::command]
+pub async fn list_routing_attempts(
+    state: State<'_, AppServices>,
+    request_id: Option<String>,
+    limit: Option<i64>,
+) -> Result<Vec<RoutingAttemptRecord>, String> {
+    state
+        .core
+        .store
+        .routing_attempts(request_id.as_deref(), limit.unwrap_or(100))
+        .await
+        .map_err(err)
+}
+
+#[tauri::command]
+pub async fn export_routing_config(
+    state: State<'_, AppServices>,
+) -> Result<RoutingConfigExport, String> {
+    Ok(RoutingConfigExport {
+        schema: "local-ai-router/routing-policy/v1".into(),
+        tasks: state.core.store.custom_routing_tasks().await.map_err(err)?,
+        profiles: state
+            .core
+            .store
+            .target_routing_profiles()
+            .await
+            .map_err(err)?,
+        policies: state.core.store.routing_policies().await.map_err(err)?,
+    })
+}
+
+#[derive(Debug, Serialize)]
+pub struct RoutingImportPreview {
+    pub valid: bool,
+    pub task_count: usize,
+    pub profile_count: usize,
+    pub policy_count: usize,
+    pub warnings: Vec<String>,
+}
+
+#[tauri::command]
+pub async fn import_routing_config(
+    state: State<'_, AppServices>,
+    config: RoutingConfigExport,
+    apply: bool,
+) -> Result<RoutingImportPreview, String> {
+    if config.schema != "local-ai-router/routing-policy/v1" {
+        return Err("unsupported routing configuration schema".into());
+    }
+    let builtin = builtin_tasks()
+        .into_iter()
+        .map(|task| task.id)
+        .collect::<Vec<_>>();
+    let mut known = builtin.clone();
+    let mut task_ids = HashSet::new();
+    for task in &config.tasks {
+        if task.id.trim().is_empty()
+            || !task
+                .id
+                .chars()
+                .all(|value| value.is_ascii_alphanumeric() || matches!(value, '_' | '-'))
+            || task.label.trim().is_empty()
+            || task.builtin
+            || builtin.contains(&task.id)
+            || !task_ids.insert(task.id.clone())
+        {
+            return Err("invalid or duplicate custom routing task".into());
+        }
+        known.push(task.id.clone());
+    }
+    let targets = state.core.store.targets().await.map_err(err)?;
+    let routes = state.core.store.routes().await.map_err(err)?;
+    let mut profile_ids = HashSet::new();
+    for profile in &config.profiles {
+        profile.validate()?;
+        if !profile_ids.insert(profile.target_id.clone()) {
+            return Err(format!("duplicate routing profile: {}", profile.target_id));
+        }
+        if let Some(task) = profile
+            .task_quality
+            .keys()
+            .find(|task| !known.contains(task))
+        {
+            return Err(format!("unknown task in routing profile: {task}"));
+        }
+        if !targets.iter().any(|target| target.id == profile.target_id) {
+            return Err(format!(
+                "unknown target in routing profile: {}",
+                profile.target_id
+            ));
+        }
+    }
+    let mut policy_aliases = HashSet::new();
+    for policy in &config.policies {
+        policy.validate(&known)?;
+        if !policy_aliases.insert(policy.alias.clone()) {
+            return Err(format!("duplicate routing policy: {}", policy.alias));
+        }
+        if !routes.iter().any(|route| route.alias == policy.alias) {
+            return Err(format!("unknown alias in routing policy: {}", policy.alias));
+        }
+        let route = routes
+            .iter()
+            .find(|route| route.alias == policy.alias)
+            .expect("route existence checked above");
+        if let Some(target_id) = policy
+            .candidate_target_ids
+            .iter()
+            .find(|id| !route.targets.iter().any(|target| target.id == id.as_str()))
+        {
+            return Err(format!(
+                "candidate target is not part of alias: {target_id}"
+            ));
+        }
+    }
+    let warnings = config
+        .profiles
+        .iter()
+        .filter(|profile| {
+            profile.input_price_per_million.is_none() || profile.output_price_per_million.is_none()
+        })
+        .map(|profile| format!("{} has unknown pricing", profile.target_id))
+        .collect();
+    if apply {
+        state
+            .core
+            .store
+            .import_routing_config(&config)
+            .await
+            .map_err(err)?;
+    }
+    Ok(RoutingImportPreview {
+        valid: true,
+        task_count: config.tasks.len(),
+        profile_count: config.profiles.len(),
+        policy_count: config.policies.len(),
+        warnings,
+    })
 }
 
 #[tauri::command]
@@ -546,6 +1415,112 @@ pub async fn save_setting(
         .core
         .store
         .set_setting(&key, &value)
+        .await
+        .map_err(err)
+}
+
+#[tauri::command]
+pub async fn get_resource_policy(state: State<'_, AppServices>) -> Result<ResourcePolicy, String> {
+    let logical_cpus = crate::resource::host_performance_cpu_count();
+    state
+        .core
+        .store
+        .resource_policy(logical_cpus)
+        .await
+        .map_err(err)
+}
+
+#[tauri::command]
+pub fn get_resource_profile_preset(profile: ResourceProfile) -> Result<ResourcePolicy, String> {
+    if profile == ResourceProfile::Custom {
+        return Err("custom is not a preset".into());
+    }
+    Ok(ResourcePolicy::preset(
+        profile,
+        crate::resource::host_performance_cpu_count(),
+    ))
+}
+
+#[tauri::command]
+pub async fn save_resource_policy(
+    state: State<'_, AppServices>,
+    policy: ResourcePolicy,
+) -> Result<(), String> {
+    policy.validate().map_err(err)?;
+    state
+        .core
+        .store
+        .set_resource_policy(&policy)
+        .await
+        .map_err(err)?;
+    state
+        .core
+        .store
+        .set_setting(
+            "memory_budget_percent",
+            &policy.memory_budget_percent.to_string(),
+        )
+        .await
+        .map_err(err)?;
+    state
+        .core
+        .store
+        .set_setting(
+            "idle_unload_minutes",
+            &policy.idle_unload_minutes.to_string(),
+        )
+        .await
+        .map_err(err)?;
+    state.runtimes.apply_policy(policy).map_err(err)
+}
+
+#[tauri::command]
+pub async fn save_model_resource_overrides(
+    state: State<'_, AppServices>,
+    id: String,
+    overrides: Option<ResourceOverrides>,
+) -> Result<ModelTarget, String> {
+    let mut target = state
+        .core
+        .store
+        .target(&id)
+        .await
+        .map_err(err)?
+        .ok_or("model not found")?;
+    if !matches!(target.kind, TargetKind::Gguf | TargetKind::Mlx) {
+        return Err("resource overrides are only available for local models".into());
+    }
+    target.local.resource_overrides = overrides;
+    state
+        .core
+        .effective_resource_policy(&target)
+        .await
+        .map_err(err)?;
+    state.core.store.upsert_target(&target).await.map_err(err)?;
+    state.runtimes.mark_target_pending_restart(&id);
+    Ok(target)
+}
+
+#[tauri::command]
+pub async fn clear_kv_cache(
+    state: State<'_, AppServices>,
+    target_id: Option<String>,
+) -> Result<(), String> {
+    if let Some(id) = target_id.as_deref() {
+        let target = state
+            .core
+            .store
+            .target(id)
+            .await
+            .map_err(err)?
+            .ok_or("model not found")?;
+        if target.kind != TargetKind::Gguf {
+            return Err("disk KV is only available for GGUF models".into());
+        }
+    }
+    state
+        .runtimes
+        .clear_kv_cache(target_id.as_deref())
         .await
         .map_err(err)
 }

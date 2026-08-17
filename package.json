@@ -12,6 +12,7 @@
     "tauri": "tauri"
   },
   "dependencies": {
+    "@assistant-ui/react": "^0.15.1",
     "@tauri-apps/api": "^2.8.0",
     "@tauri-apps/plugin-autostart": "^2.5.0",
     "@tauri-apps/plugin-dialog": "^2.4.0",
@@ -21,6 +22,8 @@
     "react-dom": "^19.1.0"
   },
   "devDependencies": {
+    "@anthropic-ai/sdk": "^0.117.1",
+    "@google/genai": "^2.17.1",
     "@tauri-apps/cli": "^2.8.0",
     "@testing-library/jest-dom": "^6.6.3",
     "@testing-library/react": "^16.1.0",

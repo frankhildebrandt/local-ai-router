@@ -33,13 +33,20 @@ async fn main() -> anyhow::Result<()> {
         provider_id: None,
         name: "Contract backend".into(),
         kind: TargetKind::Gguf,
+        wire_protocol: local_ai_router_lib::providers::WireProtocol::OpenAiChat,
         provider_model: "real-model".into(),
         local_path: None,
         runtime_url: Some(upstream_url),
-        capabilities: vec!["chat".into(), "embeddings".into()],
+        capabilities: vec![
+            "chat".into(),
+            "streaming".into(),
+            "tools".into(),
+            "embeddings".into(),
+        ],
         enabled: true,
         state: "ready".into(),
         size_bytes: None,
+        local: local_ai_router_lib::storage::LocalModelMeta::default(),
     };
     store.upsert_target(&target).await?;
     store
@@ -92,6 +99,17 @@ async fn upstream(OriginalUri(uri): OriginalUri, Json(payload): Json<Value>) -> 
                 .header(header::CONTENT_TYPE, "text/event-stream")
                 .body(Body::from(body))
                 .unwrap()
+        }
+        "/v1/chat/completions"
+            if payload
+                .get("tools")
+                .and_then(Value::as_array)
+                .is_some_and(|tools| !tools.is_empty()) =>
+        {
+            response(
+                StatusCode::OK,
+                json!({"id":"chatcmpl-tool","object":"chat.completion","created":1,"model":"real-model","choices":[{"index":0,"message":{"role":"assistant","content":"","tool_calls":[{"id":"call_lookup","type":"function","function":{"name":"lookup","arguments":"{\"query\":\"hello\"}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":2,"completion_tokens":1,"total_tokens":3}}),
+            )
         }
         "/v1/chat/completions" => response(
             StatusCode::OK,

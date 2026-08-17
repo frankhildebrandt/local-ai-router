@@ -16,6 +16,8 @@ use subtle::ConstantTimeEq;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::{
+    oauth::OAuthManager,
+    providers::{provider_preset, validate_cloud_base_url, AuthMode, AuthScheme},
     secrets::{
         generate_local_token, local_api_key_account, provider_account, SecretStore, LOCAL_API_KEY,
     },
@@ -27,11 +29,14 @@ pub struct AppCore {
     pub store: Store,
     pub secrets: Arc<dyn SecretStore>,
     pub client: Client,
+    pub oauth: OAuthManager,
     local_gates: Arc<parking_lot::Mutex<HashMap<String, Arc<InferenceGate>>>>,
 }
 
 struct InferenceGate {
     active: Arc<Semaphore>,
+    limit: usize,
+    active_count: AtomicUsize,
     queued: AtomicUsize,
     last_used: parking_lot::Mutex<std::time::Instant>,
     token: parking_lot::Mutex<Option<String>>,
@@ -44,7 +49,16 @@ pub struct LocalInferencePermit {
 
 impl Drop for LocalInferencePermit {
     fn drop(&mut self) {
+        self.gate.active_count.fetch_sub(1, Ordering::AcqRel);
         *self.gate.last_used.lock() = std::time::Instant::now();
+    }
+}
+
+struct WaitingGuard(Arc<InferenceGate>);
+
+impl Drop for WaitingGuard {
+    fn drop(&mut self) {
+        self.0.queued.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -54,27 +68,54 @@ pub struct LocalActivityRegistry {
 }
 
 impl LocalActivityRegistry {
-    fn gate(&self, id: &str) -> Arc<InferenceGate> {
-        self.gates
-            .lock()
-            .entry(id.to_owned())
-            .or_insert_with(|| {
-                Arc::new(InferenceGate {
-                    active: Arc::new(Semaphore::new(1)),
-                    queued: AtomicUsize::new(0),
-                    last_used: parking_lot::Mutex::new(std::time::Instant::now()),
-                    token: parking_lot::Mutex::new(None),
-                })
-            })
-            .clone()
+    fn gate(&self, id: &str, limit: usize) -> Arc<InferenceGate> {
+        let mut gates = self.gates.lock();
+        let previous = gates.get(id).cloned();
+        if let Some(gate) = previous.as_ref() {
+            return gate.clone();
+        }
+        let gate = Arc::new(InferenceGate {
+            active: Arc::new(Semaphore::new(limit)),
+            limit,
+            active_count: AtomicUsize::new(0),
+            queued: AtomicUsize::new(0),
+            last_used: parking_lot::Mutex::new(std::time::Instant::now()),
+            token: parking_lot::Mutex::new(previous.and_then(|gate| gate.token.lock().clone())),
+        });
+        gates.insert(id.to_owned(), gate.clone());
+        gate
+    }
+
+    pub fn configure(&self, id: &str, limit: usize) -> anyhow::Result<()> {
+        let mut gates = self.gates.lock();
+        let previous = gates.get(id).cloned();
+        if previous.as_ref().is_some_and(|gate| {
+            gate.active_count.load(Ordering::Acquire) > 0 || gate.queued.load(Ordering::Acquire) > 0
+        }) {
+            anyhow::bail!("model still has active or queued requests");
+        }
+        let gate = Arc::new(InferenceGate {
+            active: Arc::new(Semaphore::new(limit)),
+            limit,
+            active_count: AtomicUsize::new(0),
+            queued: AtomicUsize::new(0),
+            last_used: parking_lot::Mutex::new(std::time::Instant::now()),
+            token: parking_lot::Mutex::new(previous.and_then(|gate| gate.token.lock().clone())),
+        });
+        gates.insert(id.to_owned(), gate);
+        Ok(())
     }
 
     pub fn touch(&self, id: &str) {
-        *self.gate(id).last_used.lock() = std::time::Instant::now();
+        let gate = self.gates.lock().get(id).cloned();
+        if let Some(gate) = gate {
+            *gate.last_used.lock() = std::time::Instant::now();
+        }
     }
 
     pub fn set_token(&self, id: &str, token: String) {
-        *self.gate(id).token.lock() = Some(token);
+        let gate = self.gate(id, 1);
+        *gate.token.lock() = Some(token);
     }
 
     pub fn token(&self, id: &str) -> Option<String> {
@@ -86,7 +127,13 @@ impl LocalActivityRegistry {
 
     pub fn try_reserve_for_unload(&self, id: &str) -> Option<OwnedSemaphorePermit> {
         let gate = self.gates.lock().get(id)?.clone();
-        gate.active.clone().try_acquire_owned().ok()
+        if gate.queued.load(Ordering::Acquire) > 0 {
+            return None;
+        }
+        gate.active
+            .clone()
+            .try_acquire_many_owned(gate.limit as u32)
+            .ok()
     }
 
     pub fn idle_for(&self, id: &str) -> Duration {
@@ -102,6 +149,14 @@ impl LocalActivityRegistry {
             .lock()
             .get(id)
             .map(|gate| gate.queued.load(Ordering::Acquire))
+            .unwrap_or(0)
+    }
+
+    pub fn active(&self, id: &str) -> usize {
+        self.gates
+            .lock()
+            .get(id)
+            .map(|gate| gate.active_count.load(Ordering::Acquire))
             .unwrap_or(0)
     }
 }
@@ -129,11 +184,14 @@ impl AppCore {
         let client = Client::builder()
             .connect_timeout(Duration::from_secs(10))
             .user_agent("LocalAI-Router/0.1")
+            .redirect(reqwest::redirect::Policy::none())
             .build()?;
+        let oauth = OAuthManager::new(client.clone(), secrets.clone());
         Ok(Self {
             store,
             secrets,
             client,
+            oauth,
             local_gates: Arc::new(parking_lot::Mutex::new(HashMap::new())),
         })
     }
@@ -260,9 +318,12 @@ impl AppCore {
     }
 
     pub async fn authorized(&self, authorization: Option<&str>) -> Option<String> {
-        let Some(candidate) = authorization.and_then(|value| value.strip_prefix("Bearer ")) else {
-            return None;
-        };
+        let candidate = authorization.and_then(|value| value.strip_prefix("Bearer "))?;
+        self.authorized_token(Some(candidate)).await
+    }
+
+    pub async fn authorized_token(&self, candidate: Option<&str>) -> Option<String> {
+        let candidate = candidate?;
         let Ok(keys) = self.store.active_local_api_key_hashes().await else {
             return None;
         };
@@ -286,9 +347,9 @@ impl AppCore {
     pub async fn target_endpoint(
         &self,
         target: &ModelTarget,
-    ) -> anyhow::Result<(String, Option<String>)> {
+    ) -> anyhow::Result<(String, Option<String>, Option<String>)> {
         match target.kind {
-            crate::domain::TargetKind::OpenAi | crate::domain::TargetKind::OpenRouter => {
+            crate::domain::TargetKind::Cloud => {
                 let provider_id = target
                     .provider_id
                     .as_deref()
@@ -301,14 +362,18 @@ impl AppCore {
                 if !provider.enabled {
                     anyhow::bail!("provider is disabled");
                 }
-                let credential = self
-                    .secrets
-                    .get(&provider_account(provider_id))?
-                    .context("provider credential missing")?;
-                Ok((
-                    provider.base_url.trim_end_matches('/').to_owned(),
-                    Some(credential),
-                ))
+                let base_url = validate_cloud_base_url(
+                    &provider.base_url,
+                    provider.preset_id == "custom_openai" || cfg!(test),
+                )?;
+                let (credential, account_id) = if provider.auth_mode == AuthMode::OpenAiSubscription
+                {
+                    let credential = self.oauth.access_token(provider_id).await?;
+                    (credential.access_token, credential.account_id)
+                } else {
+                    (self.provider_api_key(provider_id)?, None)
+                };
+                Ok((base_url, Some(credential), account_id))
             }
             crate::domain::TargetKind::Gguf | crate::domain::TargetKind::Mlx => {
                 let token = self
@@ -323,6 +388,7 @@ impl AppCore {
                         .trim_end_matches('/')
                         .to_owned(),
                     Some(token),
+                    None,
                 ))
             }
         }
@@ -336,6 +402,27 @@ impl AppCore {
         Ok(providers)
     }
 
+    pub fn save_provider_api_key(&self, provider_id: &str, key: &str) -> anyhow::Result<()> {
+        let value = serde_json::json!({ "version": 1, "type": "api_key", "key": key });
+        self.secrets
+            .set(&provider_account(provider_id), &value.to_string())
+    }
+
+    pub fn provider_api_key(&self, provider_id: &str) -> anyhow::Result<String> {
+        let stored = self
+            .secrets
+            .get(&provider_account(provider_id))?
+            .context("provider credential missing")?;
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&stored) else {
+            return Ok(stored);
+        };
+        value
+            .get("key")
+            .and_then(|key| key.as_str())
+            .map(str::to_owned)
+            .context("provider API key missing")
+    }
+
     pub async fn acquire_local_slot(
         &self,
         target: &ModelTarget,
@@ -346,20 +433,19 @@ impl AppCore {
         ) {
             return Ok(None);
         }
+        let policy = self.effective_resource_policy(target).await?;
         let activity = self.local_activity();
-        let gate = activity.gate(&target.id);
-        let waiting = gate.queued.fetch_add(1, Ordering::AcqRel);
-        if waiting >= 8 {
-            gate.queued.fetch_sub(1, Ordering::AcqRel);
-            anyhow::bail!("local inference queue is full");
-        }
+        let gate = activity.gate(&target.id, policy.max_parallel_prompts);
+        gate.queued.fetch_add(1, Ordering::AcqRel);
+        let waiting = WaitingGuard(gate.clone());
         let permit = gate
             .active
             .clone()
             .acquire_owned()
             .await
             .context("local inference gate closed")?;
-        gate.queued.fetch_sub(1, Ordering::AcqRel);
+        drop(waiting);
+        gate.active_count.fetch_add(1, Ordering::AcqRel);
         *gate.last_used.lock() = std::time::Instant::now();
         Ok(Some(LocalInferencePermit {
             _permit: permit,
@@ -367,20 +453,45 @@ impl AppCore {
         }))
     }
 
+    pub async fn effective_resource_policy(
+        &self,
+        target: &ModelTarget,
+    ) -> anyhow::Result<crate::resource::ResourcePolicy> {
+        let logical_cpus = std::thread::available_parallelism()
+            .map(usize::from)
+            .unwrap_or(1);
+        let policy = self.store.resource_policy(logical_cpus).await?;
+        let resolved = target
+            .local
+            .resource_overrides
+            .as_ref()
+            .map(|overrides| policy.resolve(overrides))
+            .unwrap_or(policy);
+        resolved.validate()?;
+        Ok(resolved)
+    }
+
     pub async fn validate_provider(
         &self,
         provider: &Provider,
         credential: &str,
     ) -> anyhow::Result<Vec<String>> {
-        let response = self
-            .client
-            .get(format!(
-                "{}/models",
-                provider.base_url.trim_end_matches('/')
-            ))
-            .bearer_auth(credential)
-            .send()
-            .await?;
+        let preset = provider_preset(&provider.preset_id).context("provider preset missing")?;
+        let mut request = self.client.get(format!(
+            "{}/models",
+            provider.base_url.trim_end_matches('/')
+        ));
+        request = match preset.auth_scheme {
+            AuthScheme::Bearer => request.bearer_auth(credential),
+            AuthScheme::XApiKey => request
+                .header("x-api-key", credential)
+                .header("anthropic-version", "2023-06-01"),
+            AuthScheme::XGoogApiKey => request.header("x-goog-api-key", credential),
+            AuthScheme::OpenAiSubscription => {
+                anyhow::bail!("subscription providers use their curated model catalog")
+            }
+        };
+        let response = request.send().await?;
         let status = response.status();
         let body: serde_json::Value = response
             .json()
@@ -391,14 +502,17 @@ impl AppCore {
         }
         Ok(body
             .get("data")
+            .or_else(|| body.get("models"))
+            .or_else(|| body.as_array().map(|_| &body))
             .and_then(|value| value.as_array())
             .into_iter()
             .flatten()
             .filter_map(|value| {
                 value
                     .get("id")
+                    .or_else(|| value.get("name"))
                     .and_then(|id| id.as_str())
-                    .map(str::to_owned)
+                    .map(|id| id.trim_start_matches("models/").to_owned())
             })
             .collect())
     }
@@ -436,10 +550,12 @@ mod tests {
             provider_model: "local".into(),
             local_path: None,
             runtime_url: Some("http://127.0.0.1:1/v1".into()),
+            wire_protocol: crate::providers::WireProtocol::OpenAiChat,
             capabilities: vec!["chat".into()],
             enabled: true,
             state: "ready".into(),
             size_bytes: None,
+            local: crate::storage::LocalModelMeta::default(),
         }
     }
 
@@ -504,7 +620,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn local_inference_allows_one_active_and_eight_queued_requests() {
+    async fn local_inference_queue_is_unbounded_and_cancellation_safe() {
         let core = AppCore::new(
             Store::memory().await.unwrap(),
             Arc::new(MemorySecrets::default()),
@@ -513,7 +629,7 @@ mod tests {
         let target = local_target();
         let active = core.acquire_local_slot(&target).await.unwrap().unwrap();
         let mut waiting = Vec::new();
-        for _ in 0..8 {
+        for _ in 0..32 {
             let core = core.clone();
             let target = target.clone();
             waiting.push(tokio::spawn(async move {
@@ -529,7 +645,7 @@ mod tests {
                     .unwrap()
                     .queued
                     .load(Ordering::Acquire);
-                if queued == 8 {
+                if queued == 32 {
                     break;
                 }
                 tokio::task::yield_now().await;
@@ -537,11 +653,23 @@ mod tests {
         })
         .await
         .unwrap();
-        assert!(core.acquire_local_slot(&target).await.is_err());
-        drop(active);
-        for task in waiting {
-            drop(task.await.unwrap().unwrap());
+        for task in waiting.drain(..) {
+            task.abort();
         }
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while core.local_activity().queued(&target.id) != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        drop(active);
+        let permit = tokio::time::timeout(Duration::from_secs(1), core.acquire_local_slot(&target))
+            .await
+            .expect("a new request should be admitted after cancelled waiters")
+            .unwrap()
+            .unwrap();
+        drop(permit);
     }
 
     #[tokio::test]
@@ -557,5 +685,21 @@ mod tests {
         assert!(activity.try_reserve_for_unload(&target.id).is_none());
         drop(request);
         assert!(activity.try_reserve_for_unload(&target.id).is_some());
+    }
+
+    #[tokio::test]
+    async fn legacy_raw_provider_keys_are_read_and_rewritten_as_versioned_records() {
+        let secrets: Arc<dyn SecretStore> = Arc::new(MemorySecrets::default());
+        secrets
+            .set(&provider_account("provider"), "legacy-key")
+            .unwrap();
+        let core = AppCore::new(Store::memory().await.unwrap(), secrets.clone()).unwrap();
+        assert_eq!(core.provider_api_key("provider").unwrap(), "legacy-key");
+        core.save_provider_api_key("provider", "legacy-key")
+            .unwrap();
+        let stored = secrets.get(&provider_account("provider")).unwrap().unwrap();
+        let value: serde_json::Value = serde_json::from_str(&stored).unwrap();
+        assert_eq!(value["version"], 1);
+        assert_eq!(value["key"], "legacy-key");
     }
 }

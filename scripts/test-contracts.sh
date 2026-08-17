@@ -12,6 +12,7 @@ for _ in $(seq 1 120); do
 done
 curl --silent --fail http://127.0.0.1:11436/health >/dev/null
 node "$PROJECT_DIR/tests/openai-contract.mjs"
+node "$PROJECT_DIR/tests/multiprotocol-contract.mjs"
 
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 if "$PYTHON_BIN" -c 'import openai' >/dev/null 2>&1; then
@@ -20,4 +21,3 @@ elif [[ "${REQUIRE_PYTHON_CONTRACT:-0}" == "1" ]]; then
   echo "Python OpenAI SDK is required but unavailable" >&2
   exit 1
 fi
-

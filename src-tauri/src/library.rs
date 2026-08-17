@@ -70,7 +70,7 @@ pub async fn download_hugging_face(
         download_resumable(
             client,
             token.as_deref(),
-            &format!("https://huggingface.co/{repo_id}/resolve/main/{file}"),
+            &format!("https://huggingface.co/{repo_id}/resolve/main/{file}?download=true"),
             &destination,
         )
         .await?;
@@ -104,7 +104,7 @@ struct HfFile {
     kind: String,
 }
 
-fn safe_model_path(value: &str) -> anyhow::Result<PathBuf> {
+pub fn safe_model_path(value: &str) -> anyhow::Result<PathBuf> {
     let path = Path::new(value);
     if path.as_os_str().is_empty()
         || path
@@ -173,7 +173,13 @@ async fn download_resumable(
     if let Some(token) = token {
         request = request.bearer_auth(token);
     }
-    let response = request.send().await?.error_for_status()?;
+    let response = request.send().await?;
+    if response.status().is_redirection() {
+        anyhow::bail!(
+            "Hugging Face returned a redirect instead of file bytes; downloads must follow the CDN"
+        );
+    }
+    let response = response.error_for_status()?;
     let append = offset > 0 && response.status() == reqwest::StatusCode::PARTIAL_CONTENT;
     let mut file = fs::OpenOptions::new()
         .create(true)

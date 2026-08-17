@@ -1,6 +1,9 @@
 import Foundation
 import Network
+import CoreImage
+import MLX
 import MLXLLM
+import MLXVLM
 import MLXLMCommon
 import MLXHuggingFace
 import HuggingFace
@@ -12,6 +15,8 @@ struct Options {
     let port: NWEndpoint.Port
     let alias: String
     let token: String
+    let stub: Bool
+    let memoryLimitMiB: Int?
 
     static func parse() throws -> Options {
         let args = Array(CommandLine.arguments.dropFirst())
@@ -20,36 +25,151 @@ struct Options {
         let host = NWEndpoint.Host(value("--host") ?? "127.0.0.1")
         guard let port = NWEndpoint.Port(value("--port") ?? "12100") else { throw ServerError.badRequest("invalid --port") }
         guard let token = ProcessInfo.processInfo.environment["LOCAL_AI_ROUTER_RUNTIME_TOKEN"], !token.isEmpty else { throw ServerError.badRequest("runtime token is required") }
-        return Options(model: model, host: host, port: port, alias: value("--alias") ?? "local-mlx", token: token)
+        let stub = ProcessInfo.processInfo.environment["LOCAL_AI_ROUTER_STUB_ENGINE"] == "1" || args.contains("--stub")
+        let memoryLimitMiB = value("--memory-limit-mib").flatMap(Int.init)
+        if let memoryLimitMiB, memoryLimitMiB < 512 { throw ServerError.badRequest("--memory-limit-mib must be at least 512") }
+        return Options(model: model, host: host, port: port, alias: value("--alias") ?? "local-mlx", token: token, stub: stub, memoryLimitMiB: memoryLimitMiB)
     }
 }
 
 enum ServerError: Error { case badRequest(String) }
 
-actor InferenceEngine {
-    let container: ModelContainer
-    let alias: String
+private let vlmTypes: Set<String> = [
+    "qwen2_vl", "qwen2_5_vl", "qwen3_vl", "gemma3", "gemma3n", "paligemma", "idefics3", "smolvlm",
+    "fastvlm", "llava_qwen2", "pixtral", "mistral3", "lfm2_vl", "lfm2-vl"
+]
 
-    init(modelPath: String, alias: String) async throws {
+actor InferenceEngine {
+    let container: ModelContainer?
+    let alias: String
+    let stub: Bool
+    let vision: Bool
+
+    init(modelPath: String, alias: String, stub: Bool) async throws {
         self.alias = alias
+        self.stub = stub
+        if stub {
+            self.container = nil
+            self.vision = true
+            return
+        }
+        let modelType = (try? InferenceEngine.readModelType(modelPath)) ?? ""
+        self.vision = vlmTypes.contains(modelType)
         let configuration = ModelConfiguration(directory: URL(filePath: modelPath))
+        // Importing MLXVLM registers its factory trampoline so this macro can
+        // resolve either MLXLLM or MLXVLM from the pinned 3.31.4 registry.
         self.container = try await #huggingFaceLoadModelContainer(configuration: configuration)
     }
 
     func generate(payload: sending [String: Any]) async throws -> AsyncThrowingStream<String, Error> {
+        let parsed = ParsedPrompt.parse(payload)
+        if !parsed.videos.isEmpty {
+            throw ServerError.badRequest("video input is not enabled for this pinned MLX runtime")
+        }
+        if !parsed.audios.isEmpty {
+            throw ServerError.badRequest("audio input is not enabled for this pinned MLX runtime")
+        }
+        if stub {
+            return AsyncThrowingStream { continuation in
+                continuation.yield(parsed.images.isEmpty ? "stub-text" : "stub-vision")
+                continuation.finish()
+            }
+        }
+        guard let container else { throw ServerError.badRequest("model is not loaded") }
         let maxTokens = payload["max_tokens"] as? Int ?? payload["max_output_tokens"] as? Int ?? 512
         let temperature = payload["temperature"] as? Float ?? Float(payload["temperature"] as? Double ?? 0.7)
         let parameters = GenerateParameters(maxTokens: maxTokens, temperature: temperature)
-        let messages = payload["messages"] as? [[String: Any]]
-        let system = messages?.filter { ($0["role"] as? String) == "system" || ($0["role"] as? String) == "developer" }.compactMap { $0["content"] as? String }.joined(separator: "\n")
-        let chatPrompt = messages?.filter { ($0["role"] as? String) != "system" && ($0["role"] as? String) != "developer" }.compactMap { message -> String? in
-            guard let role = message["role"] as? String, let content = message["content"] as? String else { return nil }
-            return "\(role): \(content)"
-        }.joined(separator: "\n")
-        let input = payload["input"] as? String
-        let prompt = chatPrompt ?? input ?? payload["prompt"] as? String ?? ""
-        let session = ChatSession(container, instructions: system?.isEmpty == false ? system : nil, generateParameters: parameters)
-        return session.streamResponse(to: prompt)
+        if vision || !parsed.images.isEmpty {
+            let prompt = parsed.prompt
+            let system = parsed.system
+            let imageURLs = parsed.images
+            return AsyncThrowingStream { continuation in
+                Task {
+                    do {
+                        try await container.perform { context in
+                            let images = imageURLs.compactMap { UserInput.Image.fromDataURL($0) }
+                            var chat: [Chat.Message] = []
+                            if !system.isEmpty { chat.append(.system(system)) }
+                            chat.append(.user(prompt, images: images))
+                            let prepared = try await context.processor.prepare(input: UserInput(chat: chat))
+                            let stream = try MLXLMCommon.generate(input: prepared, parameters: parameters, context: context)
+                            for await item in stream {
+                                if case .chunk(let text) = item { continuation.yield(text) }
+                            }
+                        }
+                        continuation.finish()
+                    } catch {
+                        continuation.finish(throwing: error)
+                    }
+                }
+            }
+        }
+        let session = ChatSession(container, instructions: parsed.system.isEmpty ? nil : parsed.system, generateParameters: parameters)
+        return session.streamResponse(to: parsed.prompt)
+    }
+
+    static func readModelType(_ path: String) throws -> String {
+        let data = try Data(contentsOf: URL(filePath: path).appending(path: "config.json"))
+        let json = try JSONSerialization.jsonObject(with: data) as? [String: Any]
+        return json?["model_type"] as? String ?? ""
+    }
+}
+
+struct ParsedPrompt {
+    var system: String
+    var prompt: String
+    var images: [String]
+    var audios: [String]
+    var videos: [String]
+
+    static func parse(_ payload: [String: Any]) -> ParsedPrompt {
+        var system = ""
+        var lines: [String] = []
+        var images: [String] = []
+        var audios: [String] = []
+        var videos: [String] = []
+        func consume(_ content: Any, role: String) {
+            if let text = content as? String {
+                if role == "system" || role == "developer" { system += (system.isEmpty ? "" : "\n") + text }
+                else { lines.append("\(role): \(text)") }
+                return
+            }
+            guard let blocks = content as? [[String: Any]] else { return }
+            var text = ""
+            for block in blocks {
+                let type = block["type"] as? String
+                if let value = block["text"] as? String { text += value }
+                if type == "image_url" || type == "input_image" {
+                    if let url = (block["image_url"] as? [String: Any])?["url"] as? String ?? block["image_url"] as? String { images.append(url) }
+                }
+                if type == "input_audio" {
+                    if let audio = block["input_audio"] as? [String: Any], let data = audio["data"] as? String {
+                        audios.append("data:audio/\(audio["format"] as? String ?? "wav");base64,\(data)")
+                    }
+                }
+                if type == "input_video" {
+                    if let video = block["input_video"] as? [String: Any], let url = video["url"] as? String { videos.append(url) }
+                }
+            }
+            if role == "system" || role == "developer" { system += (system.isEmpty ? "" : "\n") + text }
+            else if !text.isEmpty { lines.append("\(role): \(text)") }
+        }
+        if let messages = payload["messages"] as? [[String: Any]] {
+            for message in messages {
+                consume(message["content"] as Any, role: message["role"] as? String ?? "user")
+            }
+        }
+        let prompt = lines.joined(separator: "\n").isEmpty ? (payload["input"] as? String ?? payload["prompt"] as? String ?? "") : lines.joined(separator: "\n")
+        return ParsedPrompt(system: system, prompt: prompt, images: images, audios: audios, videos: videos)
+    }
+}
+
+extension UserInput.Image {
+    static func fromDataURL(_ url: String) -> UserInput.Image? {
+        guard let range = url.range(of: "base64,") else { return nil }
+        let data = Data(base64Encoded: String(url[range.upperBound...]))
+        guard let data else { return nil }
+        return .ciImage(CIImage(data: data) ?? CIImage.empty())
     }
 }
 
@@ -73,7 +193,10 @@ final class HTTPServer: @unchecked Sendable {
 
     func run() async {
         listener.start(queue: queue)
-        await withCheckedContinuation { (_: CheckedContinuation<Void, Never>) in }
+        while !Task.isCancelled {
+            try? await Task.sleep(for: .seconds(3600))
+        }
+        listener.cancel()
     }
 
     private func accept(_ connection: NWConnection) {
@@ -101,7 +224,8 @@ final class HTTPServer: @unchecked Sendable {
         guard request.headers["authorization"] == "Bearer \(token)" else {
             sendJSON(connection, status: "401 Unauthorized", object: errorObject("invalid_api_key", "Invalid internal runtime credential")); return
         }
-        if request.path == "/v1/models" { sendJSON(connection, object: ["object": "list", "data": [["id": engine.alias, "object": "model", "owned_by": "mlx"]]]); return }
+        let alias = engine.alias
+        if request.path == "/v1/models" { sendJSON(connection, object: ["object": "list", "data": [["id": alias, "object": "model", "owned_by": "mlx"]]]); return }
         let supported = ["/v1/chat/completions", "/v1/responses", "/v1/completions"]
         guard request.method == "POST", supported.contains(request.path), let payload = try? JSONSerialization.jsonObject(with: request.body) as? [String: Any] else {
             sendJSON(connection, status: "404 Not Found", object: errorObject("route_not_found", "Unsupported endpoint")); return
@@ -117,7 +241,7 @@ final class HTTPServer: @unchecked Sendable {
             } else {
                 var text = ""
                 for try await chunk in stream { text += chunk }
-                sendJSON(connection, object: completionObject(path: request.path, alias: engine.alias, text: text))
+                sendJSON(connection, object: completionObject(path: request.path, alias: alias, text: text))
             }
         } catch {
             sendJSON(connection, status: "500 Internal Server Error", object: errorObject("inference_error", String(describing: error)))
@@ -211,7 +335,11 @@ func errorObject(_ code: String, _ message: String) -> [String: Any] { ["error":
 @main struct MLXServer {
     static func main() async throws {
         let options = try Options.parse()
-        let engine = try await InferenceEngine(modelPath: options.model, alias: options.alias)
+        if let limit = options.memoryLimitMiB {
+            Memory.memoryLimit = limit * 1024 * 1024
+            Memory.cacheLimit = min(max(64, limit / 8), 512) * 1024 * 1024
+        }
+        let engine = try await InferenceEngine(modelPath: options.model, alias: options.alias, stub: options.stub)
         try await HTTPServer(options: options, engine: engine).run()
     }
 }

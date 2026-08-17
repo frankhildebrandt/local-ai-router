@@ -35,3 +35,8 @@ jobs:
           REQUIRE_PYTHON_CONTRACT: "1"
       - run: cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
       - run: swift build --package-path sidecars/mlx-server -c debug --arch arm64
+      - run: ./scripts/prepare-flux-vendor.sh
+      - run: swift build --package-path sidecars/mlx-image-server -c debug --arch arm64
+      - run: ./scripts/prepare-kokoro-vendor.sh
+      - run: swift build --package-path sidecars/mlx-speech-server -c debug --arch arm64
+      - run: ./scripts/test-sidecar-stubs.sh

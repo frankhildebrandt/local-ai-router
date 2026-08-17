@@ -8,6 +8,9 @@ assert.deepEqual(models.data.map(model => model.id), ["sdk-model"]);
 const chat = await client.chat.completions.create({ model: "sdk-model", messages: [{ role: "user", content: "hello" }] });
 assert.equal(chat.choices[0].message.content, "hello");
 
+const tool = await client.chat.completions.create({ model: "sdk-model", messages: [{ role: "user", content: "hello" }], tools: [{ type: "function", function: { name: "lookup", parameters: { type: "object", properties: { query: { type: "string" } } } } }] });
+assert.equal(tool.choices[0].message.tool_calls?.[0]?.function.name, "lookup");
+
 let streamed = "";
 const stream = await client.chat.completions.create({ model: "sdk-model", messages: [{ role: "user", content: "hello" }], stream: true });
 for await (const chunk of stream) streamed += chunk.choices[0]?.delta.content ?? "";
