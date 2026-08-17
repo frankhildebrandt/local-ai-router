@@ -1,0 +1,43 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Local AI Router",
+  "version": "0.1.0",
+  "identifier": "app.local-ai-router.desktop",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "macOSPrivateApi": false,
+    "windows": [
+      {
+        "title": "Local AI Router",
+        "width": 1180,
+        "height": 760,
+        "minWidth": 940,
+        "minHeight": 620,
+        "center": true
+      }
+    ],
+    "security": { "csp": "default-src 'self'; connect-src ipc: http://ipc.localhost; img-src 'self' asset: http://asset.localhost data:; style-src 'self' 'unsafe-inline'" }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["dmg", "app"],
+    "createUpdaterArtifacts": true,
+    "resources": {
+      "../sidecars/bin/": "sidecars/bin/",
+      "../sidecars/licenses/": "sidecars/licenses/",
+      "../THIRD_PARTY_NOTICES.md": "THIRD_PARTY_NOTICES.md"
+    },
+    "macOS": { "minimumSystemVersion": "14.0" }
+  },
+  "plugins": {
+    "updater": {
+      "endpoints": ["https://github.com/frankhildebrandt/local-ai-router/releases/latest/download/latest.json"],
+      "pubkey": "REPLACE_WITH_TAURI_UPDATER_PUBLIC_KEY"
+    }
+  }
+}

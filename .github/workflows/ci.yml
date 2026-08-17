@@ -1,0 +1,37 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+      - run: npm ci
+      - run: python -m pip install openai
+      - run: npm audit --audit-level=high
+      - run: npm test
+      - run: npm run build
+      - run: cargo test --manifest-path src-tauri/Cargo.toml
+      - run: npm run test:contract
+        env:
+          REQUIRE_PYTHON_CONTRACT: "1"
+      - run: cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
+      - run: swift build --package-path sidecars/mlx-server -c debug --arch arm64

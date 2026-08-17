@@ -1,0 +1,15 @@
+node_modules/
+dist/
+target/
+src-tauri/target/
+.DS_Store
+*.log
+.env
+.env.*
+!.env.example
+sidecars/bin/*
+!sidecars/bin/.gitkeep
+sidecars/licenses/*
+!sidecars/licenses/.gitkeep
+sidecars/mlx-server/.build/
+sidecars/mlx-server/.swiftpm/
