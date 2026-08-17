@@ -5,13 +5,17 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::{sqlite::SqliteConnectOptions, QueryBuilder, Row, Sqlite, SqlitePool};
 
-use crate::domain::{ModelRoute, RouteTarget, TargetKind};
+use crate::{
+    domain::{ModelRoute, RouteTarget, TargetKind},
+    providers::{AuthMode, WireProtocol},
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Provider {
     pub id: String,
     pub name: String,
-    pub kind: TargetKind,
+    pub preset_id: String,
+    pub auth_mode: AuthMode,
     pub base_url: String,
     pub enabled: bool,
     pub has_credential: bool,
@@ -26,10 +30,19 @@ pub struct ModelTarget {
     pub provider_model: String,
     pub local_path: Option<String>,
     pub runtime_url: Option<String>,
+    #[serde(default)]
+    pub wire_protocol: WireProtocol,
     pub capabilities: Vec<String>,
     pub enabled: bool,
     pub state: String,
     pub size_bytes: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProviderModel {
+    pub id: String,
+    pub wire_protocol: WireProtocol,
+    pub capabilities: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -63,6 +76,7 @@ pub struct LogQuery {
     pub from: Option<DateTime<Utc>>,
     pub to: Option<DateTime<Utc>>,
     pub api_key_id: Option<String>,
+    #[serde(default)]
     pub legacy_only: bool,
     pub alias: Option<String>,
     pub target: Option<String>,
@@ -148,12 +162,12 @@ impl Store {
 
     async fn migrate(&self) -> anyhow::Result<()> {
         for statement in [
-            "CREATE TABLE IF NOT EXISTS providers (id TEXT PRIMARY KEY, name TEXT NOT NULL, kind TEXT NOT NULL, base_url TEXT NOT NULL, enabled INTEGER NOT NULL DEFAULT 1)",
-            "CREATE TABLE IF NOT EXISTS model_targets (id TEXT PRIMARY KEY, provider_id TEXT, name TEXT NOT NULL, kind TEXT NOT NULL, provider_model TEXT NOT NULL, local_path TEXT, runtime_url TEXT, capabilities TEXT NOT NULL, enabled INTEGER NOT NULL DEFAULT 1, state TEXT NOT NULL DEFAULT 'ready', size_bytes INTEGER, FOREIGN KEY(provider_id) REFERENCES providers(id) ON DELETE CASCADE)",
+            "CREATE TABLE IF NOT EXISTS providers (id TEXT PRIMARY KEY, name TEXT NOT NULL, kind TEXT NOT NULL DEFAULT 'cloud', base_url TEXT NOT NULL, enabled INTEGER NOT NULL DEFAULT 1, preset_id TEXT NOT NULL DEFAULT 'openai', auth_mode TEXT NOT NULL DEFAULT 'api_key')",
+            "CREATE TABLE IF NOT EXISTS model_targets (id TEXT PRIMARY KEY, provider_id TEXT, name TEXT NOT NULL, kind TEXT NOT NULL, provider_model TEXT NOT NULL, local_path TEXT, runtime_url TEXT, capabilities TEXT NOT NULL, enabled INTEGER NOT NULL DEFAULT 1, state TEXT NOT NULL DEFAULT 'ready', size_bytes INTEGER, wire_protocol TEXT NOT NULL DEFAULT 'open_ai_chat', FOREIGN KEY(provider_id) REFERENCES providers(id) ON DELETE CASCADE)",
             "CREATE TABLE IF NOT EXISTS routes (alias TEXT PRIMARY KEY, enabled INTEGER NOT NULL DEFAULT 1, capabilities TEXT NOT NULL)",
             "CREATE TABLE IF NOT EXISTS route_targets (alias TEXT NOT NULL, target_id TEXT NOT NULL, priority INTEGER NOT NULL, PRIMARY KEY(alias, target_id), FOREIGN KEY(alias) REFERENCES routes(alias) ON DELETE CASCADE, FOREIGN KEY(target_id) REFERENCES model_targets(id) ON DELETE CASCADE)",
             "CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
-            "CREATE TABLE IF NOT EXISTS provider_models (provider_id TEXT NOT NULL, model_id TEXT NOT NULL, synced_at TEXT NOT NULL, PRIMARY KEY(provider_id, model_id), FOREIGN KEY(provider_id) REFERENCES providers(id) ON DELETE CASCADE)",
+            "CREATE TABLE IF NOT EXISTS provider_models (provider_id TEXT NOT NULL, model_id TEXT NOT NULL, synced_at TEXT NOT NULL, wire_protocol TEXT NOT NULL DEFAULT 'open_ai_chat', capabilities TEXT NOT NULL DEFAULT '[\"chat\",\"streaming\"]', PRIMARY KEY(provider_id, model_id), FOREIGN KEY(provider_id) REFERENCES providers(id) ON DELETE CASCADE)",
             "CREATE TABLE IF NOT EXISTS local_api_keys (id TEXT PRIMARY KEY, name TEXT NOT NULL, token_hash BLOB NOT NULL, created_at TEXT NOT NULL, last_used_at TEXT, revoked_at TEXT)",
             "CREATE TABLE IF NOT EXISTS request_logs (id TEXT PRIMARY KEY, created_at TEXT NOT NULL, endpoint TEXT NOT NULL, alias TEXT, target TEXT, attempts INTEGER NOT NULL, status INTEGER NOT NULL, latency_ms INTEGER NOT NULL, input_tokens INTEGER, output_tokens INTEGER, error_code TEXT)",
             "CREATE INDEX IF NOT EXISTS request_logs_created_idx ON request_logs(created_at DESC)",
@@ -171,6 +185,55 @@ impl Store {
             sqlx::query("ALTER TABLE request_logs ADD COLUMN api_key_id TEXT")
                 .execute(&self.pool)
                 .await?;
+        }
+        let provider_columns = sqlx::query("PRAGMA table_info(providers)")
+            .fetch_all(&self.pool)
+            .await?;
+        if !provider_columns
+            .iter()
+            .any(|column| column.get::<String, _>("name") == "preset_id")
+        {
+            sqlx::query(
+                "ALTER TABLE providers ADD COLUMN preset_id TEXT NOT NULL DEFAULT 'openai'",
+            )
+            .execute(&self.pool)
+            .await?;
+            sqlx::query("UPDATE providers SET preset_id=CASE WHEN kind='open_router' THEN 'openrouter' ELSE 'openai' END").execute(&self.pool).await?;
+        }
+        sqlx::query("UPDATE providers SET preset_id='openrouter' WHERE kind='open_router' AND preset_id='openai'").execute(&self.pool).await?;
+        if !provider_columns
+            .iter()
+            .any(|column| column.get::<String, _>("name") == "auth_mode")
+        {
+            sqlx::query(
+                "ALTER TABLE providers ADD COLUMN auth_mode TEXT NOT NULL DEFAULT 'api_key'",
+            )
+            .execute(&self.pool)
+            .await?;
+        }
+        let target_columns = sqlx::query("PRAGMA table_info(model_targets)")
+            .fetch_all(&self.pool)
+            .await?;
+        if !target_columns
+            .iter()
+            .any(|column| column.get::<String, _>("name") == "wire_protocol")
+        {
+            sqlx::query("ALTER TABLE model_targets ADD COLUMN wire_protocol TEXT NOT NULL DEFAULT 'open_ai_chat'").execute(&self.pool).await?;
+        }
+        let model_columns = sqlx::query("PRAGMA table_info(provider_models)")
+            .fetch_all(&self.pool)
+            .await?;
+        if !model_columns
+            .iter()
+            .any(|column| column.get::<String, _>("name") == "wire_protocol")
+        {
+            sqlx::query("ALTER TABLE provider_models ADD COLUMN wire_protocol TEXT NOT NULL DEFAULT 'open_ai_chat'").execute(&self.pool).await?;
+        }
+        if !model_columns
+            .iter()
+            .any(|column| column.get::<String, _>("name") == "capabilities")
+        {
+            sqlx::query("ALTER TABLE provider_models ADD COLUMN capabilities TEXT NOT NULL DEFAULT '[\"chat\",\"streaming\"]'").execute(&self.pool).await?;
         }
         sqlx::query("CREATE INDEX IF NOT EXISTS request_logs_api_key_idx ON request_logs(api_key_id, created_at DESC)")
             .execute(&self.pool)
@@ -207,16 +270,18 @@ impl Store {
     }
 
     pub async fn providers(&self) -> anyhow::Result<Vec<Provider>> {
-        let rows =
-            sqlx::query("SELECT id, name, kind, base_url, enabled FROM providers ORDER BY name")
-                .fetch_all(&self.pool)
-                .await?;
+        let rows = sqlx::query(
+            "SELECT id, name, preset_id, auth_mode, base_url, enabled FROM providers ORDER BY name",
+        )
+        .fetch_all(&self.pool)
+        .await?;
         rows.into_iter()
             .map(|row| {
                 Ok(Provider {
                     id: row.get("id"),
                     name: row.get("name"),
-                    kind: decode_kind(row.get::<String, _>("kind").as_str())?,
+                    preset_id: row.get("preset_id"),
+                    auth_mode: decode_auth_mode(row.get::<String, _>("auth_mode").as_str())?,
                     base_url: row.get("base_url"),
                     enabled: row.get::<i64, _>("enabled") != 0,
                     has_credential: false,
@@ -226,15 +291,18 @@ impl Store {
     }
 
     pub async fn provider(&self, id: &str) -> anyhow::Result<Option<Provider>> {
-        let row = sqlx::query("SELECT id, name, kind, base_url, enabled FROM providers WHERE id=?")
-            .bind(id)
-            .fetch_optional(&self.pool)
-            .await?;
+        let row = sqlx::query(
+            "SELECT id, name, preset_id, auth_mode, base_url, enabled FROM providers WHERE id=?",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
         row.map(|row| {
             Ok(Provider {
                 id: row.get("id"),
                 name: row.get("name"),
-                kind: decode_kind(row.get::<String, _>("kind").as_str())?,
+                preset_id: row.get("preset_id"),
+                auth_mode: decode_auth_mode(row.get::<String, _>("auth_mode").as_str())?,
                 base_url: row.get("base_url"),
                 enabled: row.get::<i64, _>("enabled") != 0,
                 has_credential: false,
@@ -244,8 +312,8 @@ impl Store {
     }
 
     pub async fn upsert_provider(&self, provider: &Provider) -> anyhow::Result<()> {
-        sqlx::query("INSERT INTO providers(id,name,kind,base_url,enabled) VALUES(?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET name=excluded.name,kind=excluded.kind,base_url=excluded.base_url,enabled=excluded.enabled")
-            .bind(&provider.id).bind(&provider.name).bind(encode_kind(&provider.kind)).bind(&provider.base_url).bind(provider.enabled as i64)
+        sqlx::query("INSERT INTO providers(id,name,kind,base_url,enabled,preset_id,auth_mode) VALUES(?,?,'cloud',?,?,?,?) ON CONFLICT(id) DO UPDATE SET name=excluded.name,base_url=excluded.base_url,enabled=excluded.enabled,preset_id=excluded.preset_id,auth_mode=excluded.auth_mode")
+            .bind(&provider.id).bind(&provider.name).bind(&provider.base_url).bind(provider.enabled as i64).bind(&provider.preset_id).bind(encode_auth_mode(provider.auth_mode))
             .execute(&self.pool).await?;
         Ok(())
     }
@@ -261,7 +329,7 @@ impl Store {
     pub async fn replace_provider_models(
         &self,
         provider_id: &str,
-        models: &[String],
+        models: &[ProviderModel],
     ) -> anyhow::Result<()> {
         let mut transaction = self.pool.begin().await?;
         sqlx::query("DELETE FROM provider_models WHERE provider_id=?")
@@ -271,11 +339,13 @@ impl Store {
         let synced_at = Utc::now().to_rfc3339();
         for model in models {
             sqlx::query(
-                "INSERT INTO provider_models(provider_id, model_id, synced_at) VALUES(?,?,?)",
+                "INSERT INTO provider_models(provider_id, model_id, synced_at,wire_protocol,capabilities) VALUES(?,?,?,?,?)",
             )
             .bind(provider_id)
-            .bind(model)
+            .bind(&model.id)
             .bind(&synced_at)
+            .bind(encode_wire_protocol(model.wire_protocol))
+            .bind(serde_json::to_string(&model.capabilities)?)
             .execute(&mut *transaction)
             .await?;
         }
@@ -283,13 +353,26 @@ impl Store {
         Ok(())
     }
 
-    pub async fn provider_models(&self, provider_id: &str) -> anyhow::Result<Vec<String>> {
-        Ok(sqlx::query_scalar(
-            "SELECT model_id FROM provider_models WHERE provider_id=? ORDER BY model_id",
+    pub async fn provider_models(&self, provider_id: &str) -> anyhow::Result<Vec<ProviderModel>> {
+        let rows = sqlx::query(
+            "SELECT model_id,wire_protocol,capabilities FROM provider_models WHERE provider_id=? ORDER BY model_id",
         )
         .bind(provider_id)
         .fetch_all(&self.pool)
-        .await?)
+        .await?;
+        rows.into_iter()
+            .map(|row| {
+                Ok(ProviderModel {
+                    id: row.get("model_id"),
+                    wire_protocol: decode_wire_protocol(
+                        row.get::<String, _>("wire_protocol").as_str(),
+                    )?,
+                    capabilities: serde_json::from_str(
+                        row.get::<String, _>("capabilities").as_str(),
+                    )?,
+                })
+            })
+            .collect()
     }
 
     pub async fn targets(&self) -> anyhow::Result<Vec<ModelTarget>> {
@@ -310,9 +393,9 @@ impl Store {
 
     pub async fn upsert_target(&self, target: &ModelTarget) -> anyhow::Result<()> {
         let capabilities = serde_json::to_string(&target.capabilities)?;
-        sqlx::query("INSERT INTO model_targets(id,provider_id,name,kind,provider_model,local_path,runtime_url,capabilities,enabled,state,size_bytes) VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET provider_id=excluded.provider_id,name=excluded.name,kind=excluded.kind,provider_model=excluded.provider_model,local_path=excluded.local_path,runtime_url=excluded.runtime_url,capabilities=excluded.capabilities,enabled=excluded.enabled,state=excluded.state,size_bytes=excluded.size_bytes")
+        sqlx::query("INSERT INTO model_targets(id,provider_id,name,kind,provider_model,local_path,runtime_url,capabilities,enabled,state,size_bytes,wire_protocol) VALUES(?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET provider_id=excluded.provider_id,name=excluded.name,kind=excluded.kind,provider_model=excluded.provider_model,local_path=excluded.local_path,runtime_url=excluded.runtime_url,capabilities=excluded.capabilities,enabled=excluded.enabled,state=excluded.state,size_bytes=excluded.size_bytes,wire_protocol=excluded.wire_protocol")
             .bind(&target.id).bind(&target.provider_id).bind(&target.name).bind(encode_kind(&target.kind)).bind(&target.provider_model)
-            .bind(&target.local_path).bind(&target.runtime_url).bind(capabilities).bind(target.enabled as i64).bind(&target.state).bind(target.size_bytes)
+            .bind(&target.local_path).bind(&target.runtime_url).bind(capabilities).bind(target.enabled as i64).bind(&target.state).bind(target.size_bytes).bind(encode_wire_protocol(target.wire_protocol))
             .execute(&self.pool).await?;
         Ok(())
     }
@@ -781,6 +864,7 @@ fn row_to_target(row: sqlx::sqlite::SqliteRow) -> anyhow::Result<ModelTarget> {
         provider_model: row.get("provider_model"),
         local_path: row.get("local_path"),
         runtime_url: row.get("runtime_url"),
+        wire_protocol: decode_wire_protocol(row.get::<String, _>("wire_protocol").as_str())?,
         capabilities: serde_json::from_str(row.get::<String, _>("capabilities").as_str())
             .context("invalid capabilities")?,
         enabled: row.get::<i64, _>("enabled") != 0,
@@ -791,8 +875,7 @@ fn row_to_target(row: sqlx::sqlite::SqliteRow) -> anyhow::Result<ModelTarget> {
 
 pub fn encode_kind(kind: &TargetKind) -> &'static str {
     match kind {
-        TargetKind::OpenAi => "open_ai",
-        TargetKind::OpenRouter => "open_router",
+        TargetKind::Cloud => "cloud",
         TargetKind::Gguf => "gguf",
         TargetKind::Mlx => "mlx",
     }
@@ -800,11 +883,44 @@ pub fn encode_kind(kind: &TargetKind) -> &'static str {
 
 pub fn decode_kind(value: &str) -> anyhow::Result<TargetKind> {
     match value {
-        "open_ai" => Ok(TargetKind::OpenAi),
-        "open_router" => Ok(TargetKind::OpenRouter),
+        "cloud" | "open_ai" | "open_router" => Ok(TargetKind::Cloud),
         "gguf" => Ok(TargetKind::Gguf),
         "mlx" => Ok(TargetKind::Mlx),
         _ => anyhow::bail!("unknown target kind: {value}"),
+    }
+}
+
+fn encode_auth_mode(value: AuthMode) -> &'static str {
+    match value {
+        AuthMode::ApiKey => "api_key",
+        AuthMode::OpenAiSubscription => "open_ai_subscription",
+    }
+}
+
+fn decode_auth_mode(value: &str) -> anyhow::Result<AuthMode> {
+    match value {
+        "api_key" => Ok(AuthMode::ApiKey),
+        "open_ai_subscription" => Ok(AuthMode::OpenAiSubscription),
+        _ => anyhow::bail!("unknown auth mode {value}"),
+    }
+}
+
+fn encode_wire_protocol(value: WireProtocol) -> &'static str {
+    match value {
+        WireProtocol::OpenAiChat => "open_ai_chat",
+        WireProtocol::OpenAiResponses => "open_ai_responses",
+        WireProtocol::AnthropicMessages => "anthropic_messages",
+        WireProtocol::GeminiGenerateContent => "gemini_generate_content",
+    }
+}
+
+fn decode_wire_protocol(value: &str) -> anyhow::Result<WireProtocol> {
+    match value {
+        "open_ai_chat" => Ok(WireProtocol::OpenAiChat),
+        "open_ai_responses" => Ok(WireProtocol::OpenAiResponses),
+        "anthropic_messages" => Ok(WireProtocol::AnthropicMessages),
+        "gemini_generate_content" => Ok(WireProtocol::GeminiGenerateContent),
+        _ => anyhow::bail!("unknown wire protocol {value}"),
     }
 }
 
@@ -812,6 +928,98 @@ pub fn decode_kind(value: &str) -> anyhow::Result<TargetKind> {
 mod tests {
     use super::*;
     use chrono::TimeZone;
+
+    #[test]
+    fn log_query_defaults_legacy_filter_when_omitted() {
+        let query: LogQuery = serde_json::from_value(serde_json::json!({ "limit": 100 })).unwrap();
+
+        assert!(!query.legacy_only);
+        assert_eq!(query.limit, Some(100));
+    }
+
+    #[tokio::test]
+    async fn provider_metadata_and_wire_protocol_round_trip() {
+        let store = Store::memory().await.unwrap();
+        let provider = Provider {
+            id: "groq".into(),
+            name: "Groq".into(),
+            preset_id: "groq".into(),
+            auth_mode: crate::providers::AuthMode::ApiKey,
+            base_url: "https://api.groq.com/openai/v1".into(),
+            enabled: true,
+            has_credential: false,
+        };
+        store.upsert_provider(&provider).await.unwrap();
+        assert_eq!(
+            store.provider("groq").await.unwrap().unwrap().preset_id,
+            "groq"
+        );
+
+        let target = ModelTarget {
+            id: "model".into(),
+            provider_id: Some("groq".into()),
+            name: "Model".into(),
+            kind: TargetKind::Cloud,
+            provider_model: "model-id".into(),
+            local_path: None,
+            runtime_url: None,
+            wire_protocol: crate::providers::WireProtocol::OpenAiChat,
+            capabilities: vec!["chat".into(), "tools".into()],
+            enabled: true,
+            state: "ready".into(),
+            size_bytes: None,
+        };
+        store.upsert_target(&target).await.unwrap();
+        assert_eq!(
+            store.target("model").await.unwrap().unwrap().wire_protocol,
+            crate::providers::WireProtocol::OpenAiChat
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_openrouter_database_is_migrated_idempotently() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("legacy.sqlite3");
+        let options = SqliteConnectOptions::from_str(&format!("sqlite://{}", path.display()))
+            .unwrap()
+            .create_if_missing(true)
+            .foreign_keys(true);
+        let pool = SqlitePool::connect_with(options).await.unwrap();
+        for statement in [
+            "CREATE TABLE providers (id TEXT PRIMARY KEY,name TEXT NOT NULL,kind TEXT NOT NULL,base_url TEXT NOT NULL,enabled INTEGER NOT NULL)",
+            "CREATE TABLE model_targets (id TEXT PRIMARY KEY,provider_id TEXT,name TEXT NOT NULL,kind TEXT NOT NULL,provider_model TEXT NOT NULL,local_path TEXT,runtime_url TEXT,capabilities TEXT NOT NULL,enabled INTEGER NOT NULL,state TEXT NOT NULL,size_bytes INTEGER)",
+            "CREATE TABLE routes (alias TEXT PRIMARY KEY,enabled INTEGER NOT NULL,capabilities TEXT NOT NULL)",
+            "CREATE TABLE route_targets (alias TEXT NOT NULL,target_id TEXT NOT NULL,priority INTEGER NOT NULL,PRIMARY KEY(alias,target_id))",
+            "CREATE TABLE settings (key TEXT PRIMARY KEY,value TEXT NOT NULL)",
+            "CREATE TABLE provider_models (provider_id TEXT NOT NULL,model_id TEXT NOT NULL,synced_at TEXT NOT NULL,PRIMARY KEY(provider_id,model_id))",
+            "CREATE TABLE request_logs (id TEXT PRIMARY KEY,created_at TEXT NOT NULL,endpoint TEXT NOT NULL,alias TEXT,target TEXT,attempts INTEGER NOT NULL,status INTEGER NOT NULL,latency_ms INTEGER NOT NULL,input_tokens INTEGER,output_tokens INTEGER,error_code TEXT)",
+            "INSERT INTO providers VALUES ('provider','OpenRouter','open_router','https://openrouter.ai/api/v1',1)",
+            "INSERT INTO model_targets VALUES ('target','provider','Old target','open_router','old-model',NULL,NULL,'[\"chat\"]',1,'ready',NULL)",
+            "INSERT INTO routes VALUES ('assistant',1,'[\"chat\"]')",
+            "INSERT INTO route_targets VALUES ('assistant','target',10)",
+            "INSERT INTO provider_models VALUES ('provider','old-model','2025-01-01T00:00:00Z')",
+            "INSERT INTO request_logs VALUES ('log','2025-01-01T00:00:00Z','/v1/chat/completions','assistant','Old target',1,200,5,1,2,NULL)",
+        ] { sqlx::query(statement).execute(&pool).await.unwrap(); }
+        pool.close().await;
+
+        let store = Store::open(&path).await.unwrap();
+        assert_eq!(
+            store.provider("provider").await.unwrap().unwrap().preset_id,
+            "openrouter"
+        );
+        assert_eq!(
+            store.target("target").await.unwrap().unwrap().kind,
+            TargetKind::Cloud
+        );
+        assert_eq!(
+            store.provider_models("provider").await.unwrap()[0].capabilities,
+            vec!["chat", "streaming"]
+        );
+        assert!(store.route("assistant").await.unwrap().is_some());
+        assert_eq!(store.logs(10).await.unwrap().len(), 1);
+        drop(store);
+        Store::open(&path).await.unwrap();
+    }
 
     #[tokio::test]
     async fn route_round_trip_preserves_order_and_capabilities() {
@@ -822,10 +1030,11 @@ mod tests {
                     id: id.into(),
                     provider_id: None,
                     name: id.into(),
-                    kind: TargetKind::OpenAi,
+                    kind: TargetKind::Cloud,
                     provider_model: model.into(),
                     local_path: None,
                     runtime_url: Some("http://example.test/v1".into()),
+                    wire_protocol: WireProtocol::OpenAiChat,
                     capabilities: vec!["chat".into()],
                     enabled: true,
                     state: "ready".into(),
@@ -842,14 +1051,14 @@ mod tests {
                 targets: vec![
                     RouteTarget {
                         id: "two".into(),
-                        kind: TargetKind::OpenAi,
+                        kind: TargetKind::Cloud,
                         model: "gpt-two".into(),
                         priority: 20,
                         enabled: true,
                     },
                     RouteTarget {
                         id: "one".into(),
-                        kind: TargetKind::OpenAi,
+                        kind: TargetKind::Cloud,
                         model: "gpt-one".into(),
                         priority: 10,
                         enabled: true,

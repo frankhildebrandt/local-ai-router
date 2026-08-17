@@ -9,6 +9,7 @@ beforeEach(() => {
   command.mockImplementation((name: string) => {
     if (name === "dashboard") return Promise.resolve({ running: true, base_url: "http://127.0.0.1:11435/v1", provider_count: 0, target_count: 0, route_count: 0, recent_requests: 1, runtimes: [] });
     if (name === "list_providers" || name === "list_targets" || name === "list_routes") return Promise.resolve([]);
+    if (name === "list_provider_presets") return Promise.resolve([]);
     if (name === "list_local_api_keys") return Promise.resolve([{ id: "default", name: "Default", created_at: "2026-08-17T10:00:00Z", last_used_at: null, revoked_at: null }]);
     if (name === "list_logs") return Promise.resolve({ total: 1, items: [{ id: "request", created_at: "2026-08-17T10:00:00Z", endpoint: "/v1/chat/completions", alias: "assistant", target: "cloud", attempts: 1, status: 200, latency_ms: 12, input_tokens: 3, output_tokens: 5, error_code: null, api_key_id: "default", api_key_name: "Default" }] });
     if (name === "get_settings") return Promise.resolve({});
@@ -25,6 +26,7 @@ describe("Local AI Router shell", () => {
     render(<App />);
     expect(await screen.findByText("Your models, one local endpoint.")).toBeTruthy();
     expect(screen.getAllByText("http://127.0.0.1:11435/v1").length).toBeGreaterThan(0);
+    expect(command).toHaveBeenCalledWith("list_logs", { query: { legacy_only: false, limit: 100 } });
   });
 
   it("exposes usage, named keys, and structured request-log filters", async () => {

@@ -1,9 +1,28 @@
-export type TargetKind = "open_ai" | "open_router" | "gguf" | "mlx";
+export type TargetKind = "cloud" | "gguf" | "mlx";
+export type AuthMode = "api_key" | "open_ai_subscription";
+export type WireProtocol = "open_ai_chat" | "open_ai_responses" | "anthropic_messages" | "gemini_generate_content";
+export type AccessTier = "paid" | "subscription" | "free_tier" | "starter_credits" | "experimental";
+
+export interface ProviderPreset {
+  id: string;
+  name: string;
+  base_url: string | null;
+  editable_base_url: boolean;
+  auth_mode: AuthMode;
+  auth_scheme: "bearer" | "x_api_key" | "x_goog_api_key" | "open_ai_subscription";
+  default_protocol: WireProtocol;
+  access_tier: AccessTier;
+  access_type: "api_key" | "deployment" | "plan" | "subscription";
+  discovery_strategy: "open_ai_models" | "gemini_models" | "curated";
+  docs_url: string;
+  note: string | null;
+}
 
 export interface Provider {
   id: string;
   name: string;
-  kind: TargetKind;
+  preset_id: string;
+  auth_mode: AuthMode;
   base_url: string;
   enabled: boolean;
   has_credential: boolean;
@@ -14,6 +33,7 @@ export interface ModelTarget {
   provider_id: string | null;
   name: string;
   kind: TargetKind;
+  wire_protocol: WireProtocol;
   provider_model: string;
   local_path: string | null;
   runtime_url: string | null;
@@ -21,6 +41,12 @@ export interface ModelTarget {
   enabled: boolean;
   state: string;
   size_bytes: number | null;
+}
+
+export interface ProviderModel {
+  id: string;
+  wire_protocol: WireProtocol;
+  capabilities: string[];
 }
 
 export interface RouteTarget {

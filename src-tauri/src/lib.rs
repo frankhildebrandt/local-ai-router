@@ -3,6 +3,9 @@ pub mod core;
 pub mod domain;
 pub mod gateway;
 pub mod library;
+pub mod oauth;
+pub mod protocol;
+pub mod providers;
 pub mod runtime;
 pub mod secrets;
 pub mod storage;
@@ -165,10 +168,15 @@ pub fn run() {
             commands::rotate_local_api_key,
             commands::revoke_local_api_key,
             commands::list_providers,
+            commands::list_provider_presets,
             commands::save_provider,
             commands::delete_provider,
             commands::sync_provider_models,
             commands::cached_provider_models,
+            commands::begin_openai_subscription,
+            commands::openai_subscription_status,
+            commands::logout_openai_subscription,
+            commands::test_provider_connection,
             commands::list_targets,
             commands::save_target,
             commands::delete_target,

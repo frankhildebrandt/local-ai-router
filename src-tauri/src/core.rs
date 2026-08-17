@@ -16,6 +16,8 @@ use subtle::ConstantTimeEq;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::{
+    oauth::OAuthManager,
+    providers::{provider_preset, validate_cloud_base_url, AuthMode, AuthScheme},
     secrets::{
         generate_local_token, local_api_key_account, provider_account, SecretStore, LOCAL_API_KEY,
     },
@@ -27,6 +29,7 @@ pub struct AppCore {
     pub store: Store,
     pub secrets: Arc<dyn SecretStore>,
     pub client: Client,
+    pub oauth: OAuthManager,
     local_gates: Arc<parking_lot::Mutex<HashMap<String, Arc<InferenceGate>>>>,
 }
 
@@ -129,11 +132,14 @@ impl AppCore {
         let client = Client::builder()
             .connect_timeout(Duration::from_secs(10))
             .user_agent("LocalAI-Router/0.1")
+            .redirect(reqwest::redirect::Policy::none())
             .build()?;
+        let oauth = OAuthManager::new(client.clone(), secrets.clone());
         Ok(Self {
             store,
             secrets,
             client,
+            oauth,
             local_gates: Arc::new(parking_lot::Mutex::new(HashMap::new())),
         })
     }
@@ -260,9 +266,12 @@ impl AppCore {
     }
 
     pub async fn authorized(&self, authorization: Option<&str>) -> Option<String> {
-        let Some(candidate) = authorization.and_then(|value| value.strip_prefix("Bearer ")) else {
-            return None;
-        };
+        let candidate = authorization.and_then(|value| value.strip_prefix("Bearer "))?;
+        self.authorized_token(Some(candidate)).await
+    }
+
+    pub async fn authorized_token(&self, candidate: Option<&str>) -> Option<String> {
+        let candidate = candidate?;
         let Ok(keys) = self.store.active_local_api_key_hashes().await else {
             return None;
         };
@@ -286,9 +295,9 @@ impl AppCore {
     pub async fn target_endpoint(
         &self,
         target: &ModelTarget,
-    ) -> anyhow::Result<(String, Option<String>)> {
+    ) -> anyhow::Result<(String, Option<String>, Option<String>)> {
         match target.kind {
-            crate::domain::TargetKind::OpenAi | crate::domain::TargetKind::OpenRouter => {
+            crate::domain::TargetKind::Cloud => {
                 let provider_id = target
                     .provider_id
                     .as_deref()
@@ -301,14 +310,18 @@ impl AppCore {
                 if !provider.enabled {
                     anyhow::bail!("provider is disabled");
                 }
-                let credential = self
-                    .secrets
-                    .get(&provider_account(provider_id))?
-                    .context("provider credential missing")?;
-                Ok((
-                    provider.base_url.trim_end_matches('/').to_owned(),
-                    Some(credential),
-                ))
+                let base_url = validate_cloud_base_url(
+                    &provider.base_url,
+                    provider.preset_id == "custom_openai" || cfg!(test),
+                )?;
+                let (credential, account_id) = if provider.auth_mode == AuthMode::OpenAiSubscription
+                {
+                    let credential = self.oauth.access_token(provider_id).await?;
+                    (credential.access_token, credential.account_id)
+                } else {
+                    (self.provider_api_key(provider_id)?, None)
+                };
+                Ok((base_url, Some(credential), account_id))
             }
             crate::domain::TargetKind::Gguf | crate::domain::TargetKind::Mlx => {
                 let token = self
@@ -323,6 +336,7 @@ impl AppCore {
                         .trim_end_matches('/')
                         .to_owned(),
                     Some(token),
+                    None,
                 ))
             }
         }
@@ -334,6 +348,27 @@ impl AppCore {
             provider.has_credential = self.secrets.get(&provider_account(&provider.id))?.is_some();
         }
         Ok(providers)
+    }
+
+    pub fn save_provider_api_key(&self, provider_id: &str, key: &str) -> anyhow::Result<()> {
+        let value = serde_json::json!({ "version": 1, "type": "api_key", "key": key });
+        self.secrets
+            .set(&provider_account(provider_id), &value.to_string())
+    }
+
+    pub fn provider_api_key(&self, provider_id: &str) -> anyhow::Result<String> {
+        let stored = self
+            .secrets
+            .get(&provider_account(provider_id))?
+            .context("provider credential missing")?;
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&stored) else {
+            return Ok(stored);
+        };
+        value
+            .get("key")
+            .and_then(|key| key.as_str())
+            .map(str::to_owned)
+            .context("provider API key missing")
     }
 
     pub async fn acquire_local_slot(
@@ -372,15 +407,22 @@ impl AppCore {
         provider: &Provider,
         credential: &str,
     ) -> anyhow::Result<Vec<String>> {
-        let response = self
-            .client
-            .get(format!(
-                "{}/models",
-                provider.base_url.trim_end_matches('/')
-            ))
-            .bearer_auth(credential)
-            .send()
-            .await?;
+        let preset = provider_preset(&provider.preset_id).context("provider preset missing")?;
+        let mut request = self.client.get(format!(
+            "{}/models",
+            provider.base_url.trim_end_matches('/')
+        ));
+        request = match preset.auth_scheme {
+            AuthScheme::Bearer => request.bearer_auth(credential),
+            AuthScheme::XApiKey => request
+                .header("x-api-key", credential)
+                .header("anthropic-version", "2023-06-01"),
+            AuthScheme::XGoogApiKey => request.header("x-goog-api-key", credential),
+            AuthScheme::OpenAiSubscription => {
+                anyhow::bail!("subscription providers use their curated model catalog")
+            }
+        };
+        let response = request.send().await?;
         let status = response.status();
         let body: serde_json::Value = response
             .json()
@@ -391,14 +433,17 @@ impl AppCore {
         }
         Ok(body
             .get("data")
+            .or_else(|| body.get("models"))
+            .or_else(|| body.as_array().map(|_| &body))
             .and_then(|value| value.as_array())
             .into_iter()
             .flatten()
             .filter_map(|value| {
                 value
                     .get("id")
+                    .or_else(|| value.get("name"))
                     .and_then(|id| id.as_str())
-                    .map(str::to_owned)
+                    .map(|id| id.trim_start_matches("models/").to_owned())
             })
             .collect())
     }
@@ -436,6 +481,7 @@ mod tests {
             provider_model: "local".into(),
             local_path: None,
             runtime_url: Some("http://127.0.0.1:1/v1".into()),
+            wire_protocol: crate::providers::WireProtocol::OpenAiChat,
             capabilities: vec!["chat".into()],
             enabled: true,
             state: "ready".into(),
@@ -557,5 +603,21 @@ mod tests {
         assert!(activity.try_reserve_for_unload(&target.id).is_none());
         drop(request);
         assert!(activity.try_reserve_for_unload(&target.id).is_some());
+    }
+
+    #[tokio::test]
+    async fn legacy_raw_provider_keys_are_read_and_rewritten_as_versioned_records() {
+        let secrets: Arc<dyn SecretStore> = Arc::new(MemorySecrets::default());
+        secrets
+            .set(&provider_account("provider"), "legacy-key")
+            .unwrap();
+        let core = AppCore::new(Store::memory().await.unwrap(), secrets.clone()).unwrap();
+        assert_eq!(core.provider_api_key("provider").unwrap(), "legacy-key");
+        core.save_provider_api_key("provider", "legacy-key")
+            .unwrap();
+        let stored = secrets.get(&provider_account("provider")).unwrap().unwrap();
+        let value: serde_json::Value = serde_json::from_str(&stored).unwrap();
+        assert_eq!(value["version"], 1);
+        assert_eq!(value["key"], "legacy-key");
     }
 }

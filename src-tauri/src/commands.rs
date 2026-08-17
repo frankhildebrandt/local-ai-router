@@ -1,5 +1,6 @@
 use std::{path::PathBuf, sync::Arc};
 
+use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use tauri::State;
 use uuid::Uuid;
@@ -8,10 +9,15 @@ use crate::{
     core::AppCore,
     domain::{ModelRoute, TargetKind},
     library,
+    providers::{
+        provider_preset, provider_presets, validate_cloud_base_url, AuthMode, ProviderPreset,
+        WireProtocol,
+    },
     runtime::{RuntimeManager, RuntimeStatus},
     secrets::{local_api_key_account, provider_account, HF_ACCOUNT, LOCAL_API_KEY},
     storage::{
-        LocalApiKey, LogFacets, LogQuery, LogResult, ModelTarget, Provider, Store, UsageData,
+        LocalApiKey, LogFacets, LogQuery, LogResult, ModelTarget, Provider, ProviderModel, Store,
+        UsageData,
     },
 };
 
@@ -45,7 +51,9 @@ pub struct LocalApiKeyWithToken {
 pub struct SaveProviderInput {
     pub id: Option<String>,
     pub name: String,
-    pub kind: TargetKind,
+    pub preset_id: String,
+    #[serde(default)]
+    pub auth_mode: AuthMode,
     pub base_url: String,
     pub enabled: bool,
     pub api_key: Option<String>,
@@ -159,33 +167,59 @@ pub async fn list_providers(state: State<'_, AppServices>) -> Result<Vec<Provide
 }
 
 #[tauri::command]
+pub fn list_provider_presets() -> Vec<ProviderPreset> {
+    provider_presets()
+}
+
+#[tauri::command]
 pub async fn save_provider(
     state: State<'_, AppServices>,
     input: SaveProviderInput,
 ) -> Result<Provider, String> {
-    if !matches!(input.kind, TargetKind::OpenAi | TargetKind::OpenRouter) {
-        return Err("provider must be OpenAI or OpenRouter".into());
+    let preset = provider_preset(&input.preset_id).ok_or("unknown provider preset")?;
+    if input.auth_mode != preset.auth_mode {
+        return Err("authentication mode does not match provider preset".into());
     }
     let id = input.id.unwrap_or_else(|| Uuid::new_v4().to_string());
+    if let Some(previous) = state.core.store.provider(&id).await.map_err(err)? {
+        if previous.auth_mode != input.auth_mode {
+            state
+                .core
+                .secrets
+                .delete(&provider_account(&id))
+                .map_err(err)?;
+        }
+    }
+    let base_url = if preset.editable_base_url {
+        validate_cloud_base_url(&input.base_url, preset.id == "custom_openai").map_err(err)?
+    } else {
+        preset
+            .base_url
+            .context("provider preset has no base URL")
+            .map_err(err)?
+            .to_owned()
+    };
     let provider = Provider {
         id: id.clone(),
         name: input.name,
-        kind: input.kind,
-        base_url: input.base_url.trim_end_matches('/').to_owned(),
+        preset_id: input.preset_id,
+        auth_mode: input.auth_mode,
+        base_url,
         enabled: input.enabled,
         has_credential: input.api_key.as_ref().is_some_and(|key| !key.is_empty()),
     };
     if let Some(key) = input.api_key.filter(|key| !key.trim().is_empty()) {
         state
             .core
-            .validate_provider(&provider, &key)
-            .await
+            .save_provider_api_key(&id, key.trim())
             .map_err(err)?;
-        state
-            .core
-            .secrets
-            .set(&provider_account(&id), key.trim())
-            .map_err(err)?;
+    } else if provider.auth_mode == AuthMode::ApiKey {
+        if let Ok(existing) = state.core.provider_api_key(&id) {
+            state
+                .core
+                .save_provider_api_key(&id, &existing)
+                .map_err(err)?;
+        }
     }
     state
         .core
@@ -204,6 +238,64 @@ pub async fn save_provider(
 }
 
 #[tauri::command]
+pub async fn test_provider_connection(
+    state: State<'_, AppServices>,
+    id: String,
+) -> Result<Vec<String>, String> {
+    let provider = state
+        .core
+        .store
+        .provider(&id)
+        .await
+        .map_err(err)?
+        .ok_or("provider not found")?;
+    if provider.auth_mode == AuthMode::OpenAiSubscription {
+        state.core.oauth.access_token(&id).await.map_err(err)?;
+        return Ok(vec!["subscription".into()]);
+    }
+    let credential = state.core.provider_api_key(&id).map_err(err)?;
+    state
+        .core
+        .validate_provider(&provider, &credential)
+        .await
+        .map_err(err)
+}
+
+#[tauri::command]
+pub async fn begin_openai_subscription(
+    state: State<'_, AppServices>,
+    id: String,
+) -> Result<crate::oauth::OAuthStart, String> {
+    let provider = state
+        .core
+        .store
+        .provider(&id)
+        .await
+        .map_err(err)?
+        .ok_or("provider not found")?;
+    if provider.auth_mode != AuthMode::OpenAiSubscription {
+        return Err("provider is not configured for subscription OAuth".into());
+    }
+    state.core.oauth.begin(&id).await.map_err(err)
+}
+
+#[tauri::command]
+pub async fn openai_subscription_status(
+    state: State<'_, AppServices>,
+    id: String,
+) -> Result<crate::oauth::OAuthStatus, String> {
+    state.core.oauth.status(&id).await.map_err(err)
+}
+
+#[tauri::command]
+pub async fn logout_openai_subscription(
+    state: State<'_, AppServices>,
+    id: String,
+) -> Result<(), String> {
+    state.core.oauth.logout(&id).await.map_err(err)
+}
+
+#[tauri::command]
 pub async fn delete_provider(state: State<'_, AppServices>, id: String) -> Result<(), String> {
     state.core.store.delete_provider(&id).await.map_err(err)?;
     state
@@ -217,7 +309,7 @@ pub async fn delete_provider(state: State<'_, AppServices>, id: String) -> Resul
 pub async fn sync_provider_models(
     state: State<'_, AppServices>,
     id: String,
-) -> Result<Vec<String>, String> {
+) -> Result<Vec<ProviderModel>, String> {
     let provider = state
         .core
         .store
@@ -225,17 +317,41 @@ pub async fn sync_provider_models(
         .await
         .map_err(err)?
         .ok_or("provider not found")?;
-    let credential = state
-        .core
-        .secrets
-        .get(&provider_account(&id))
-        .map_err(err)?
-        .ok_or("provider credential missing")?;
-    let models = state
-        .core
-        .validate_provider(&provider, &credential)
-        .await
-        .map_err(err)?;
+    let model_ids = if provider.auth_mode == AuthMode::OpenAiSubscription {
+        vec![
+            "gpt-5.6-sol".into(),
+            "gpt-5.6-terra".into(),
+            "gpt-5.6-luna".into(),
+        ]
+    } else {
+        let credential = state.core.provider_api_key(&id).map_err(err)?;
+        state
+            .core
+            .validate_provider(&provider, &credential)
+            .await
+            .map_err(err)?
+    };
+    let trusted_capabilities = provider.preset_id == "openai_subscription";
+    let models = model_ids
+        .into_iter()
+        .filter(|_| provider.preset_id != "opencode_zen")
+        .map(|model_id| ProviderModel {
+            wire_protocol: crate::providers::inferred_protocol(&provider.preset_id, &model_id),
+            id: model_id,
+            capabilities: if trusted_capabilities {
+                vec![
+                    "chat".into(),
+                    "streaming".into(),
+                    "tools".into(),
+                    "vision".into(),
+                    "reasoning".into(),
+                    "structured_output".into(),
+                ]
+            } else {
+                vec!["chat".into(), "streaming".into()]
+            },
+        })
+        .collect::<Vec<_>>();
     state
         .core
         .store
@@ -249,7 +365,7 @@ pub async fn sync_provider_models(
 pub async fn cached_provider_models(
     state: State<'_, AppServices>,
     id: String,
-) -> Result<Vec<String>, String> {
+) -> Result<Vec<ProviderModel>, String> {
     state.core.store.provider_models(&id).await.map_err(err)
 }
 
@@ -293,6 +409,7 @@ pub async fn import_local_model(
         provider_model: input.alias_model,
         local_path: Some(imported.path),
         runtime_url: None,
+        wire_protocol: WireProtocol::OpenAiChat,
         capabilities: input.capabilities,
         enabled: true,
         state: "stopped".into(),
@@ -325,6 +442,7 @@ pub async fn download_local_model(
         provider_model: input.alias_model,
         local_path: Some(imported.path),
         runtime_url: None,
+        wire_protocol: WireProtocol::OpenAiChat,
         capabilities: input.capabilities,
         enabled: true,
         state: "stopped".into(),
@@ -396,11 +514,36 @@ pub async fn list_routes(state: State<'_, AppServices>) -> Result<Vec<ModelRoute
 #[tauri::command]
 pub async fn save_route(
     state: State<'_, AppServices>,
-    route: ModelRoute,
+    mut route: ModelRoute,
 ) -> Result<ModelRoute, String> {
     if route.alias.trim().is_empty() || route.alias.contains(char::is_whitespace) {
         return Err("alias must be non-empty and contain no whitespace".into());
     }
+    let mut shared: Option<Vec<String>> = None;
+    for route_target in route.targets.iter().filter(|target| target.enabled) {
+        let target = state
+            .core
+            .store
+            .target(&route_target.id)
+            .await
+            .map_err(err)?
+            .ok_or("route target not found")?;
+        let mut capabilities = target.capabilities.clone();
+        if target.wire_protocol == WireProtocol::AnthropicMessages {
+            capabilities.retain(|item| item != "structured_output");
+        }
+        if target.wire_protocol == WireProtocol::GeminiGenerateContent {
+            capabilities.retain(|item| item != "reasoning");
+        }
+        shared = Some(match shared {
+            Some(current) => current
+                .into_iter()
+                .filter(|item| capabilities.contains(item))
+                .collect(),
+            None => capabilities,
+        });
+    }
+    route.capabilities = shared.ok_or("route must have at least one enabled target")?;
     state.core.store.upsert_route(&route).await.map_err(err)?;
     Ok(route)
 }

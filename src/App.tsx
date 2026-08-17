@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useState, type FormEvent, type ReactNode } from "react";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import { enable, disable, isEnabled } from "@tauri-apps/plugin-autostart";
+import { openUrl } from "@tauri-apps/plugin-opener";
 import {
   Activity, BarChart3, BookOpen, Box, Check, ChevronRight, CircleAlert, Cloud, Copy, Database,
   Download, Eye, EyeOff, FileDown, Gauge, KeyRound, Layers3, ListRestart, LoaderCircle, Menu,
@@ -8,7 +9,7 @@ import {
   Trash2, X,
 } from "lucide-react";
 import { command, errorMessage, isTauri } from "./api";
-import type { DashboardData, LocalApiKey, LocalApiKeyWithToken, LogFacets, LogQuery, LogResult, ModelRoute, ModelTarget, Provider, RequestLog, TargetKind, UsageData } from "./types";
+import type { DashboardData, LocalApiKey, LocalApiKeyWithToken, LogFacets, LogQuery, LogResult, ModelRoute, ModelTarget, Provider, ProviderModel, ProviderPreset, RequestLog, TargetKind, UsageData, WireProtocol } from "./types";
 
 type Page = "overview" | "usage" | "providers" | "cloud" | "local" | "routes" | "logs" | "settings";
 
@@ -29,6 +30,7 @@ export default function App() {
   const [page, setPage] = useState<Page>("overview");
   const [dashboard, setDashboard] = useState(emptyDashboard);
   const [providers, setProviders] = useState<Provider[]>([]);
+  const [providerPresets, setProviderPresets] = useState<ProviderPreset[]>([]);
   const [targets, setTargets] = useState<ModelTarget[]>([]);
   const [routes, setRoutes] = useState<ModelRoute[]>([]);
   const [logs, setLogs] = useState<RequestLog[]>([]);
@@ -41,11 +43,11 @@ export default function App() {
   const refresh = useCallback(async () => {
     if (!isTauri()) { setLoading(false); return; }
     try {
-      const [dash, p, t, r, l, s, k] = await Promise.all([
-        command<DashboardData>("dashboard"), command<Provider[]>("list_providers"), command<ModelTarget[]>("list_targets"),
-        command<ModelRoute[]>("list_routes"), command<LogResult>("list_logs", { query: { limit: 100 } }), command<Record<string, string>>("get_settings"), command<LocalApiKey[]>("list_local_api_keys"),
+      const [dash, p, presets, t, r, l, s, k] = await Promise.all([
+        command<DashboardData>("dashboard"), command<Provider[]>("list_providers"), command<ProviderPreset[]>("list_provider_presets"),
+        command<ModelTarget[]>("list_targets"), command<ModelRoute[]>("list_routes"), command<LogResult>("list_logs", { query: { legacy_only: false, limit: 100 } }), command<Record<string, string>>("get_settings"), command<LocalApiKey[]>("list_local_api_keys"),
       ]);
-      setDashboard(dash); setProviders(p); setTargets(t); setRoutes(r); setLogs(l.items); setSettings(s); setLocalKeys(k);
+      setDashboard(dash); setProviders(p); setProviderPresets(presets); setTargets(t); setRoutes(r); setLogs(l.items); setSettings(s); setLocalKeys(k);
     } catch (error) { setNotice({ type: "error", text: errorMessage(error) }); }
     finally { setLoading(false); }
   }, []);
@@ -54,7 +56,7 @@ export default function App() {
 
   const success = (text: string) => { setNotice({ type: "success", text }); window.setTimeout(() => setNotice(null), 3500); };
   const fail = (error: unknown) => setNotice({ type: "error", text: errorMessage(error) });
-  const common = { providers, targets, routes, logs, localKeys, settings, refresh, success, fail };
+  const common = { providers, providerPresets, targets, routes, logs, localKeys, settings, refresh, success, fail };
 
   return <div className="shell">
     <aside className={sidebar ? "sidebar" : "sidebar collapsed"}>
@@ -82,7 +84,7 @@ export default function App() {
   </div>;
 }
 
-type Common = { providers: Provider[]; targets: ModelTarget[]; routes: ModelRoute[]; logs: RequestLog[]; localKeys: LocalApiKey[]; settings: Record<string, string>; refresh: () => Promise<void>; success: (text: string) => void; fail: (error: unknown) => void };
+type Common = { providers: Provider[]; providerPresets: ProviderPreset[]; targets: ModelTarget[]; routes: ModelRoute[]; logs: RequestLog[]; localKeys: LocalApiKey[]; settings: Record<string, string>; refresh: () => Promise<void>; success: (text: string) => void; fail: (error: unknown) => void };
 
 function PageHead({ eyebrow, title, description, action }: { eyebrow: string; title: string; description: string; action?: ReactNode }) {
   return <div className="page-head"><div><span className="eyebrow">{eyebrow}</span><h1>{title}</h1><p>{description}</p></div>{action}</div>;
@@ -141,33 +143,40 @@ function UsagePage() {
   </>;
 }
 
-function ProvidersPage({ providers, refresh, success, fail }: Common) {
+function ProvidersPage({ providers, providerPresets, refresh, success, fail }: Common) {
   const [editing, setEditing] = useState<Provider | null | undefined>();
   const remove = async (id: string) => { if (!confirm("Delete this provider and its cloud targets?")) return; try { await command("delete_provider", { id }); await refresh(); success("Provider removed"); } catch (e) { fail(e); } };
+  const test = async (id: string) => { try { const models = await command<string[]>("test_provider_connection", { id }); success(`Connection successful${models.length > 1 ? ` · ${models.length} models visible` : ""}`); } catch (e) { fail(e); } };
+  const connect = async (id: string) => { try { const start = await command<{ authorization_url: string }>("begin_openai_subscription", { id }); await openUrl(start.authorization_url); success("Browser opened; complete sign-in within three minutes"); } catch (e) { fail(e); } };
+  const oauthStatus = async (id: string) => { try { const status = await command<{ state: string; account_id: string | null; error: string | null }>("openai_subscription_status", { id }); if (status.state === "error") fail(status.error ?? "OAuth failed"); else success(`OAuth status: ${status.state}${status.account_id ? ` · ${status.account_id}` : ""}`); await refresh(); } catch (e) { fail(e); } };
+  const logout = async (id: string) => { try { await command("logout_openai_subscription", { id }); await refresh(); success("Subscription disconnected and tokens removed from Keychain"); } catch (e) { fail(e); } };
   return <>
     <PageHead eyebrow="Credentials" title="Providers" description="Keys stay in macOS Keychain and are never written to the database." action={<button className="primary" onClick={() => setEditing(null)}><Plus size={17} />Add provider</button>} />
-    <div className="cards">{providers.map(provider => <article className="provider-card" key={provider.id}><div className={`provider-logo ${provider.kind}`}><Cloud /></div><div className="grow"><div className="row"><h3>{provider.name}</h3><Badge tone={provider.enabled && provider.has_credential ? "good" : "warn"}>{provider.enabled && provider.has_credential ? "Connected" : "Needs attention"}</Badge></div><p>{provider.base_url}</p><small>{provider.kind === "open_ai" ? "OpenAI" : "OpenRouter"} · Credential {provider.has_credential ? "stored in Keychain" : "missing"}</small></div><button className="icon-button" onClick={() => setEditing(provider)}><Settings size={17} /></button><button className="icon-button danger" onClick={() => void remove(provider.id)}><Trash2 size={17} /></button></article>)}</div>
-    {!providers.length && <Empty icon={<KeyRound />} title="Connect your first provider" text="Add an OpenAI or OpenRouter key to discover available models." action={<button className="primary" onClick={() => setEditing(null)}><Plus size={17} />Add provider</button>} />}
-    {editing !== undefined && <ProviderModal provider={editing} close={() => setEditing(undefined)} done={async () => { setEditing(undefined); await refresh(); success("Provider verified and saved"); }} fail={fail} />}
+    <div className="cards">{providers.map(provider => { const preset = providerPresets.find(item => item.id === provider.preset_id); const subscription = provider.auth_mode === "open_ai_subscription"; return <article className="provider-card" key={provider.id}><div className="provider-logo cloud"><Cloud /></div><div className="grow"><div className="row"><h3>{provider.name}</h3><Badge tone={provider.enabled && provider.has_credential ? "good" : "warn"}>{provider.enabled && provider.has_credential ? "Connected" : "Needs attention"}</Badge></div><p>{provider.base_url}</p><small>{preset?.name ?? provider.preset_id} · {accessLabel(preset?.access_tier)} · Credential {provider.has_credential ? "stored in Keychain" : "missing"}</small></div>{subscription ? <><button className="secondary" onClick={() => void oauthStatus(provider.id)}>Status</button>{!provider.has_credential && <button className="secondary" onClick={() => void connect(provider.id)}>Connect</button>}{provider.has_credential && <button className="secondary" onClick={() => void logout(provider.id)}>Logout</button>}</> : <button className="secondary" onClick={() => void test(provider.id)}>Test</button>}<button className="icon-button" onClick={() => setEditing(provider)}><Settings size={17} /></button><button className="icon-button danger" onClick={() => void remove(provider.id)}><Trash2 size={17} /></button></article>; })}</div>
+    {!providers.length && <Empty icon={<KeyRound />} title="Connect your first provider" text="Choose a hosted provider or an experimental subscription connection." action={<button className="primary" onClick={() => setEditing(null)}><Plus size={17} />Add provider</button>} />}
+    {editing !== undefined && <ProviderModal provider={editing} presets={providerPresets} close={() => setEditing(undefined)} done={async () => { setEditing(undefined); await refresh(); success("Provider saved"); }} fail={fail} />}
   </>;
 }
 
-function ProviderModal({ provider, close, done, fail }: { provider: Provider | null; close: () => void; done: () => Promise<void>; fail: (e: unknown) => void }) {
-  const [kind, setKind] = useState<TargetKind>(provider?.kind ?? "open_ai"); const [name, setName] = useState(provider?.name ?? "OpenAI"); const [url, setUrl] = useState(provider?.base_url ?? "https://api.openai.com/v1"); const [key, setKey] = useState(""); const [busy, setBusy] = useState(false);
-  const choose = (next: TargetKind) => { setKind(next); if (!provider) { setName(next === "open_ai" ? "OpenAI" : "OpenRouter"); setUrl(next === "open_ai" ? "https://api.openai.com/v1" : "https://openrouter.ai/api/v1"); } };
-  const submit = async (event: FormEvent) => { event.preventDefault(); setBusy(true); try { await command("save_provider", { input: { id: provider?.id ?? null, name, kind, baseUrl: url, enabled: true, apiKey: key || null } }); await done(); } catch (e) { fail(e); } finally { setBusy(false); } };
-  return <Modal title={provider ? "Edit provider" : "Add provider"} close={close}><form onSubmit={submit} className="form"><div className="segmented"><button type="button" className={kind === "open_ai" ? "selected" : ""} onClick={() => choose("open_ai")}>OpenAI</button><button type="button" className={kind === "open_router" ? "selected" : ""} onClick={() => choose("open_router")}>OpenRouter</button></div><Field label="Display name"><input value={name} onChange={e => setName(e.target.value)} required /></Field><Field label="Base URL"><input value={url} onChange={e => setUrl(e.target.value)} required /></Field><Field label={provider?.has_credential ? "Replace API key (optional)" : "API key"}><input type="password" value={key} onChange={e => setKey(e.target.value)} required={!provider?.has_credential} placeholder="sk-••••••••" /></Field><div className="security-note"><ShieldCheck size={17} /><span>The key is validated with the provider before it is saved to Keychain.</span></div><ModalActions close={close} busy={busy} label="Verify & save" /></form></Modal>;
+function ProviderModal({ provider, presets, close, done, fail }: { provider: Provider | null; presets: ProviderPreset[]; close: () => void; done: () => Promise<void>; fail: (e: unknown) => void }) {
+  const initialPreset = presets.find(item => item.id === provider?.preset_id) ?? presets[0];
+  const [presetId, setPresetId] = useState(provider?.preset_id ?? initialPreset?.id ?? "openai"); const [name, setName] = useState(provider?.name ?? initialPreset?.name ?? "OpenAI"); const [url, setUrl] = useState(provider?.base_url ?? initialPreset?.base_url ?? ""); const [key, setKey] = useState(""); const [busy, setBusy] = useState(false);
+  const preset = presets.find(item => item.id === presetId) ?? initialPreset;
+  const choose = (next: string) => { const selected = presets.find(item => item.id === next); setPresetId(next); if (selected) { setName(selected.name); setUrl(selected.base_url ?? ""); } };
+  const submit = async (event: FormEvent) => { event.preventDefault(); if (!preset) return; setBusy(true); try { await command("save_provider", { input: { id: provider?.id ?? null, name, presetId, authMode: preset.auth_mode, baseUrl: url, enabled: true, apiKey: key || null } }); await done(); } catch (e) { fail(e); } finally { setBusy(false); } };
+  return <Modal title={provider ? "Edit provider" : "Add provider"} close={close}><form onSubmit={submit} className="form"><Field label="Provider preset"><select value={presetId} onChange={e => choose(e.target.value)}>{presets.map(item => <option value={item.id} key={item.id}>{item.name} · {accessLabel(item.access_tier)}</option>)}</select></Field><Field label="Display name"><input value={name} onChange={e => setName(e.target.value)} required /></Field><Field label="Base URL"><input value={url} onChange={e => setUrl(e.target.value)} required readOnly={!preset?.editable_base_url} /></Field>{preset?.auth_mode === "api_key" ? <Field label={provider?.has_credential ? "Replace API key (optional)" : "API key"}><input type="password" value={key} onChange={e => setKey(e.target.value)} required={!provider?.has_credential} placeholder="Provider API key" /></Field> : <div className="security-note"><CircleAlert size={17} /><span>Experimental ChatGPT subscription access is not a documented general OpenAI Platform API. API keys remain the stable application-access option.</span></div>}{preset?.note && <div className="security-note"><BookOpen size={17} /><span>{preset.note}</span></div>}{preset && <div className="security-note"><BookOpen size={17} /><a href={preset.docs_url} target="_blank" rel="noreferrer">Provider documentation</a></div>}<div className="security-note"><ShieldCheck size={17} /><span>Credentials are stored only in macOS Keychain. Connection testing, replacement and model sync are separate actions.</span></div><ModalActions close={close} busy={busy} label="Save provider" /></form></Modal>;
 }
 
 function CloudPage({ providers, targets, refresh, success, fail }: Common) {
-  const cloud = targets.filter(target => target.kind === "open_ai" || target.kind === "open_router");
-  const [providerId, setProviderId] = useState(providers[0]?.id ?? ""); const [models, setModels] = useState<string[]>([]); const [model, setModel] = useState(""); const [busy, setBusy] = useState(false);
-  useEffect(() => { if (providerId) void command<string[]>("cached_provider_models", { id: providerId }).then(setModels).catch(() => setModels([])); }, [providerId]);
-  const sync = async () => { if (!providerId) return; setBusy(true); try { const found = await command<string[]>("sync_provider_models", { id: providerId }); setModels(found); success(`${found.length} models discovered`); } catch (e) { fail(e); } finally { setBusy(false); } };
-  const add = async () => { const provider = providers.find(item => item.id === providerId); if (!provider || !model) return; try { await command("save_target", { target: { id: crypto.randomUUID(), provider_id: provider.id, name: model, kind: provider.kind, provider_model: model, local_path: null, runtime_url: null, capabilities: ["chat", "embeddings", "images", "audio", "moderation"], enabled: true, state: "ready", size_bytes: null } }); setModel(""); await refresh(); success("Cloud model added"); } catch (e) { fail(e); } };
+  const cloud = targets.filter(target => target.kind === "cloud");
+  const [providerId, setProviderId] = useState(providers[0]?.id ?? ""); const [models, setModels] = useState<ProviderModel[]>([]); const [model, setModel] = useState(""); const [protocol, setProtocol] = useState<WireProtocol>("open_ai_chat"); const [capabilities, setCapabilities] = useState(["chat", "streaming"]); const [busy, setBusy] = useState(false);
+  useEffect(() => { if (providerId) void command<ProviderModel[]>("cached_provider_models", { id: providerId }).then(setModels).catch(() => setModels([])); }, [providerId]);
+  useEffect(() => { const selected = models.find(item => item.id === model); if (selected) { setProtocol(selected.wire_protocol); setCapabilities(selected.capabilities); } }, [model, models]);
+  const sync = async () => { if (!providerId) return; setBusy(true); try { const found = await command<ProviderModel[]>("sync_provider_models", { id: providerId }); setModels(found); success(`${found.length} models discovered`); } catch (e) { fail(e); } finally { setBusy(false); } };
+  const add = async () => { const provider = providers.find(item => item.id === providerId); if (!provider || !model) return; try { await command("save_target", { target: { id: crypto.randomUUID(), provider_id: provider.id, name: model, kind: "cloud", wire_protocol: protocol, provider_model: model, local_path: null, runtime_url: null, capabilities, enabled: true, state: "ready", size_bytes: null } }); setModel(""); await refresh(); success("Cloud model added"); } catch (e) { fail(e); } };
   return <><PageHead eyebrow="Catalog" title="Cloud models" description="Discover provider models, then expose only the ones you choose." />
-    <section className="panel toolbar-panel"><select value={providerId} onChange={e => setProviderId(e.target.value)}>{providers.map(provider => <option value={provider.id} key={provider.id}>{provider.name}</option>)}</select><button className="secondary" onClick={() => void sync()} disabled={!providerId || busy}>{busy ? <LoaderCircle className="spin" size={17} /> : <RefreshCw size={17} />}Sync catalog</button><div className="divider" /><input list="provider-models" value={model} onChange={e => setModel(e.target.value)} placeholder="Select or enter model ID" /><datalist id="provider-models">{models.map(item => <option value={item} key={item} />)}</datalist><button className="primary" disabled={!model || !providerId} onClick={() => void add()}><Plus size={17} />Add model</button></section>
-    <div className="table"><div className="table-head"><span>Model</span><span>Provider</span><span>Capabilities</span><span>Status</span><span /></div>{cloud.map(target => <div className="table-row" key={target.id}><strong>{target.name}</strong><span>{providers.find(p => p.id === target.provider_id)?.name ?? "Unknown"}</span><CapabilityList items={target.capabilities} /><Badge tone="good">Ready</Badge><DeleteTarget id={target.id} refresh={refresh} success={success} fail={fail} /></div>)}</div>
+    <section className="panel"><div className="toolbar-panel"><select value={providerId} onChange={e => setProviderId(e.target.value)}>{providers.map(provider => <option value={provider.id} key={provider.id}>{provider.name}</option>)}</select><button className="secondary" onClick={() => void sync()} disabled={!providerId || busy}>{busy ? <LoaderCircle className="spin" size={17} /> : <RefreshCw size={17} />}Sync catalog</button><div className="divider" /><input list="provider-models" value={model} onChange={e => setModel(e.target.value)} placeholder="Select or enter model ID" /><datalist id="provider-models">{models.map(item => <option value={item.id} key={item.id} />)}</datalist><select aria-label="Wire protocol" value={protocol} onChange={e => setProtocol(e.target.value as WireProtocol)}><option value="open_ai_chat">OpenAI Chat</option><option value="open_ai_responses">OpenAI Responses</option><option value="anthropic_messages">Anthropic Messages</option><option value="gemini_generate_content">Gemini GenerateContent</option></select><button className="primary" disabled={!model || !providerId} onClick={() => void add()}><Plus size={17} />Add model</button></div><div className="capabilities capability-editor">{["chat", "streaming", "tools", "vision", "reasoning", "structured_output", "embeddings", "images", "audio", "moderation"].map(item => <label key={item}><input type="checkbox" checked={capabilities.includes(item)} onChange={event => setCapabilities(event.target.checked ? [...capabilities, item] : capabilities.filter(value => value !== item))} />{item}</label>)}</div></section>
+    <div className="table"><div className="table-head"><span>Model</span><span>Provider / protocol</span><span>Capabilities</span><span>Status</span><span /></div>{cloud.map(target => <div className="table-row" key={target.id}><strong>{target.name}</strong><span>{providers.find(p => p.id === target.provider_id)?.name ?? "Unknown"}<small>{protocolLabel(target.wire_protocol)}</small></span><CapabilityList items={target.capabilities} /><Badge tone="good">Ready</Badge><DeleteTarget id={target.id} refresh={refresh} success={success} fail={fail} /></div>)}</div>
     {!cloud.length && <Empty icon={<Cloud />} title="No cloud models selected" text="Sync a provider catalog or enter a model ID manually." />}
   </>;
 }
@@ -269,3 +278,5 @@ function NumberSetting({ value: initial, suffix, onSave }: { value: string; suff
 function formatBytes(value: number | null) { if (!value) return "Size unknown"; const units = ["B", "KB", "MB", "GB", "TB"]; const index = Math.min(Math.floor(Math.log(value) / Math.log(1024)), units.length - 1); return `${(value / 1024 ** index).toFixed(index > 2 ? 1 : 0)} ${units[index]}`; }
 function formatNumber(value: number) { return new Intl.NumberFormat().format(value); }
 function statusTone(status: number): "good" | "warn" | "bad" | "neutral" { if (status >= 200 && status < 300) return "good"; if (status >= 400 && status < 500) return "warn"; if (status >= 500) return "bad"; return "neutral"; }
+function accessLabel(tier?: ProviderPreset["access_tier"]) { return ({ free_tier: "Free tier", starter_credits: "Starter credits", paid: "Paid", subscription: "Subscription", experimental: "Experimental" } as const)[tier ?? "paid"]; }
+function protocolLabel(protocol: WireProtocol) { return ({ open_ai_chat: "OpenAI Chat", open_ai_responses: "OpenAI Responses", anthropic_messages: "Anthropic Messages", gemini_generate_content: "Gemini GenerateContent" } as const)[protocol]; }

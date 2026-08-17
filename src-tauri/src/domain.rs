@@ -3,8 +3,8 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum TargetKind {
-    OpenAi,
-    OpenRouter,
+    #[serde(alias = "open_ai", alias = "open_router")]
+    Cloud,
     Gguf,
     Mlx,
 }
@@ -49,7 +49,7 @@ mod tests {
     fn target(id: &str, priority: i64, enabled: bool) -> RouteTarget {
         RouteTarget {
             id: id.into(),
-            kind: TargetKind::OpenAi,
+            kind: TargetKind::Cloud,
             model: id.into(),
             priority,
             enabled,
