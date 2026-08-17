@@ -32,7 +32,7 @@
       "../sidecars/licenses/": "sidecars/licenses/",
       "../THIRD_PARTY_NOTICES.md": "THIRD_PARTY_NOTICES.md"
     },
-    "macOS": { "minimumSystemVersion": "14.0" }
+            "macOS": { "minimumSystemVersion": "15.0" }
   },
   "plugins": {
     "updater": {

@@ -4,24 +4,26 @@ A private, multi-protocol model gateway for Apple Silicon Macs. Local AI Router 
 
 ## What works
 
-- Tauri 2 menu-bar app for macOS 14+
+- Tauri 2 menu-bar app for macOS 15+
 - Presets for OpenAI, Anthropic, OpenRouter, Poolside, MiniMax, Z.AI, OpenCode Zen, Gemini, Groq, Cerebras, Mistral, Hugging Face, NVIDIA NIM and SambaNova
 - API keys and experimental OpenAI Subscription OAuth tokens stored in macOS Keychain
 - Provider model discovery and manually entered model IDs
 - Stable model aliases with ordered transient-error fallbacks
-- `/v1/chat/completions`, `/v1/responses`, Anthropic `/v1/messages`, and Gemini `/v1beta/models/*` with non-streaming, SSE, vision and tool translation
+- `/v1/chat/completions`, `/v1/responses`, Anthropic `/v1/messages`, and Gemini `/v1beta/models/*` with non-streaming, SSE, vision, audio/video input and tool translation
+- Local `/v1/images/generations` and `/v1/audio/speech` for installed MLX image and TTS models
 - Cloud proxying for Images, Audio and Moderations, including multipart uploads
 - Named local client keys with per-key usage attribution
+- Built-in open-source chat playground, preconfigured for enabled chat aliases
 - Usage dashboard plus filterable metadata-only request logs, filtered CSV export and automatic 30-day retention
-- Managed MLX/GGUF imports and resumable Hugging Face downloads
-- Resident local model management with a configurable memory budget and idle unloading
-- Native MLX and Metal-enabled llama.cpp sidecars
+- Curated MLX catalog with RAM-aware install, live Hugging Face MLX search, managed imports and resumable downloads
+- Stealth, Balanced, Performance and Custom resource profiles with automatic loading, idle unloading, prompt concurrency and per-model overrides
+- Native MLX chat, image and speech sidecars plus Metal-enabled llama.cpp
 
 The gateway listens only on `http://127.0.0.1:11435`. Every request requires a local token managed under Settings. Supply it as `Authorization: Bearer`, `x-api-key`, or `x-goog-api-key`; query-string keys are deliberately rejected because URLs are commonly logged.
 
 ## Development
 
-Requirements: Apple Silicon, macOS 14+, Node.js 22+, Rust 1.77+, Swift 6.2+, CMake, and Xcode command-line tools.
+Requirements: Apple Silicon, macOS 15+, Node.js 22+, Rust 1.77+, Swift 6.2+, CMake, and Xcode command-line tools.
 
 ```bash
 npm install
@@ -29,7 +31,7 @@ npm install
 npm run tauri dev
 ```
 
-Building both inference engines takes time. The desktop shell and cloud router can be developed without them; local model startup will report a clear “runtime sidecar missing” error until the script has run.
+Building both inference engines takes time. `swift build` compiles the MLX servers but skips Metal shaders, so `scripts/build-sidecars.sh` also compiles `mlx.metallib` next to the binaries. That step needs Xcode’s Metal toolchain (`xcodebuild -downloadComponent MetalToolchain`). The desktop shell and cloud router can be developed without sidecars; local model startup will report a missing binary or missing Metal kernels until the script has run.
 
 Run all fast checks:
 
@@ -87,6 +89,34 @@ response = client.models.generate_content(model="my-assistant", contents="Hello"
 
 Only configured aliases appear in `client.models.list()`. The alias must advertise the capability used by the endpoint.
 
+### Adaptive task routing
+
+Every existing alias remains a fixed, ordered fallback route until an adaptive policy is explicitly activated. Adaptive policies filter candidates by capabilities, context, privacy and configured cost limits, then deterministically rank them by task quality, predicted cost, rolling latency, reliability and locality. Draft policies do not affect traffic; Shadow policies record the model they would select while the fixed route continues serving.
+
+Clients can bypass automatic task rules with a local-only header:
+
+```bash
+curl http://127.0.0.1:11435/v1/chat/completions \
+  -H "Authorization: Bearer lar_..." \
+  -H "Content-Type: application/json" \
+  -H "X-Local-AI-Task: coding" \
+  -d '{"model":"my-assistant","messages":[{"role":"user","content":"Refactor this function"}]}'
+```
+
+The task header is validated and never forwarded upstream. Responses expose `X-Local-AI-Task`, `X-Local-AI-Target`, `X-Local-AI-Routing-Mode` and `X-Local-AI-Routing-Reason`. Routing profiles, policies and custom tasks can be previewed and imported/exported as `local-ai-router/routing-policy/v1` JSON; credentials, prompts, responses and measurement history are excluded.
+
+### Background inference and persistent sessions
+
+New installations default to Stealth mode: local sidecars run at low process priority and are runnable for 100 ms of each 400 ms window while inference is active. This is a 25% scheduler duty cycle, not a guaranteed 25% Metal utilization value; macOS does not expose per-process GPU or Neural Engine compute quotas to these runtimes. GGUF additionally exposes GPU-layer and CPU-thread limits. MLX uses Metal and receives process memory/cache limits; the current engines do not target the Apple Neural Engine.
+
+Stopped local models load automatically on their first request. Active prompts are limited per model, while additional authenticated requests wait in a FIFO queue until the client disconnects or the app shuts down. Resource changes restart loaded sidecars only after active and queued work has drained.
+
+GGUF clients can opt into persistent llama.cpp KV snapshots by sending `X-Local-AI-Session` with a stable value of at most 128 characters. Persistent KV requires one parallel prompt and the client must still send the full conversation history. Snapshots are isolated by API key, model and session, stored with private filesystem permissions under Application Support, and evicted least-recently-used above 10 GiB. They are not encrypted independently of the Mac filesystem.
+
+Local chat models accept OpenAI `input_audio` and the Local AI Router extension `input_video`, plus Gemini `inlineData` for image, audio and video. Anthropic remains text and image only. Remote media must be a data URL or public HTTPS URL; private, loopback and link-local destinations are blocked. Generated images and speech are returned to the client and are neither persisted nor written to request logs.
+
+`/v1/images/generations` for local targets supports `model`, `prompt`, `n: 1`, engine-compatible sizes and `response_format: "b64_json"`. `/v1/audio/speech` supports `model`, `input`, `voice`, `speed`, plus `wav` and `pcm`. New local speech targets must advertise `speech`; stored cloud targets may still use `audio`.
+
 ## Provider notes
 
 - Poolside requires the HTTPS deployment domain assigned to your organization; enter its OpenAI-compatible base URL in the preset.
@@ -103,6 +133,7 @@ Only configured aliases appear in `client.models.list()`. The alias must adverti
 - Local bearer tokens are stored in Keychain, compared in constant time and can be rotated or revoked immediately.
 - The gateway never binds to a LAN address.
 - Imported models are copied into the app-managed Application Support directory.
+- Optional GGUF KV snapshots can encode sensitive conversation state. They are unencrypted app-private files and can be removed from Settings at any time.
 - Cloud prompts and tool data are sent to the provider selected by the route and remain subject to that provider's retention, training and regional-processing terms. Fallback targets may send a request to a different provider only after an eligible pre-stream failure.
 
 ## Release setup
@@ -117,4 +148,4 @@ Before the first public build, replace the updater public-key placeholder in `sr
 
 ## Runtime notes
 
-`scripts/build-sidecars.sh` pins llama.cpp to a reviewed commit and MLX Swift LM to release `3.31.4`. Their licenses must accompany redistributed binaries; see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+`scripts/build-sidecars.sh` pins llama.cpp to a reviewed commit, MLX Swift LM to release `3.31.4`, FLUX.2 Swift MLX to release `v2.4.0`, and kokoro-swift to commit `20bf04c506e913ff129d7d2229398180ba24c690`. Metal shaders are compiled into `sidecars/bin/mlx.metallib` because SwiftPM command-line builds skip them. FLUX.2 and Kokoro are prepared as local Swift packages (`scripts/prepare-flux-vendor.sh`, `scripts/prepare-kokoro-vendor.sh`) because unmodified git dependencies cannot be consumed as-is. Their licenses must accompany redistributed binaries; see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). Model weights are not shipped with the app.

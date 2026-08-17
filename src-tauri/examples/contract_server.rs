@@ -46,6 +46,7 @@ async fn main() -> anyhow::Result<()> {
         enabled: true,
         state: "ready".into(),
         size_bytes: None,
+        local: local_ai_router_lib::storage::LocalModelMeta::default(),
     };
     store.upsert_target(&target).await?;
     store

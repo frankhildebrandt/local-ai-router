@@ -24,10 +24,55 @@ use crate::{
         PublicProtocol, StreamTranslator,
     },
     providers::{provider_preset, AuthScheme, WireProtocol},
+    routing::{
+        evaluate_route, PolicyStatus, RouteEvaluationInput, RoutingAttemptRecord,
+        RoutingEvaluation, RoutingMode,
+    },
+    runtime::RuntimeManager,
     storage::RequestLog,
 };
 
+#[derive(Clone)]
+struct GatewayState {
+    core: Arc<AppCore>,
+    runtimes: Option<Arc<RuntimeManager>>,
+}
+
 pub fn router(core: Arc<AppCore>) -> Router {
+    router_with_state(GatewayState {
+        core,
+        runtimes: None,
+    })
+}
+
+pub fn managed_router(core: Arc<AppCore>, runtimes: Arc<RuntimeManager>) -> Router {
+    router_with_state(GatewayState {
+        core,
+        runtimes: Some(runtimes),
+    })
+}
+
+async fn sync_runtime_states(core: &AppCore, runtimes: &RuntimeManager) {
+    let Ok(targets) = core.store.targets().await else {
+        return;
+    };
+    for mut target in targets {
+        if matches!(
+            target.kind,
+            crate::domain::TargetKind::Gguf | crate::domain::TargetKind::Mlx
+        ) && target.runtime_url.is_some()
+            && !runtimes.is_running(&target.id)
+        {
+            target.runtime_url = None;
+            target.state = "stopped".into();
+            if let Err(error) = core.store.upsert_target(&target).await {
+                tracing::warn!(target = %target.id, %error, "failed to synchronize local runtime state");
+            }
+        }
+    }
+}
+
+fn router_with_state(state: GatewayState) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/v1/models", get(models))
@@ -45,14 +90,15 @@ pub fn router(core: Arc<AppCore>) -> Router {
         .route("/v1/audio/translations", post(proxy))
         .route("/v1/moderations", post(proxy))
         .fallback(not_found)
-        .with_state(core)
+        .with_state(state)
 }
 
 async fn gemini_models(
-    State(core): State<Arc<AppCore>>,
+    State(state): State<GatewayState>,
     OriginalUri(uri): OriginalUri,
     headers: HeaderMap,
 ) -> Response<Body> {
+    let core = state.core;
     if query_has_api_key(&uri) {
         return protocol_error(
             PublicProtocol::Gemini,
@@ -69,7 +115,7 @@ async fn gemini_models(
             "Invalid local API key",
         );
     }
-    match core.store.routes().await {
+    match advertised_routes(&core).await {
         Ok(routes) => json_response(
             StatusCode::OK,
             json!({"models": routes.into_iter().filter(|route| route.enabled).map(|route| json!({"name":format!("models/{}",route.alias),"displayName":route.alias,"supportedGenerationMethods":["generateContent","streamGenerateContent"]})).collect::<Vec<_>>() }),
@@ -96,10 +142,11 @@ async fn not_found() -> Response<Body> {
 }
 
 async fn models(
-    State(core): State<Arc<AppCore>>,
+    State(state): State<GatewayState>,
     OriginalUri(uri): OriginalUri,
     headers: HeaderMap,
 ) -> Response<Body> {
+    let core = state.core;
     if query_has_api_key(&uri) {
         return openai_error(
             StatusCode::BAD_REQUEST,
@@ -110,7 +157,7 @@ async fn models(
     if authenticated_key_id(&core, &headers).await.is_none() {
         return unauthorized();
     }
-    match core.store.routes().await {
+    match advertised_routes(&core).await {
         Ok(routes) => json_response(
             StatusCode::OK,
             json!({
@@ -129,11 +176,13 @@ async fn models(
 }
 
 async fn proxy(
-    State(core): State<Arc<AppCore>>,
+    State(state): State<GatewayState>,
     OriginalUri(uri): OriginalUri,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response<Body> {
+    let core = state.core;
+    let runtimes = state.runtimes;
     let public_protocol = protocol_for_path(uri.path());
     if query_has_api_key(&uri) {
         return request_error(
@@ -150,6 +199,17 @@ async fn proxy(
             "invalid_api_key",
             "Invalid local API key",
         );
+    };
+    let session_id = match validated_session_id(headers.get("x-local-ai-session")) {
+        Ok(value) => value.map(str::to_owned),
+        Err(message) => {
+            return request_error(
+                public_protocol,
+                StatusCode::BAD_REQUEST,
+                "invalid_local_session",
+                message,
+            )
+        }
     };
     let started = Instant::now();
     let request_id = Uuid::new_v4().to_string();
@@ -213,7 +273,11 @@ async fn proxy(
         );
     }
     let capability = endpoint_capability(uri.path());
-    if !route.capabilities.iter().any(|item| item == capability) {
+    let routing_policy = core.store.routing_policy(&alias).await.ok().flatten();
+    let adaptive_active = routing_policy.as_ref().is_some_and(|policy| {
+        policy.mode == RoutingMode::Adaptive && policy.status == PolicyStatus::Active
+    });
+    if !adaptive_active && !route_supports_capability(&route, capability) {
         return request_error(
             public_protocol,
             StatusCode::BAD_REQUEST,
@@ -232,7 +296,7 @@ async fn proxy(
             payload["stream"] = Value::Bool(true);
         }
     }
-    let canonical = match (public_protocol, json_payload.as_ref()) {
+    let decoded = match (public_protocol, json_payload.as_ref()) {
         (Some(protocol), Some(payload)) => match decode_request(protocol, payload, path_model) {
             Ok(request) => Some(request),
             Err(error) => {
@@ -246,13 +310,124 @@ async fn proxy(
         },
         _ => None,
     };
-    let targets = route.ordered_targets();
+    let mut required_capabilities = vec![capability.to_owned()];
+    if is_stream {
+        required_capabilities.push("streaming".into());
+    }
+    if let Some(canonical) = decoded.as_ref() {
+        if !canonical.tools.is_empty() {
+            required_capabilities.push("tools".into());
+        }
+        if canonical.reasoning.is_some() {
+            required_capabilities.push("reasoning".into());
+        }
+        if canonical.response_format.is_some() {
+            required_capabilities.push("structured_output".into());
+        }
+        for (needed, name) in [
+            (
+                canonical
+                    .messages
+                    .iter()
+                    .flat_map(|message| &message.content)
+                    .any(|block| matches!(block, crate::protocol::ContentBlock::Image { .. })),
+                "vision",
+            ),
+            (
+                canonical
+                    .messages
+                    .iter()
+                    .flat_map(|message| &message.content)
+                    .any(|block| matches!(block, crate::protocol::ContentBlock::Audio { .. })),
+                "audio_input",
+            ),
+            (
+                canonical
+                    .messages
+                    .iter()
+                    .flat_map(|message| &message.content)
+                    .any(|block| matches!(block, crate::protocol::ContentBlock::Video { .. })),
+                "video_input",
+            ),
+        ] {
+            if needed {
+                required_capabilities.push(name.into());
+            }
+        }
+    }
+    required_capabilities.sort();
+    required_capabilities.dedup();
+    let explicit_task = headers
+        .get("x-local-ai-task")
+        .and_then(|value| value.to_str().ok());
+    let evaluation = match evaluate_route(
+        &core.store,
+        &route,
+        RouteEvaluationInput {
+            policy: routing_policy.as_ref(),
+            explicit_task,
+            endpoint: uri.path(),
+            canonical: decoded.as_ref(),
+            required_capabilities,
+            streaming: is_stream,
+        },
+    )
+    .await
+    {
+        Ok(evaluation) => evaluation,
+        Err(error) if error.to_string().starts_with("unknown routing task:") => {
+            return request_error(
+                public_protocol,
+                StatusCode::BAD_REQUEST,
+                "invalid_task",
+                &error.to_string(),
+            )
+        }
+        Err(error) => {
+            return request_error(
+                public_protocol,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "routing_error",
+                &error.to_string(),
+            )
+        }
+    };
+    let targets = evaluation
+        .ordered_target_ids
+        .iter()
+        .filter_map(|id| route.targets.iter().find(|target| target.id == *id))
+        .collect::<Vec<_>>();
     if targets.is_empty() {
+        if evaluation.mode == "adaptive" {
+            record_routing_attempt(
+                &core,
+                &evaluation,
+                &request_id,
+                "none",
+                RoutingAttemptOutcome {
+                    status: 503,
+                    transient_failure: false,
+                    retry_after_until: None,
+                    latency: Duration::ZERO,
+                    ttft: None,
+                    streaming: is_stream,
+                },
+            )
+            .await;
+        }
         return request_error(
             public_protocol,
             StatusCode::SERVICE_UNAVAILABLE,
-            "no_targets",
-            "This alias has no enabled targets",
+            if evaluation.mode == "adaptive" {
+                "no_available_target"
+            } else {
+                "no_targets"
+            },
+            if evaluation.mode == "adaptive" {
+                "No target satisfies this adaptive routing policy"
+            } else {
+                "This alias has no enabled targets"
+            },
         );
     }
     let total_targets = targets.len() as i64;
@@ -260,15 +435,29 @@ async fn proxy(
     let mut attempts = 0i64;
     let mut last_error: Option<Response<Body>> = None;
     let mut last_translation_error: Option<String> = None;
+    let mut last_capability_error: Option<&str> = None;
     for route_target in targets {
         attempts += 1;
-        let Ok(Some(target)) = core.store.target(&route_target.id).await else {
-            continue;
-        };
-        if !target.capabilities.iter().any(|item| item == capability) {
+        if evaluation.mode == "adaptive"
+            && evaluation.half_open_target_ids.contains(&route_target.id)
+            && !core
+                .store
+                .claim_half_open(&route_target.id, &evaluation.task)
+                .await
+                .unwrap_or(false)
+        {
             continue;
         }
-        if canonical.is_none()
+        let attempt_started = Instant::now();
+        let Ok(Some(mut target)) = core.store.target(&route_target.id).await else {
+            continue;
+        };
+        if !target_supports_capability(&target, capability) {
+            last_capability_error =
+                Some("No target in this alias supports the requested capability");
+            continue;
+        }
+        if decoded.is_none()
             && !matches!(
                 target.wire_protocol,
                 WireProtocol::OpenAiChat | WireProtocol::OpenAiResponses
@@ -276,6 +465,7 @@ async fn proxy(
         {
             continue;
         }
+        let mut canonical = decoded.clone();
         if let Some(canonical) = canonical.as_ref() {
             let required = [
                 (is_stream, "streaming"),
@@ -290,27 +480,160 @@ async fn proxy(
                         .any(|block| matches!(block, crate::protocol::ContentBlock::Image { .. })),
                     "vision",
                 ),
+                (
+                    canonical
+                        .messages
+                        .iter()
+                        .flat_map(|message| &message.content)
+                        .any(|block| matches!(block, crate::protocol::ContentBlock::Audio { .. })),
+                    "audio_input",
+                ),
+                (
+                    canonical
+                        .messages
+                        .iter()
+                        .flat_map(|message| &message.content)
+                        .any(|block| matches!(block, crate::protocol::ContentBlock::Video { .. })),
+                    "video_input",
+                ),
             ];
             if required.into_iter().any(|(needed, capability)| {
                 needed && !target.capabilities.iter().any(|item| item == capability)
             }) {
+                last_capability_error =
+                    Some("No target in this alias supports the requested media capability");
                 continue;
+            }
+        }
+        if matches!(
+            target.kind,
+            crate::domain::TargetKind::Gguf | crate::domain::TargetKind::Mlx
+        ) {
+            if uri.path() == "/v1/images/generations" {
+                if let Some(payload) = json_payload.as_ref() {
+                    if let Err(error) = validate_local_image_request(payload) {
+                        return request_error(
+                            public_protocol,
+                            StatusCode::BAD_REQUEST,
+                            "unsupported_parameter",
+                            &error.to_string(),
+                        );
+                    }
+                }
+            }
+            if uri.path() == "/v1/audio/speech" {
+                if let Some(payload) = json_payload.as_ref() {
+                    if let Err(error) = validate_local_speech_request(payload) {
+                        return request_error(
+                            public_protocol,
+                            StatusCode::BAD_REQUEST,
+                            "unsupported_parameter",
+                            &error.to_string(),
+                        );
+                    }
+                }
+            }
+            if let Some(canonical) = canonical.as_mut() {
+                if let Err(error) =
+                    crate::media::resolve_request_media(&core.client, canonical).await
+                {
+                    return request_error(
+                        public_protocol,
+                        StatusCode::BAD_REQUEST,
+                        "invalid_media",
+                        &error.to_string(),
+                    );
+                }
+            }
+        }
+        if matches!(
+            target.kind,
+            crate::domain::TargetKind::Gguf | crate::domain::TargetKind::Mlx
+        ) && runtimes
+            .as_ref()
+            .is_some_and(|runtimes| !runtimes.is_running(&target.id))
+        {
+            target.runtime_url = None;
+            target.state = "stopped".into();
+            let _ = core.store.upsert_target(&target).await;
+        }
+        if matches!(
+            target.kind,
+            crate::domain::TargetKind::Gguf | crate::domain::TargetKind::Mlx
+        ) && target.runtime_url.is_none()
+        {
+            let auto_load = core
+                .effective_resource_policy(&target)
+                .await
+                .map(|policy| policy.auto_load)
+                .unwrap_or(false);
+            let load = if auto_load {
+                match runtimes.as_ref() {
+                    Some(runtimes) => runtimes.start(&target).await,
+                    None => Err(anyhow::anyhow!("runtime manager unavailable")),
+                }
+            } else {
+                Err(anyhow::anyhow!("automatic loading is disabled"))
+            };
+            match load {
+                Ok(url) => {
+                    target.runtime_url = Some(url);
+                    target.state = "ready".into();
+                    let _ = core.store.upsert_target(&target).await;
+                    if let Some(runtimes) = runtimes.as_ref() {
+                        sync_runtime_states(&core, runtimes).await;
+                    }
+                }
+                Err(error) if attempts < total_targets => {
+                    tracing::warn!(target = %target.id, %error, "local model load failed; trying fallback");
+                    continue;
+                }
+                Err(error) => {
+                    return request_error(
+                        public_protocol,
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "local_load_failed",
+                        &format!("The local model could not be loaded: {error}"),
+                    );
+                }
             }
         }
         let local_permit = match core.acquire_local_slot(&target).await {
             Ok(permit) => permit,
-            Err(_) if attempts < total_targets => continue,
-            Err(_) => {
+            Err(error) if attempts < total_targets => {
+                tracing::warn!(target = %target.id, %error, "local admission failed; trying fallback");
+                continue;
+            }
+            Err(error) => {
                 return request_error(
                     public_protocol,
                     StatusCode::SERVICE_UNAVAILABLE,
                     "local_busy",
-                    "The local model queue is full",
+                    &format!("The local model could not admit the request: {error}"),
                 )
             }
         };
         let Ok((base_url, credential, account_id)) = core.target_endpoint(&target).await else {
             continue;
+        };
+        let kv_context = if target.kind == crate::domain::TargetKind::Gguf {
+            match (runtimes.as_ref(), session_id.as_deref()) {
+                (Some(runtimes), Some(session_id)) => {
+                    if let Err(error) = runtimes.restore_kv(&target, &api_key_id, session_id).await
+                    {
+                        tracing::warn!(target = %target.id, %error, "discarding unusable KV snapshot");
+                    }
+                    Some((
+                        runtimes.clone(),
+                        target.clone(),
+                        api_key_id.clone(),
+                        session_id.to_owned(),
+                    ))
+                }
+                _ => None,
+            }
+        } else {
+            None
         };
         let provider = if let Some(provider_id) = target.provider_id.as_deref() {
             core.store.provider(provider_id).await.ok().flatten()
@@ -340,19 +663,24 @@ async fn proxy(
             };
         let mut request = core.client.post(upstream_url);
         if let Some(payload) = json_payload.as_mut() {
-            let outbound = if let (Some(protocol), Some(canonical)) =
-                (public_protocol, canonical.as_ref())
-            {
-                if protocol_matches(protocol, target.wire_protocol) {
+            let outbound = if let Some(canonical) = canonical.as_ref() {
+                let protocol = public_protocol.unwrap();
+                if !matches!(
+                    target.kind,
+                    crate::domain::TargetKind::Gguf | crate::domain::TargetKind::Mlx
+                ) && protocol_matches(protocol, target.wire_protocol)
+                {
                     let mut native = payload.clone();
                     if protocol != PublicProtocol::Gemini {
                         native["model"] = Value::String(target.provider_model.clone());
                     }
                     native
                 } else {
-                    if let Err(error) = validate_cross_protocol(protocol, payload) {
-                        last_translation_error = Some(error.to_string());
-                        continue;
+                    if !protocol_matches(protocol, target.wire_protocol) {
+                        if let Err(error) = validate_cross_protocol(protocol, payload) {
+                            last_translation_error = Some(error.to_string());
+                            continue;
+                        }
                     }
                     match encode_request(target.wire_protocol, canonical, &target.provider_model) {
                         Ok(value) => value,
@@ -407,6 +735,7 @@ async fn proxy(
         match tokio::time::timeout(Duration::from_secs(120), request.send()).await {
             Ok(Ok(upstream)) => {
                 let status = upstream.status();
+                let retry_after_until = retry_after_deadline(upstream.headers());
                 if status.is_redirection() {
                     log_request(
                         &core,
@@ -432,10 +761,26 @@ async fn proxy(
                     );
                 }
                 if is_transient_status(status.as_u16()) && attempts < total_targets {
+                    record_routing_attempt(
+                        &core,
+                        &evaluation,
+                        &request_id,
+                        &target.id,
+                        RoutingAttemptOutcome {
+                            status: status.as_u16(),
+                            transient_failure: true,
+                            retry_after_until,
+                            latency: attempt_started.elapsed(),
+                            ttft: None,
+                            streaming: is_stream,
+                        },
+                    )
+                    .await;
                     continue;
                 }
                 let mut usage = (None, None);
                 let mut error_code = None;
+                let mut attempt_ttft = None;
                 let response = if is_stream && status.is_success() {
                     let translated_stream = public_protocol
                         .filter(|protocol| !protocol_matches(*protocol, target.wire_protocol));
@@ -453,9 +798,39 @@ async fn proxy(
                     {
                         Ok(Some(Ok(chunk))) => chunk,
                         Ok(Some(Err(_))) | Ok(None) | Err(_) if attempts < total_targets => {
-                            continue
+                            record_routing_attempt(
+                                &core,
+                                &evaluation,
+                                &request_id,
+                                &target.id,
+                                RoutingAttemptOutcome {
+                                    status: 502,
+                                    transient_failure: true,
+                                    retry_after_until: None,
+                                    latency: attempt_started.elapsed(),
+                                    ttft: None,
+                                    streaming: true,
+                                },
+                            )
+                            .await;
+                            continue;
                         }
                         Ok(Some(Err(_))) | Ok(None) | Err(_) => {
+                            record_routing_attempt(
+                                &core,
+                                &evaluation,
+                                &request_id,
+                                &target.id,
+                                RoutingAttemptOutcome {
+                                    status: 502,
+                                    transient_failure: true,
+                                    retry_after_until: None,
+                                    latency: attempt_started.elapsed(),
+                                    ttft: None,
+                                    streaming: true,
+                                },
+                            )
+                            .await;
                             last_error = Some(request_error(
                                 public_protocol,
                                 StatusCode::BAD_GATEWAY,
@@ -465,12 +840,20 @@ async fn proxy(
                             continue;
                         }
                     };
+                    attempt_ttft = Some(attempt_started.elapsed());
                     let stream_core = core.clone();
                     let stream_request_id = request_id.clone();
                     let stream_model = alias.clone();
                     let stream_wire_protocol = target.wire_protocol;
+                    let stream_kv = kv_context.clone();
+                    let stream_runtimes = runtimes.clone();
+                    let stream_evaluation = evaluation.clone();
+                    let stream_target_id = target.id.clone();
+                    let stream_attempt_started = attempt_started;
+                    let stream_ttft = attempt_ttft;
                     let stream = async_stream::stream! {
                         let _permit = local_permit;
+                        let mut stream_ok = true;
                         let mut usage_buffer = Vec::new();
                         let mut translator = translated_stream.map(|protocol| StreamTranslator::new(stream_wire_protocol, protocol, &stream_model));
                         if let Some((input_tokens, output_tokens)) = extract_sse_usage(&mut usage_buffer, &first_chunk) {
@@ -487,8 +870,52 @@ async fn proxy(
                                     let output = translator.as_mut().map(|translator| Bytes::from(translator.push(&chunk))).unwrap_or(chunk);
                                     if !output.is_empty() { yield Ok(output); }
                                 }
-                                Err(error) => yield Err(std::io::Error::other(error)),
+                                Err(error) => {
+                                    stream_ok = false;
+                                    record_routing_attempt(
+                                        &stream_core,
+                                        &stream_evaluation,
+                                        &stream_request_id,
+                                        &stream_target_id,
+                                        RoutingAttemptOutcome {
+                                            status: 502,
+                                            transient_failure: true,
+                                            retry_after_until: None,
+                                            latency: stream_attempt_started.elapsed(),
+                                            ttft: stream_ttft,
+                                            streaming: true,
+                                        },
+                                    ).await;
+                                    yield Err(std::io::Error::other(error));
+                                    break;
+                                }
                             }
+                        }
+                        if stream_ok {
+                            if let Some((runtimes, target, api_key_id, session_id)) = stream_kv {
+                                if let Err(error) = runtimes.save_kv(&target, &api_key_id, &session_id).await {
+                                    tracing::warn!(target = %target.id, %error, "KV snapshot save failed");
+                                }
+                            }
+                            record_routing_attempt(
+                                &stream_core,
+                                &stream_evaluation,
+                                &stream_request_id,
+                                &stream_target_id,
+                                RoutingAttemptOutcome {
+                                    status: status.as_u16(),
+                                    transient_failure: false,
+                                    retry_after_until: None,
+                                    latency: stream_attempt_started.elapsed(),
+                                    ttft: stream_ttft,
+                                    streaming: true,
+                                },
+                            ).await;
+                        }
+                        drop(_permit);
+                        if let Some(runtimes) = stream_runtimes.as_ref() {
+                            runtimes.reap_over_budget().await;
+                            sync_runtime_states(&stream_core, runtimes).await;
                         }
                     };
                     response_from_body(status, content_type, Body::from_stream(stream), &request_id)
@@ -501,8 +928,40 @@ async fn proxy(
                     .await
                     {
                         Ok(Ok(bytes)) => bytes,
-                        Ok(Err(_)) | Err(_) if attempts < total_targets => continue,
+                        Ok(Err(_)) | Err(_) if attempts < total_targets => {
+                            record_routing_attempt(
+                                &core,
+                                &evaluation,
+                                &request_id,
+                                &target.id,
+                                RoutingAttemptOutcome {
+                                    status: 502,
+                                    transient_failure: true,
+                                    retry_after_until: None,
+                                    latency: attempt_started.elapsed(),
+                                    ttft: None,
+                                    streaming: false,
+                                },
+                            )
+                            .await;
+                            continue;
+                        }
                         Ok(Err(_)) | Err(_) => {
+                            record_routing_attempt(
+                                &core,
+                                &evaluation,
+                                &request_id,
+                                &target.id,
+                                RoutingAttemptOutcome {
+                                    status: 504,
+                                    transient_failure: true,
+                                    retry_after_until: None,
+                                    latency: attempt_started.elapsed(),
+                                    ttft: None,
+                                    streaming: false,
+                                },
+                            )
+                            .await;
                             last_error = Some(request_error(
                                 public_protocol,
                                 StatusCode::GATEWAY_TIMEOUT,
@@ -590,6 +1049,22 @@ async fn proxy(
                             "The upstream returned a non-JSON response that cannot be translated",
                         );
                     }
+                    if status.is_success() {
+                        if let Some((runtimes, target, api_key_id, session_id)) =
+                            kv_context.as_ref()
+                        {
+                            if let Err(error) =
+                                runtimes.save_kv(target, api_key_id, session_id).await
+                            {
+                                tracing::warn!(target = %target.id, %error, "KV snapshot save failed");
+                            }
+                        }
+                    }
+                    drop(local_permit);
+                    if let Some(runtimes) = runtimes.as_ref() {
+                        runtimes.reap_over_budget().await;
+                        sync_runtime_states(&core, runtimes).await;
+                    }
                     response_from_body(
                         status,
                         content_type,
@@ -613,7 +1088,24 @@ async fn proxy(
                     },
                 )
                 .await;
-                return response;
+                if !is_stream {
+                    record_routing_attempt(
+                        &core,
+                        &evaluation,
+                        &request_id,
+                        &target.id,
+                        RoutingAttemptOutcome {
+                            status: status.as_u16(),
+                            transient_failure: is_transient_status(status.as_u16()),
+                            retry_after_until,
+                            latency: attempt_started.elapsed(),
+                            ttft: attempt_ttft,
+                            streaming: false,
+                        },
+                    )
+                    .await;
+                }
+                return with_routing_headers(response, &evaluation, &target.id);
             }
             Ok(Err(error)) => {
                 last_error = Some(request_error(
@@ -644,6 +1136,21 @@ async fn proxy(
                     )
                     .await;
                 }
+                record_routing_attempt(
+                    &core,
+                    &evaluation,
+                    &request_id,
+                    &target.id,
+                    RoutingAttemptOutcome {
+                        status: 502,
+                        transient_failure: true,
+                        retry_after_until: None,
+                        latency: attempt_started.elapsed(),
+                        ttft: None,
+                        streaming: is_stream,
+                    },
+                )
+                .await;
             }
             Err(_) => {
                 last_error = Some(request_error(
@@ -670,6 +1177,21 @@ async fn proxy(
                     )
                     .await;
                 }
+                record_routing_attempt(
+                    &core,
+                    &evaluation,
+                    &request_id,
+                    &target.id,
+                    RoutingAttemptOutcome {
+                        status: 504,
+                        transient_failure: true,
+                        retry_after_until: None,
+                        latency: attempt_started.elapsed(),
+                        ttft: None,
+                        streaming: is_stream,
+                    },
+                )
+                .await;
             }
         }
     }
@@ -684,12 +1206,170 @@ async fn proxy(
             &error,
         );
     }
+    if let Some(error) = last_capability_error {
+        return request_error(
+            public_protocol,
+            StatusCode::BAD_REQUEST,
+            "unsupported_capability",
+            error,
+        );
+    }
     request_error(
         public_protocol,
         StatusCode::SERVICE_UNAVAILABLE,
         "no_available_target",
         "No configured target is currently available",
     )
+}
+
+async fn advertised_routes(core: &AppCore) -> anyhow::Result<Vec<crate::domain::ModelRoute>> {
+    let mut routes = core.store.routes().await?;
+    for route in &mut routes {
+        let active = core
+            .store
+            .routing_policy(&route.alias)
+            .await?
+            .is_some_and(|policy| {
+                policy.mode == RoutingMode::Adaptive && policy.status == PolicyStatus::Active
+            });
+        if !active {
+            continue;
+        }
+        let mut capabilities = Vec::new();
+        for route_target in route.ordered_targets() {
+            if !route_target.enabled {
+                continue;
+            }
+            if let Some(target) = core.store.target(&route_target.id).await? {
+                if !target.enabled {
+                    continue;
+                }
+                for capability in target.capabilities {
+                    if !capabilities.contains(&capability) {
+                        capabilities.push(capability);
+                    }
+                }
+            }
+        }
+        capabilities.sort();
+        route.capabilities = capabilities;
+    }
+    Ok(routes)
+}
+
+struct RoutingAttemptOutcome {
+    status: u16,
+    transient_failure: bool,
+    retry_after_until: Option<chrono::DateTime<Utc>>,
+    latency: Duration,
+    ttft: Option<Duration>,
+    streaming: bool,
+}
+
+async fn record_routing_attempt(
+    core: &AppCore,
+    evaluation: &RoutingEvaluation,
+    request_id: &str,
+    target_id: &str,
+    outcome: RoutingAttemptOutcome,
+) {
+    let ranked = evaluation
+        .decision
+        .ranked
+        .iter()
+        .find(|candidate| candidate.target_id == target_id);
+    let mut reason = if let Some(shadow) = evaluation.shadow_target_id.as_deref() {
+        format!("{};shadow={shadow}", evaluation.task_source)
+    } else {
+        evaluation.task_source.clone()
+    };
+    if !evaluation.decision.excluded.is_empty() {
+        reason.push_str(";excluded=");
+        reason.push_str(
+            &evaluation
+                .decision
+                .excluded
+                .iter()
+                .map(|candidate| format!("{}:{}", candidate.target_id, candidate.reason))
+                .collect::<Vec<_>>()
+                .join("|"),
+        );
+    }
+    let _ = core
+        .store
+        .insert_routing_attempt(&RoutingAttemptRecord {
+            id: Uuid::new_v4().to_string(),
+            request_id: request_id.into(),
+            created_at: Utc::now(),
+            alias: evaluation.alias.clone(),
+            task: evaluation.task.clone(),
+            task_source: evaluation.task_source.clone(),
+            target_id: target_id.into(),
+            routing_mode: evaluation.mode.clone(),
+            status: outcome.status,
+            transient_failure: outcome.transient_failure,
+            retry_after_until: outcome.retry_after_until,
+            latency_ms: outcome.latency.as_millis() as u64,
+            ttft_ms: outcome.ttft.map(|value| value.as_millis() as u64),
+            streaming: outcome.streaming,
+            input_tokens: Some(evaluation.estimated_input_tokens),
+            output_tokens: None,
+            estimated_cost_usd: ranked.and_then(|candidate| candidate.estimated_cost_usd),
+            cost_verified: ranked.is_some_and(|candidate| candidate.cost_verified),
+            score: ranked.map(|candidate| candidate.score.clone()),
+            reason,
+        })
+        .await;
+}
+
+fn retry_after_deadline(headers: &HeaderMap) -> Option<chrono::DateTime<Utc>> {
+    let value = headers.get(header::RETRY_AFTER)?.to_str().ok()?.trim();
+    if let Ok(seconds) = value.parse::<i64>() {
+        return Some(Utc::now() + chrono::Duration::seconds(seconds.clamp(0, 300)));
+    }
+    chrono::DateTime::parse_from_rfc2822(value)
+        .ok()
+        .map(|value| value.with_timezone(&Utc))
+        .map(|value| value.min(Utc::now() + chrono::Duration::minutes(5)))
+}
+
+fn with_routing_headers(
+    mut response: Response<Body>,
+    evaluation: &RoutingEvaluation,
+    target_id: &str,
+) -> Response<Body> {
+    let ranked = evaluation
+        .decision
+        .ranked
+        .iter()
+        .find(|candidate| candidate.target_id == target_id);
+    let reason = ranked
+        .map(|candidate| {
+            format!(
+                "{};score={:.4};cost={}",
+                evaluation.task_source,
+                candidate.score.total,
+                if candidate.cost_verified {
+                    "verified"
+                } else {
+                    "unknown"
+                }
+            )
+        })
+        .unwrap_or_else(|| evaluation.task_source.clone());
+    for (name, value) in [
+        ("x-local-ai-task", evaluation.task.as_str()),
+        ("x-local-ai-target", target_id),
+        ("x-local-ai-routing-mode", evaluation.mode.as_str()),
+        ("x-local-ai-routing-reason", reason.as_str()),
+    ] {
+        if let Ok(value) = HeaderValue::from_str(value) {
+            response
+                .headers_mut()
+                .insert(axum::http::HeaderName::from_static(name), value);
+        }
+    }
+    response
 }
 
 fn extract_multipart_model(body: &[u8]) -> Option<&str> {
@@ -791,10 +1471,67 @@ fn endpoint_capability(path: &str) -> &'static str {
         path if path.starts_with("/v1beta/models/") => "chat",
         "/v1/embeddings" => "embeddings",
         path if path.starts_with("/v1/images/") => "images",
+        "/v1/audio/speech" => "speech",
         path if path.starts_with("/v1/audio/") => "audio",
         "/v1/moderations" => "moderation",
         _ => "unknown",
     }
+}
+
+fn route_supports_capability(route: &crate::domain::ModelRoute, capability: &str) -> bool {
+    route.capabilities.iter().any(|item| item == capability)
+        || (capability == "speech" && route.capabilities.iter().any(|item| item == "audio"))
+}
+
+fn target_supports_capability(target: &crate::storage::ModelTarget, capability: &str) -> bool {
+    if capability == "speech"
+        && matches!(
+            target.kind,
+            crate::domain::TargetKind::Gguf | crate::domain::TargetKind::Mlx
+        )
+    {
+        return target.capabilities.iter().any(|item| item == "speech");
+    }
+    target.capabilities.iter().any(|item| item == capability)
+        || (capability == "speech" && target.capabilities.iter().any(|item| item == "audio"))
+}
+
+fn validate_local_image_request(payload: &Value) -> anyhow::Result<()> {
+    if payload.get("n").and_then(Value::as_u64).unwrap_or(1) != 1 {
+        anyhow::bail!("local image generation only supports n=1");
+    }
+    if let Some(format) = payload.get("response_format").and_then(Value::as_str) {
+        if format != "b64_json" {
+            anyhow::bail!("local image generation only supports response_format=b64_json");
+        }
+    }
+    for field in [
+        "quality",
+        "style",
+        "background",
+        "moderation",
+        "output_format",
+        "output_compression",
+        "user",
+        "partial_images",
+        "stream",
+        "mask",
+        "image",
+    ] {
+        if payload.get(field).is_some() {
+            anyhow::bail!("local image generation does not support `{field}`");
+        }
+    }
+    Ok(())
+}
+
+fn validate_local_speech_request(payload: &Value) -> anyhow::Result<()> {
+    if let Some(format) = payload.get("response_format").and_then(Value::as_str) {
+        if !matches!(format, "wav" | "pcm") {
+            anyhow::bail!("local speech only supports wav and pcm");
+        }
+    }
+    Ok(())
 }
 
 async fn authenticated_key_id(core: &AppCore, headers: &HeaderMap) -> Option<String> {
@@ -834,6 +1571,20 @@ fn query_has_api_key(uri: &axum::http::Uri) -> bool {
             )
         })
     })
+}
+
+fn validated_session_id(value: Option<&HeaderValue>) -> Result<Option<&str>, &'static str> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let value = value
+        .to_str()
+        .map_err(|_| "X-Local-AI-Session must be valid ASCII")?
+        .trim();
+    if value.is_empty() || value.len() > 128 {
+        return Err("X-Local-AI-Session must contain between 1 and 128 characters");
+    }
+    Ok(Some(value))
 }
 
 fn gemini_path_model(path: &str) -> Option<&str> {
@@ -1102,7 +1853,7 @@ mod tests {
     }
 
     async fn authenticated_upstream(expected: Vec<(&'static str, &'static str)>) -> String {
-        let app=Router::new().fallback(move |headers:HeaderMap| { let expected=expected.clone(); async move { if expected.iter().all(|(name,value)|headers.get(*name).and_then(|header|header.to_str().ok())==Some(*value)) { (StatusCode::OK,Json(json!({"id":"ok","choices":[{"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}))) } else { (StatusCode::UNAUTHORIZED,Json(json!({"error":{"code":"bad_auth"}}))) } } });
+        let app=Router::new().fallback(move |headers:HeaderMap| { let expected=expected.clone(); async move { if headers.get("x-local-ai-session").is_none() && expected.iter().all(|(name,value)|headers.get(*name).and_then(|header|header.to_str().ok())==Some(*value)) { (StatusCode::OK,Json(json!({"id":"ok","choices":[{"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}))) } else { (StatusCode::UNAUTHORIZED,Json(json!({"error":{"code":"bad_auth"}}))) } } });
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -1165,6 +1916,7 @@ mod tests {
                     enabled: true,
                     state: "ready".into(),
                     size_bytes: None,
+                    local: crate::storage::LocalModelMeta::default(),
                 })
                 .await
                 .unwrap();
@@ -1189,7 +1941,7 @@ mod tests {
             core.migrate_legacy_local_api_key().await.unwrap();
             core.save_provider_api_key("provider", "provider-key")
                 .unwrap();
-            let response=router(Arc::new(core)).oneshot(Request::builder().method("POST").uri("/v1/chat/completions").header("authorization","Bearer local-key").header("content-type","application/json").body(Body::from(r#"{"model":"assistant","messages":[{"role":"user","content":"hello"}]}"#)).unwrap()).await.unwrap();
+            let response=router(Arc::new(core)).oneshot(Request::builder().method("POST").uri("/v1/chat/completions").header("authorization","Bearer local-key").header("x-local-ai-session", "private-session").header("content-type","application/json").body(Body::from(r#"{"model":"assistant","messages":[{"role":"user","content":"hello"}]}"#)).unwrap()).await.unwrap();
             assert_eq!(response.status(), StatusCode::OK, "preset {preset_id}");
         }
 
@@ -1226,6 +1978,7 @@ mod tests {
                 enabled: true,
                 state: "ready".into(),
                 size_bytes: None,
+                local: crate::storage::LocalModelMeta::default(),
             })
             .await
             .unwrap();
@@ -1309,6 +2062,7 @@ mod tests {
                 enabled: true,
                 state: "ready".into(),
                 size_bytes: None,
+                local: crate::storage::LocalModelMeta::default(),
             })
             .await
             .unwrap();
@@ -1378,6 +2132,7 @@ mod tests {
                     enabled: true,
                     state: "ready".into(),
                     size_bytes: None,
+                    local: crate::storage::LocalModelMeta::default(),
                 })
                 .await
                 .unwrap();
@@ -1434,6 +2189,89 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn active_adaptive_policy_routes_by_explicit_task_and_explains_the_choice() {
+        let low = upstream(StatusCode::OK, json!({ "id": "low", "choices": [{"message":{"role":"assistant","content":"low"},"finish_reason":"stop"}] })).await;
+        let high = upstream(StatusCode::OK, json!({ "id": "high", "choices": [{"message":{"role":"assistant","content":"high"},"finish_reason":"stop"}] })).await;
+        let store = Store::memory().await.unwrap();
+        for (id, url, priority) in [("low", low, 10), ("high", high, 20)] {
+            store
+                .upsert_target(&ModelTarget {
+                    id: id.into(),
+                    provider_id: None,
+                    name: id.into(),
+                    kind: TargetKind::Gguf,
+                    provider_model: id.into(),
+                    local_path: None,
+                    runtime_url: Some(url),
+                    wire_protocol: WireProtocol::OpenAiChat,
+                    capabilities: vec!["chat".into()],
+                    enabled: true,
+                    state: "ready".into(),
+                    size_bytes: None,
+                    local: crate::storage::LocalModelMeta::default(),
+                })
+                .await
+                .unwrap();
+            let mut profile = crate::routing::TargetRoutingProfile::neutral(id, TargetKind::Gguf);
+            profile
+                .task_quality
+                .insert("coding".into(), if id == "high" { 95.0 } else { 20.0 });
+            store.upsert_target_routing_profile(&profile).await.unwrap();
+            if priority == 20 { /* documents the fixed-order inversion */ }
+        }
+        store
+            .upsert_route(&ModelRoute {
+                alias: "assistant".into(),
+                enabled: true,
+                capabilities: vec!["chat".into()],
+                targets: vec![
+                    RouteTarget {
+                        id: "low".into(),
+                        kind: TargetKind::Gguf,
+                        model: "low".into(),
+                        priority: 10,
+                        enabled: true,
+                    },
+                    RouteTarget {
+                        id: "high".into(),
+                        kind: TargetKind::Gguf,
+                        model: "high".into(),
+                        priority: 20,
+                        enabled: true,
+                    },
+                ],
+            })
+            .await
+            .unwrap();
+        let mut policy = crate::routing::RoutingPolicy::new("assistant");
+        policy.mode = crate::routing::RoutingMode::Adaptive;
+        policy.status = crate::routing::PolicyStatus::Active;
+        policy.candidate_target_ids = vec!["low".into(), "high".into()];
+        policy.privacy = crate::routing::PrivacyMode::CloudAllowed;
+        store.upsert_routing_policy(&policy).await.unwrap();
+        let secrets: Arc<dyn SecretStore> = Arc::new(MemorySecrets::default());
+        secrets.set(LOCAL_API_KEY, "test-token").unwrap();
+        let core = AppCore::new(store.clone(), secrets).unwrap();
+        core.migrate_legacy_local_api_key().await.unwrap();
+        core.local_activity()
+            .set_token("low", "runtime-token".into());
+        core.local_activity()
+            .set_token("high", "runtime-token".into());
+
+        let response = router(Arc::new(core)).oneshot(Request::builder().method("POST").uri("/v1/chat/completions")
+            .header("authorization", "Bearer test-token").header("content-type", "application/json").header("x-local-ai-task", "coding")
+            .body(Body::from(r#"{"model":"assistant","messages":[{"role":"user","content":"write code"}]}"#)).unwrap()).await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers().get("x-local-ai-target").unwrap(), "high");
+        assert_eq!(response.headers().get("x-local-ai-task").unwrap(), "coding");
+        assert_eq!(
+            response.headers().get("x-local-ai-routing-mode").unwrap(),
+            "adaptive"
+        );
+    }
+
+    #[tokio::test]
     async fn anthropic_and_gemini_facades_translate_openai_upstream() {
         let url = upstream(StatusCode::OK, json!({
             "id":"upstream","choices":[{"message":{"role":"assistant","content":"translated"},"finish_reason":"stop"}],
@@ -1460,6 +2298,7 @@ mod tests {
                 enabled: true,
                 state: "ready".into(),
                 size_bytes: None,
+                local: crate::storage::LocalModelMeta::default(),
             })
             .await
             .unwrap();
@@ -1530,5 +2369,293 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    async fn local_app(store: Store, token: &str, runtime_token: &str, target_id: &str) -> Router {
+        let secrets: Arc<dyn SecretStore> = Arc::new(MemorySecrets::default());
+        secrets.set(LOCAL_API_KEY, token).unwrap();
+        let core = AppCore::new(store, secrets).unwrap();
+        core.migrate_legacy_local_api_key().await.unwrap();
+        core.local_activity()
+            .set_token(target_id, runtime_token.into());
+        router(Arc::new(core))
+    }
+
+    #[tokio::test]
+    async fn local_speech_requires_speech_capability_not_legacy_audio() {
+        let url = upstream(StatusCode::OK, json!({"id":"ok"})).await;
+        let store = Store::memory().await.unwrap();
+        store
+            .upsert_target(&ModelTarget {
+                id: "tts".into(),
+                provider_id: None,
+                name: "Legacy audio".into(),
+                kind: TargetKind::Mlx,
+                provider_model: "kokoro".into(),
+                local_path: Some("/tmp/model".into()),
+                runtime_url: Some(url),
+                wire_protocol: crate::providers::WireProtocol::OpenAiChat,
+                capabilities: vec!["audio".into()],
+                enabled: true,
+                state: "ready".into(),
+                size_bytes: None,
+                local: crate::storage::LocalModelMeta::default(),
+            })
+            .await
+            .unwrap();
+        store
+            .upsert_route(&ModelRoute {
+                alias: "speaker".into(),
+                enabled: true,
+                capabilities: vec!["speech".into(), "audio".into()],
+                targets: vec![RouteTarget {
+                    id: "tts".into(),
+                    kind: TargetKind::Mlx,
+                    model: "kokoro".into(),
+                    priority: 10,
+                    enabled: true,
+                }],
+            })
+            .await
+            .unwrap();
+        let response = local_app(store, "test-token", "runtime-token", "tts")
+            .await
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/audio/speech")
+                    .header("authorization", "Bearer test-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"model":"speaker","input":"hello","voice":"af_heart"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let body = String::from_utf8_lossy(&bytes);
+        assert!(body.contains("unsupported_capability"));
+    }
+
+    #[tokio::test]
+    async fn local_image_generation_rejects_unsupported_openai_options() {
+        let url = upstream(
+            StatusCode::OK,
+            json!({"created":1,"data":[{"b64_json":"aa"}]}),
+        )
+        .await;
+        let store = Store::memory().await.unwrap();
+        store
+            .upsert_target(&ModelTarget {
+                id: "image".into(),
+                provider_id: None,
+                name: "FLUX".into(),
+                kind: TargetKind::Mlx,
+                provider_model: "flux".into(),
+                local_path: Some("/tmp/model".into()),
+                runtime_url: Some(url),
+                wire_protocol: crate::providers::WireProtocol::OpenAiChat,
+                capabilities: vec!["images".into()],
+                enabled: true,
+                state: "ready".into(),
+                size_bytes: None,
+                local: crate::storage::LocalModelMeta::default(),
+            })
+            .await
+            .unwrap();
+        store
+            .upsert_route(&ModelRoute {
+                alias: "painter".into(),
+                enabled: true,
+                capabilities: vec!["images".into()],
+                targets: vec![RouteTarget {
+                    id: "image".into(),
+                    kind: TargetKind::Mlx,
+                    model: "flux".into(),
+                    priority: 10,
+                    enabled: true,
+                }],
+            })
+            .await
+            .unwrap();
+        let response = local_app(store, "test-token", "runtime-token", "image")
+            .await
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/images/generations")
+                    .header("authorization", "Bearer test-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"model":"painter","prompt":"a cat","n":2}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let body = String::from_utf8_lossy(&bytes);
+        assert!(body.contains("unsupported_parameter"));
+    }
+
+    #[tokio::test]
+    async fn audio_input_falls_back_to_a_capable_target() {
+        let first = upstream(StatusCode::OK, json!({"id":"primary","choices":[{"message":{"role":"assistant","content":"primary"},"finish_reason":"stop"}]})).await;
+        let second = upstream(StatusCode::OK, json!({"id":"fallback","choices":[{"message":{"role":"assistant","content":"audio-ok"},"finish_reason":"stop"}]})).await;
+        let store = Store::memory().await.unwrap();
+        store
+            .upsert_target(&ModelTarget {
+                id: "text".into(),
+                provider_id: None,
+                name: "Text".into(),
+                kind: TargetKind::Mlx,
+                provider_model: "qwen".into(),
+                local_path: Some("/tmp/a".into()),
+                runtime_url: Some(first),
+                wire_protocol: crate::providers::WireProtocol::OpenAiChat,
+                capabilities: vec!["chat".into()],
+                enabled: true,
+                state: "ready".into(),
+                size_bytes: None,
+                local: crate::storage::LocalModelMeta::default(),
+            })
+            .await
+            .unwrap();
+        store
+            .upsert_target(&ModelTarget {
+                id: "audio".into(),
+                provider_id: None,
+                name: "Audio".into(),
+                kind: TargetKind::Mlx,
+                provider_model: "vlm".into(),
+                local_path: Some("/tmp/b".into()),
+                runtime_url: Some(second),
+                wire_protocol: crate::providers::WireProtocol::OpenAiChat,
+                capabilities: vec!["chat".into(), "audio_input".into()],
+                enabled: true,
+                state: "ready".into(),
+                size_bytes: None,
+                local: crate::storage::LocalModelMeta::default(),
+            })
+            .await
+            .unwrap();
+        store
+            .upsert_route(&ModelRoute {
+                alias: "assistant".into(),
+                enabled: true,
+                capabilities: vec!["chat".into()],
+                targets: vec![
+                    RouteTarget {
+                        id: "text".into(),
+                        kind: TargetKind::Mlx,
+                        model: "qwen".into(),
+                        priority: 10,
+                        enabled: true,
+                    },
+                    RouteTarget {
+                        id: "audio".into(),
+                        kind: TargetKind::Mlx,
+                        model: "vlm".into(),
+                        priority: 20,
+                        enabled: true,
+                    },
+                ],
+            })
+            .await
+            .unwrap();
+        let secrets: Arc<dyn SecretStore> = Arc::new(MemorySecrets::default());
+        secrets.set(LOCAL_API_KEY, "test-token").unwrap();
+        let core = AppCore::new(store, secrets).unwrap();
+        core.migrate_legacy_local_api_key().await.unwrap();
+        core.local_activity()
+            .set_token("text", "runtime-token".into());
+        core.local_activity()
+            .set_token("audio", "runtime-token".into());
+        let response = router(Arc::new(core))
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("authorization", "Bearer test-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"model":"assistant","messages":[{"role":"user","content":[{"type":"input_audio","input_audio":{"data":"AAAA","format":"wav"}}]}]}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: Value =
+            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert_eq!(body["choices"][0]["message"]["content"], "audio-ok");
+    }
+
+    #[tokio::test]
+    async fn missing_video_input_capability_is_a_client_error() {
+        let url = upstream(StatusCode::OK, json!({"id":"ok","choices":[{"message":{"role":"assistant","content":"no"},"finish_reason":"stop"}]})).await;
+        let store = Store::memory().await.unwrap();
+        store
+            .upsert_target(&ModelTarget {
+                id: "chat".into(),
+                provider_id: None,
+                name: "Chat".into(),
+                kind: TargetKind::Mlx,
+                provider_model: "qwen".into(),
+                local_path: Some("/tmp/a".into()),
+                runtime_url: Some(url),
+                wire_protocol: crate::providers::WireProtocol::OpenAiChat,
+                capabilities: vec!["chat".into(), "vision".into()],
+                enabled: true,
+                state: "ready".into(),
+                size_bytes: None,
+                local: crate::storage::LocalModelMeta::default(),
+            })
+            .await
+            .unwrap();
+        store
+            .upsert_route(&ModelRoute {
+                alias: "assistant".into(),
+                enabled: true,
+                capabilities: vec!["chat".into()],
+                targets: vec![RouteTarget {
+                    id: "chat".into(),
+                    kind: TargetKind::Mlx,
+                    model: "qwen".into(),
+                    priority: 10,
+                    enabled: true,
+                }],
+            })
+            .await
+            .unwrap();
+        let response = local_app(store, "test-token", "runtime-token", "chat")
+            .await
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("authorization", "Bearer test-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"model":"assistant","messages":[{"role":"user","content":[{"type":"input_video","input_video":{"url":"data:video/mp4;base64,AA=="}}]}]}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let body = String::from_utf8_lossy(&bytes);
+        assert!(body.contains("unsupported_capability"));
+    }
+
+    #[test]
+    fn local_session_header_is_optional_bounded_and_trimmed() {
+        assert_eq!(validated_session_id(None).unwrap(), None);
+        let value = HeaderValue::from_static(" session-1 ");
+        assert_eq!(
+            validated_session_id(Some(&value)).unwrap(),
+            Some("session-1")
+        );
+        let long = HeaderValue::from_str(&"x".repeat(129)).unwrap();
+        assert!(validated_session_id(Some(&long)).is_err());
     }
 }

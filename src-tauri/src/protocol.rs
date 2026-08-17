@@ -24,6 +24,14 @@ pub enum ContentBlock {
         url: String,
         media_type: Option<String>,
     },
+    Audio {
+        url: String,
+        media_type: Option<String>,
+    },
+    Video {
+        url: String,
+        media_type: Option<String>,
+    },
     Reasoning {
         text: String,
     },
@@ -426,6 +434,20 @@ pub fn encode_request(
     {
         anyhow::bail!("remote image URLs cannot be translated safely to this protocol");
     }
+    if protocol == WireProtocol::AnthropicMessages
+        && request
+            .messages
+            .iter()
+            .flat_map(|message| &message.content)
+            .any(|block| {
+                matches!(
+                    block,
+                    ContentBlock::Audio { .. } | ContentBlock::Video { .. }
+                )
+            })
+    {
+        anyhow::bail!("audio and video inputs cannot be translated to Anthropic Messages");
+    }
     Ok(match protocol {
         WireProtocol::OpenAiChat => encode_openai_chat_request(request, model),
         WireProtocol::OpenAiResponses => encode_openai_responses_request(request, model),
@@ -744,7 +766,15 @@ fn validate_nested_content(protocol: PublicProtocol, value: &Value) -> anyhow::R
                 PublicProtocol::OpenAiChat | PublicProtocol::OpenAiResponses
                     if !matches!(
                         block.get("type").and_then(Value::as_str),
-                        Some("text" | "input_text" | "output_text" | "image_url" | "input_image")
+                        Some(
+                            "text"
+                                | "input_text"
+                                | "output_text"
+                                | "image_url"
+                                | "input_image"
+                                | "input_audio"
+                                | "input_video"
+                        )
                     ) =>
                 {
                     anyhow::bail!("unsupported OpenAI content block cannot be translated safely")
@@ -1008,6 +1038,26 @@ fn openai_content(value: Option<&Value>) -> Vec<ContentBlock> {
                         url: url.into(),
                         media_type: None,
                     }),
+                Some("input_audio") => Some(ContentBlock::Audio {
+                    url: openai_media_url(block, "input_audio", "audio/wav"),
+                    media_type: block
+                        .pointer("/input_audio/format")
+                        .and_then(Value::as_str)
+                        .map(|format| format!("audio/{format}"))
+                        .or_else(|| {
+                            block
+                                .get("media_type")
+                                .and_then(Value::as_str)
+                                .map(str::to_owned)
+                        }),
+                }),
+                Some("input_video") => Some(ContentBlock::Video {
+                    url: openai_media_url(block, "input_video", "video/mp4"),
+                    media_type: block
+                        .get("media_type")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
+                }),
                 _ => None,
             })
             .collect(),
@@ -1121,20 +1171,29 @@ fn gemini_parts(value: Option<&Value>) -> Vec<ContentBlock> {
                 });
             }
             part.get("inlineData").and_then(|data| {
-                data.get("data")
+                let mime = data
+                    .get("mimeType")
                     .and_then(Value::as_str)
-                    .map(|raw| ContentBlock::Image {
-                        url: format!(
-                            "data:{};base64,{raw}",
-                            data.get("mimeType")
-                                .and_then(Value::as_str)
-                                .unwrap_or("image/jpeg")
-                        ),
-                        media_type: data
-                            .get("mimeType")
-                            .and_then(Value::as_str)
-                            .map(str::to_owned),
-                    })
+                    .unwrap_or("application/octet-stream");
+                data.get("data").and_then(Value::as_str).map(|raw| {
+                    let url = format!("data:{mime};base64,{raw}");
+                    if mime.starts_with("audio/") {
+                        ContentBlock::Audio {
+                            url,
+                            media_type: Some(mime.into()),
+                        }
+                    } else if mime.starts_with("video/") {
+                        ContentBlock::Video {
+                            url,
+                            media_type: Some(mime.into()),
+                        }
+                    } else {
+                        ContentBlock::Image {
+                            url,
+                            media_type: Some(mime.into()),
+                        }
+                    }
+                })
             })
         })
         .collect()
@@ -1148,6 +1207,12 @@ fn openai_message(message: &CanonicalMessage) -> Value {
             ContentBlock::Text { text } => Some(json!({"type":"text","text":text})),
             ContentBlock::Image { url, .. } => {
                 Some(json!({"type":"image_url","image_url":{"url":url}}))
+            }
+            ContentBlock::Audio { url, media_type } => {
+                Some(openai_audio_block(url, media_type.as_deref()))
+            }
+            ContentBlock::Video { url, .. } => {
+                Some(json!({"type":"input_video","input_video":{"url":url}}))
             }
             ContentBlock::Reasoning { text } => Some(json!({"type":"text","text":text})),
             _ => None,
@@ -1194,6 +1259,10 @@ fn openai_responses_message(message: &CanonicalMessage) -> Vec<Value> {
                 Some(json!({"type":"input_text","text":text}))
             }
             ContentBlock::Image { url, .. } => Some(json!({"type":"input_image","image_url":url})),
+            ContentBlock::Audio { url, media_type } => {
+                Some(openai_audio_block(url, media_type.as_deref()))
+            }
+            ContentBlock::Video { url, .. } => Some(json!({"type":"input_video","video_url":url})),
             _ => None,
         })
         .collect::<Vec<_>>();
@@ -1210,7 +1279,7 @@ fn gemini_message(message: &CanonicalMessage) -> Value {
     json!({"role":if message.role=="assistant"{"model"}else{"user"},"parts":message.content.iter().filter_map(gemini_block).collect::<Vec<_>>()})
 }
 fn anthropic_block(block: &ContentBlock) -> Option<Value> {
-    match block { ContentBlock::Text{text}=>Some(json!({"type":"text","text":text})), ContentBlock::Reasoning{text}=>Some(json!({"type":"thinking","thinking":text})), ContentBlock::ToolUse{id,name,input}=>Some(json!({"type":"tool_use","id":id,"name":name,"input":input})), ContentBlock::ToolResult{tool_use_id,content}=>Some(json!({"type":"tool_result","tool_use_id":tool_use_id,"content":content})), ContentBlock::Image{url,..}=>data_url(url).map(|(media,data)|json!({"type":"image","source":{"type":"base64","media_type":media,"data":data}})) }
+    match block { ContentBlock::Text{text}=>Some(json!({"type":"text","text":text})), ContentBlock::Reasoning{text}=>Some(json!({"type":"thinking","thinking":text})), ContentBlock::ToolUse{id,name,input}=>Some(json!({"type":"tool_use","id":id,"name":name,"input":input})), ContentBlock::ToolResult{tool_use_id,content}=>Some(json!({"type":"tool_result","tool_use_id":tool_use_id,"content":content})), ContentBlock::Image{url,..}=>data_url(url).map(|(media,data)|json!({"type":"image","source":{"type":"base64","media_type":media,"data":data}})), ContentBlock::Audio{..}|ContentBlock::Video{..}=>None }
 }
 fn gemini_block(block: &ContentBlock) -> Option<Value> {
     match block {
@@ -1223,7 +1292,9 @@ fn gemini_block(block: &ContentBlock) -> Option<Value> {
             tool_use_id,
             content,
         } => Some(json!({"functionResponse":{"id":tool_use_id,"response":content}})),
-        ContentBlock::Image { url, .. } => {
+        ContentBlock::Image { url, .. }
+        | ContentBlock::Audio { url, .. }
+        | ContentBlock::Video { url, .. } => {
             data_url(url).map(|(media, data)| json!({"inlineData":{"mimeType":media,"data":data}}))
         }
     }
@@ -1281,6 +1352,46 @@ fn parse_json_or_string(value: Value) -> Value {
 }
 fn data_url(value: &str) -> Option<(&str, &str)> {
     value.strip_prefix("data:")?.split_once(";base64,")
+}
+
+fn openai_media_url(block: &Value, key: &str, default_mime: &str) -> String {
+    if let Some(url) = block
+        .pointer(&format!("/{key}/url"))
+        .or_else(|| block.get("url"))
+        .and_then(Value::as_str)
+    {
+        return url.into();
+    }
+    let data = block
+        .pointer(&format!("/{key}/data"))
+        .or_else(|| block.get("data"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let mime = block
+        .pointer(&format!("/{key}/format"))
+        .and_then(Value::as_str)
+        .map(|format| {
+            if format.contains('/') {
+                format.to_owned()
+            } else {
+                format!(
+                    "{}/{}",
+                    default_mime.split('/').next().unwrap_or("audio"),
+                    format
+                )
+            }
+        })
+        .unwrap_or_else(|| default_mime.into());
+    format!("data:{mime};base64,{data}")
+}
+
+fn openai_audio_block(url: &str, media_type: Option<&str>) -> Value {
+    if let Some((mime, data)) = data_url(url) {
+        let format = mime.rsplit('/').next().unwrap_or("wav");
+        json!({"type":"input_audio","input_audio":{"data":data,"format":format}})
+    } else {
+        json!({"type":"input_audio","input_audio":{"url":url,"format":media_type.and_then(|value| value.rsplit('/').next()).unwrap_or("wav")}})
+    }
 }
 fn openai_stop(stop: Option<&str>) -> &str {
     match stop {
@@ -1891,5 +2002,43 @@ mod tests {
         assert!(validate_cross_protocol(PublicProtocol::Anthropic, &anthropic).is_err());
         let gemini = json!({"contents":[{"parts":[{"fileData":{"fileUri":"gs://private"}}]}]});
         assert!(validate_cross_protocol(PublicProtocol::Gemini, &gemini).is_err());
+    }
+
+    #[test]
+    fn openai_and_gemini_audio_video_translate_while_anthropic_is_rejected() {
+        let chat = json!({"model":"m","messages":[{"role":"user","content":[
+            {"type":"text","text":"listen"},
+            {"type":"input_audio","input_audio":{"data":"AAAA","format":"wav"}},
+            {"type":"input_video","input_video":{"url":"data:video/mp4;base64,BBBB"}}
+        ]}]});
+        let canonical = decode_request(PublicProtocol::OpenAiChat, &chat, None).unwrap();
+        assert!(canonical.messages[0]
+            .content
+            .iter()
+            .any(|block| matches!(block, ContentBlock::Audio { .. })));
+        assert!(canonical.messages[0]
+            .content
+            .iter()
+            .any(|block| matches!(block, ContentBlock::Video { .. })));
+        let openai = encode_request(WireProtocol::OpenAiChat, &canonical, "m").unwrap();
+        assert_eq!(openai["messages"][0]["content"][1]["type"], "input_audio");
+        let gemini_in = json!({"contents":[{"role":"user","parts":[
+            {"text":"listen"},
+            {"inlineData":{"mimeType":"audio/wav","data":"AAAA"}},
+            {"inlineData":{"mimeType":"video/mp4","data":"BBBB"}}
+        ]}]});
+        let gemini = decode_request(PublicProtocol::Gemini, &gemini_in, Some("m")).unwrap();
+        let openai_from_gemini = encode_request(WireProtocol::OpenAiChat, &gemini, "m").unwrap();
+        assert!(openai_from_gemini["messages"][0]["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|block| block["type"] == "input_audio"));
+        assert!(
+            encode_request(WireProtocol::AnthropicMessages, &canonical, "m")
+                .unwrap_err()
+                .to_string()
+                .contains("audio and video")
+        );
     }
 }

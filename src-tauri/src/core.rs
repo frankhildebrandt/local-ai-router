@@ -35,6 +35,8 @@ pub struct AppCore {
 
 struct InferenceGate {
     active: Arc<Semaphore>,
+    limit: usize,
+    active_count: AtomicUsize,
     queued: AtomicUsize,
     last_used: parking_lot::Mutex<std::time::Instant>,
     token: parking_lot::Mutex<Option<String>>,
@@ -47,7 +49,16 @@ pub struct LocalInferencePermit {
 
 impl Drop for LocalInferencePermit {
     fn drop(&mut self) {
+        self.gate.active_count.fetch_sub(1, Ordering::AcqRel);
         *self.gate.last_used.lock() = std::time::Instant::now();
+    }
+}
+
+struct WaitingGuard(Arc<InferenceGate>);
+
+impl Drop for WaitingGuard {
+    fn drop(&mut self) {
+        self.0.queued.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -57,27 +68,54 @@ pub struct LocalActivityRegistry {
 }
 
 impl LocalActivityRegistry {
-    fn gate(&self, id: &str) -> Arc<InferenceGate> {
-        self.gates
-            .lock()
-            .entry(id.to_owned())
-            .or_insert_with(|| {
-                Arc::new(InferenceGate {
-                    active: Arc::new(Semaphore::new(1)),
-                    queued: AtomicUsize::new(0),
-                    last_used: parking_lot::Mutex::new(std::time::Instant::now()),
-                    token: parking_lot::Mutex::new(None),
-                })
-            })
-            .clone()
+    fn gate(&self, id: &str, limit: usize) -> Arc<InferenceGate> {
+        let mut gates = self.gates.lock();
+        let previous = gates.get(id).cloned();
+        if let Some(gate) = previous.as_ref() {
+            return gate.clone();
+        }
+        let gate = Arc::new(InferenceGate {
+            active: Arc::new(Semaphore::new(limit)),
+            limit,
+            active_count: AtomicUsize::new(0),
+            queued: AtomicUsize::new(0),
+            last_used: parking_lot::Mutex::new(std::time::Instant::now()),
+            token: parking_lot::Mutex::new(previous.and_then(|gate| gate.token.lock().clone())),
+        });
+        gates.insert(id.to_owned(), gate.clone());
+        gate
+    }
+
+    pub fn configure(&self, id: &str, limit: usize) -> anyhow::Result<()> {
+        let mut gates = self.gates.lock();
+        let previous = gates.get(id).cloned();
+        if previous.as_ref().is_some_and(|gate| {
+            gate.active_count.load(Ordering::Acquire) > 0 || gate.queued.load(Ordering::Acquire) > 0
+        }) {
+            anyhow::bail!("model still has active or queued requests");
+        }
+        let gate = Arc::new(InferenceGate {
+            active: Arc::new(Semaphore::new(limit)),
+            limit,
+            active_count: AtomicUsize::new(0),
+            queued: AtomicUsize::new(0),
+            last_used: parking_lot::Mutex::new(std::time::Instant::now()),
+            token: parking_lot::Mutex::new(previous.and_then(|gate| gate.token.lock().clone())),
+        });
+        gates.insert(id.to_owned(), gate);
+        Ok(())
     }
 
     pub fn touch(&self, id: &str) {
-        *self.gate(id).last_used.lock() = std::time::Instant::now();
+        let gate = self.gates.lock().get(id).cloned();
+        if let Some(gate) = gate {
+            *gate.last_used.lock() = std::time::Instant::now();
+        }
     }
 
     pub fn set_token(&self, id: &str, token: String) {
-        *self.gate(id).token.lock() = Some(token);
+        let gate = self.gate(id, 1);
+        *gate.token.lock() = Some(token);
     }
 
     pub fn token(&self, id: &str) -> Option<String> {
@@ -89,7 +127,13 @@ impl LocalActivityRegistry {
 
     pub fn try_reserve_for_unload(&self, id: &str) -> Option<OwnedSemaphorePermit> {
         let gate = self.gates.lock().get(id)?.clone();
-        gate.active.clone().try_acquire_owned().ok()
+        if gate.queued.load(Ordering::Acquire) > 0 {
+            return None;
+        }
+        gate.active
+            .clone()
+            .try_acquire_many_owned(gate.limit as u32)
+            .ok()
     }
 
     pub fn idle_for(&self, id: &str) -> Duration {
@@ -105,6 +149,14 @@ impl LocalActivityRegistry {
             .lock()
             .get(id)
             .map(|gate| gate.queued.load(Ordering::Acquire))
+            .unwrap_or(0)
+    }
+
+    pub fn active(&self, id: &str) -> usize {
+        self.gates
+            .lock()
+            .get(id)
+            .map(|gate| gate.active_count.load(Ordering::Acquire))
             .unwrap_or(0)
     }
 }
@@ -381,25 +433,42 @@ impl AppCore {
         ) {
             return Ok(None);
         }
+        let policy = self.effective_resource_policy(target).await?;
         let activity = self.local_activity();
-        let gate = activity.gate(&target.id);
-        let waiting = gate.queued.fetch_add(1, Ordering::AcqRel);
-        if waiting >= 8 {
-            gate.queued.fetch_sub(1, Ordering::AcqRel);
-            anyhow::bail!("local inference queue is full");
-        }
+        let gate = activity.gate(&target.id, policy.max_parallel_prompts);
+        gate.queued.fetch_add(1, Ordering::AcqRel);
+        let waiting = WaitingGuard(gate.clone());
         let permit = gate
             .active
             .clone()
             .acquire_owned()
             .await
             .context("local inference gate closed")?;
-        gate.queued.fetch_sub(1, Ordering::AcqRel);
+        drop(waiting);
+        gate.active_count.fetch_add(1, Ordering::AcqRel);
         *gate.last_used.lock() = std::time::Instant::now();
         Ok(Some(LocalInferencePermit {
             _permit: permit,
             gate,
         }))
+    }
+
+    pub async fn effective_resource_policy(
+        &self,
+        target: &ModelTarget,
+    ) -> anyhow::Result<crate::resource::ResourcePolicy> {
+        let logical_cpus = std::thread::available_parallelism()
+            .map(usize::from)
+            .unwrap_or(1);
+        let policy = self.store.resource_policy(logical_cpus).await?;
+        let resolved = target
+            .local
+            .resource_overrides
+            .as_ref()
+            .map(|overrides| policy.resolve(overrides))
+            .unwrap_or(policy);
+        resolved.validate()?;
+        Ok(resolved)
     }
 
     pub async fn validate_provider(
@@ -486,6 +555,7 @@ mod tests {
             enabled: true,
             state: "ready".into(),
             size_bytes: None,
+            local: crate::storage::LocalModelMeta::default(),
         }
     }
 
@@ -550,7 +620,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn local_inference_allows_one_active_and_eight_queued_requests() {
+    async fn local_inference_queue_is_unbounded_and_cancellation_safe() {
         let core = AppCore::new(
             Store::memory().await.unwrap(),
             Arc::new(MemorySecrets::default()),
@@ -559,7 +629,7 @@ mod tests {
         let target = local_target();
         let active = core.acquire_local_slot(&target).await.unwrap().unwrap();
         let mut waiting = Vec::new();
-        for _ in 0..8 {
+        for _ in 0..32 {
             let core = core.clone();
             let target = target.clone();
             waiting.push(tokio::spawn(async move {
@@ -575,7 +645,7 @@ mod tests {
                     .unwrap()
                     .queued
                     .load(Ordering::Acquire);
-                if queued == 8 {
+                if queued == 32 {
                     break;
                 }
                 tokio::task::yield_now().await;
@@ -583,11 +653,23 @@ mod tests {
         })
         .await
         .unwrap();
-        assert!(core.acquire_local_slot(&target).await.is_err());
-        drop(active);
-        for task in waiting {
-            drop(task.await.unwrap().unwrap());
+        for task in waiting.drain(..) {
+            task.abort();
         }
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while core.local_activity().queued(&target.id) != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        drop(active);
+        let permit = tokio::time::timeout(Duration::from_secs(1), core.acquire_local_slot(&target))
+            .await
+            .expect("a new request should be admitted after cancelled waiters")
+            .unwrap()
+            .unwrap();
+        drop(permit);
     }
 
     #[tokio::test]

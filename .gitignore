@@ -13,3 +13,9 @@ sidecars/licenses/*
 !sidecars/licenses/.gitkeep
 sidecars/mlx-server/.build/
 sidecars/mlx-server/.swiftpm/
+sidecars/mlx-image-server/.build/
+sidecars/mlx-image-server/.swiftpm/
+sidecars/mlx-speech-server/.build/
+sidecars/mlx-speech-server/.swiftpm/
+sidecars/vendor/kokoro-swift/
+sidecars/vendor/flux-2-swift-mlx/
