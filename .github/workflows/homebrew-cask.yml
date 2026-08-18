@@ -1,0 +1,21 @@
+name: Bump Homebrew cask
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+jobs:
+  notify-tap:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Dispatch tap update
+        env:
+          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          if [ -z "$GH_TOKEN" ]; then
+            echo "HOMEBREW_TAP_TOKEN is not set; the tap still updates on its daily schedule."
+            exit 0
+          fi
+          gh api repos/frankhildebrandt/homebrew-tap/dispatches \
+            -f event_type=local-ai-router-released

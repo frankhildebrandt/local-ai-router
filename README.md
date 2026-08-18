@@ -24,6 +24,17 @@ A private, multi-protocol model gateway for Apple Silicon Macs. Local AI Router 
 
 The gateway listens only on `http://127.0.0.1:11435`. Every request requires a local token managed under Settings. Supply it as `Authorization: Bearer`, `x-api-key`, or `x-goog-api-key`; query-string keys are deliberately rejected because URLs are commonly logged.
 
+## Install
+
+Apple Silicon, macOS 15+:
+
+```bash
+brew tap frankhildebrandt/tap
+brew install --cask local-ai-router
+```
+
+GitHub Releases also ship a DMG. After a published release, the [homebrew-tap](https://github.com/frankhildebrandt/homebrew-tap) cask is bumped automatically (daily, or immediately when `HOMEBREW_TAP_TOKEN` can dispatch the tap workflow).
+
 ## Development
 
 Requirements: Apple Silicon, macOS 15+, Node.js 22+, Rust 1.77+, Swift 6.2+, CMake, and Xcode command-line tools.
