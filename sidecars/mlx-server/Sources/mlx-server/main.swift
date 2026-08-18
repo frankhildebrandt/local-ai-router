@@ -35,7 +35,7 @@ struct Options {
 enum ServerError: Error { case badRequest(String) }
 
 private let vlmTypes: Set<String> = [
-    "qwen2_vl", "qwen2_5_vl", "qwen3_vl", "gemma3", "gemma3n", "paligemma", "idefics3", "smolvlm",
+    "qwen2_vl", "qwen2_5_vl", "qwen3_vl", "qwen3_5", "qwen3_5_moe", "gemma3", "gemma3n", "paligemma", "idefics3", "smolvlm",
     "fastvlm", "llava_qwen2", "pixtral", "mistral3", "lfm2_vl", "lfm2-vl"
 ]
 

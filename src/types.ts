@@ -307,7 +307,7 @@ export interface InFlightRequest {
 }
 
 export type CatalogCategory = "chat_vision" | "image" | "speech";
-export type RamFit = "fits" | "tight" | "unsuitable";
+export type RamFit = "fits" | "tight" | "unsuitable" | "unknown";
 
 export interface CatalogEntry {
   id: string;

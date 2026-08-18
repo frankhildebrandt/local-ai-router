@@ -92,7 +92,7 @@ export function LocalPage({ targets, resourcePolicy, refresh, success, fail }: C
         return;
       }
     }
-    if (entry.ram_fit !== "fits" && !confirm(`${entry.name} is ${entry.ram_fit === "tight" ? "tight" : "unsuitable"} for the current memory budget. Install anyway? Loading remains blocked if the budget is exceeded.`)) return;
+    if (entry.ram_fit !== "fits" && !confirm(`${entry.name} is ${entry.ram_fit === "tight" ? "tight" : entry.ram_fit === "unknown" ? "unknown size" : "unsuitable"} for the current memory budget. Install anyway? Loading remains blocked if the budget is exceeded.`)) return;
     try {
       await command("install_catalog_model", { input: { repoId: entry.repo_id, catalogId: entry.trust_status === "curated" ? entry.id : null, confirmOverBudget: entry.ram_fit !== "fits", name: entry.name } });
       await load();
@@ -234,9 +234,10 @@ function ManualImport({ refresh, success, fail }: Pick<Common, "refresh" | "succ
     <form onSubmit={submit}>{!civitai && <select value={kind} onChange={e => setKind(e.target.value as TargetKind)}><option value="gguf">GGUF · llama.cpp</option><option value="mlx">MLX · Apple Silicon</option></select>}<div className="input-action"><input value={source} onChange={e => setSource(e.target.value)} placeholder={tab === "import" ? "Model file or folder" : civitai ? "https://civitai.com/models/… or civitai.red/models/…" : "org/model-repository"} required />{tab === "import" && <button type="button" className="secondary" onClick={() => void browse()}>Browse</button>}</div>{tab === "download" && kind === "gguf" && !civitai && <input value={filename} onChange={e => setFilename(e.target.value)} placeholder="quantized-model.Q4_K_M.gguf" required />}<input value={name} onChange={e => setName(e.target.value)} placeholder="Display name" required={tab === "import"} /><button className="primary" disabled={busy}>{busy ? <LoaderCircle className="spin" size={17} /> : tab === "import" ? <FileDown size={17} /> : <Download size={17} />}{tab === "import" ? "Import" : "Download"}</button></form></section>;
 }
 
-function ramLabel(fit: RamFit): { label: string; tone: "good" | "warn" | "bad" } {
+function ramLabel(fit: RamFit): { label: string; tone: "good" | "warn" | "bad" | "neutral" } {
   if (fit === "fits") return { label: "Fits", tone: "good" };
   if (fit === "tight") return { label: "Tight", tone: "warn" };
+  if (fit === "unknown") return { label: "Unknown", tone: "neutral" };
   return { label: "Unsuitable", tone: "bad" };
 }
 

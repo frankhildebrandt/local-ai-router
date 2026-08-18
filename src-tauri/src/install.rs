@@ -134,8 +134,8 @@ impl InstallManager {
         }
         match classify_ram(estimated_memory_bytes, budget_bytes) {
             RamFit::Fits => {}
-            RamFit::Tight | RamFit::Unsuitable if confirm_over_budget => {}
-            RamFit::Tight | RamFit::Unsuitable => {
+            RamFit::Tight | RamFit::Unsuitable | RamFit::Unknown if confirm_over_budget => {}
+            RamFit::Tight | RamFit::Unsuitable | RamFit::Unknown => {
                 anyhow::bail!(
                     "this model exceeds the comfortable memory budget and needs confirmation"
                 )

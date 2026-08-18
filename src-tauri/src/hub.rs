@@ -1,4 +1,5 @@
 use anyhow::Context;
+use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -61,6 +62,8 @@ struct HfModel {
     card_data: Option<HfCardData>,
     #[serde(default)]
     config: Option<Value>,
+    #[serde(default, rename = "usedStorage")]
+    used_storage: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -175,11 +178,34 @@ impl HubClient {
         let response = self.request(url).send().await?.error_for_status()?;
         let models: Vec<HfModel> = response.json().await?;
         let next_cursor = (models.len() == 20).then(|| (offset + 20).to_string());
+        let models = self.enrich_search_models(models).await;
         let items = models
-            .into_iter()
-            .map(|model| search_view(&model, budget_bytes))
+            .iter()
+            .map(|model| search_view(model, budget_bytes))
             .collect();
         Ok(SearchPage { items, next_cursor })
+    }
+
+    async fn enrich_search_models(&self, models: Vec<HfModel>) -> Vec<HfModel> {
+        futures_util::stream::iter(models)
+            .map(|model| {
+                let this = self.clone();
+                async move {
+                    if model_download_bytes(&model) > 0 {
+                        return model;
+                    }
+                    this.fetch_model_blobs(&model.id).await.unwrap_or(model)
+                }
+            })
+            .buffered(8)
+            .collect()
+            .await
+    }
+
+    async fn fetch_model_blobs(&self, repo_id: &str) -> anyhow::Result<HfModel> {
+        let url = format!("{}/api/models/{repo_id}?blobs=true", self.base_url);
+        let response = self.request(url).send().await?.error_for_status()?;
+        Ok(response.json().await?)
     }
 
     pub async fn inspect(
@@ -364,7 +390,7 @@ impl HubClient {
 }
 
 fn search_view(model: &HfModel, budget_bytes: u64) -> CatalogEntryView {
-    let download_bytes = model.siblings.iter().filter_map(|item| item.size).sum();
+    let download_bytes = model_download_bytes(model);
     let model_type = model
         .config
         .as_ref()
@@ -389,12 +415,7 @@ fn search_view(model: &HfModel, budget_bytes: u64) -> CatalogEntryView {
         },
         task: task_name.into(),
         runtime_engine: engine.into(),
-        quantization: model
-            .tags
-            .iter()
-            .find(|tag| tag.contains("bit") || *tag == "mlx")
-            .cloned()
-            .unwrap_or_else(|| "mlx".into()),
+        quantization: infer_quantization(&model.id, &model.tags),
         license: model
             .card_data
             .as_ref()
@@ -414,6 +435,65 @@ fn search_view(model: &HfModel, budget_bytes: u64) -> CatalogEntryView {
         gated: model.gated.is_gated(),
         source: "huggingface".into(),
     }
+}
+
+fn model_download_bytes(model: &HfModel) -> u64 {
+    model
+        .used_storage
+        .filter(|value| *value > 0)
+        .unwrap_or_else(|| model.siblings.iter().filter_map(|item| item.size).sum())
+}
+
+fn infer_quantization(repo_id: &str, tags: &[String]) -> String {
+    if let Some(tag) = tags.iter().find(|tag| {
+        let lower = tag.to_ascii_lowercase();
+        lower.contains("bit") && lower != "mlx"
+    }) {
+        return tag.clone();
+    }
+    let name = repo_id
+        .rsplit('/')
+        .next()
+        .unwrap_or(repo_id)
+        .to_ascii_lowercase();
+    if name.contains("mxfp4") {
+        return "MXFP4".into();
+    }
+    if name.contains("mxfp8") {
+        return "MXFP8".into();
+    }
+    if name.contains("bf16") {
+        return "bf16".into();
+    }
+    if name.contains("fp16")
+        || name.contains("-f16")
+        || name.contains("_f16")
+        || name.ends_with("f16")
+    {
+        return "fp16".into();
+    }
+    if name.contains("fp32") {
+        return "fp32".into();
+    }
+    for (needle, label) in [
+        ("8bit", "8-bit"),
+        ("8-bit", "8-bit"),
+        ("6bit", "6-bit"),
+        ("6-bit", "6-bit"),
+        ("5bit", "5-bit"),
+        ("5-bit", "5-bit"),
+        ("4bit", "4-bit"),
+        ("4-bit", "4-bit"),
+        ("3bit", "3-bit"),
+        ("3-bit", "3-bit"),
+        ("2bit", "2-bit"),
+        ("2-bit", "2-bit"),
+    ] {
+        if name.contains(needle) {
+            return label.into();
+        }
+    }
+    "mlx".into()
 }
 
 pub fn slug(value: &str) -> String {
@@ -517,6 +597,71 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn search_enriches_missing_sizes_from_blobs_and_prefers_bit_quantization() {
+        let mut state = MockHub::default();
+        state.search_models = vec![json!({
+            "id": "mlx-community/Qwen3.8-27B-4bit",
+            "tags": ["mlx", "4-bit"],
+            "siblings": [{"rfilename": "model.safetensors"}]
+        })];
+        state.models.insert(
+            "mlx-community/Qwen3.8-27B-4bit".into(),
+            json!({
+                "id": "mlx-community/Qwen3.8-27B-4bit",
+                "tags": ["mlx", "4-bit"],
+                "usedStorage": 16_074_530_674u64,
+                "siblings": [
+                    {"rfilename": "config.json", "size": 100},
+                    {"rfilename": "model.safetensors", "size": 16_074_530_574u64}
+                ]
+            }),
+        );
+        let server = mock_hub(state).await;
+        let hub = HubClient::new(reqwest::Client::new(), server, None);
+        let page = hub.search("QWEN3.8", None, gb(32)).await.unwrap();
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(page.items[0].download_bytes, 16_074_530_674);
+        assert_eq!(page.items[0].quantization, "4-bit");
+        assert_ne!(page.items[0].ram_fit, RamFit::Unknown);
+        assert!(page.items[0].estimated_memory_bytes > 0);
+    }
+
+    #[tokio::test]
+    async fn search_marks_missing_sizes_unknown_and_reads_quant_from_repo_name() {
+        let mut state = MockHub::default();
+        state.search_models = vec![json!({
+            "id": "org/mystery-bf16",
+            "tags": ["mlx"],
+            "siblings": [{"rfilename": "model.safetensors"}]
+        })];
+        let server = mock_hub(state).await;
+        let hub = HubClient::new(reqwest::Client::new(), server, None);
+        let page = hub.search("mystery", None, gb(16)).await.unwrap();
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(page.items[0].download_bytes, 0);
+        assert_eq!(page.items[0].estimated_memory_bytes, 0);
+        assert_eq!(page.items[0].ram_fit, RamFit::Unknown);
+        assert_eq!(page.items[0].quantization, "bf16");
+    }
+
+    #[test]
+    fn quantization_prefers_bit_tags_and_repo_suffixes() {
+        assert_eq!(
+            infer_quantization("org/model-4bit", &["mlx".into()]),
+            "4-bit"
+        );
+        assert_eq!(
+            infer_quantization("org/model", &["mlx".into(), "4-bit".into()]),
+            "4-bit"
+        );
+        assert_eq!(
+            infer_quantization("org/model-bf16", &["mlx".into()]),
+            "bf16"
+        );
+        assert_eq!(infer_quantization("org/model", &["mlx".into()]), "mlx");
+    }
+
+    #[tokio::test]
     async fn inspect_rejects_unknown_architectures_gated_repos_and_missing_files() {
         let mut state = MockHub::default();
         state.models.insert(
@@ -597,6 +742,7 @@ mod tests {
         configs: HashMap<String, Value>,
         trees: HashMap<String, Vec<Value>>,
         paged_trees: HashMap<String, Vec<Vec<Value>>>,
+        search_models: Vec<Value>,
     }
 
     async fn mock_hub(state: MockHub) -> String {
@@ -608,11 +754,15 @@ mod tests {
                     let state = state.clone();
                     async move {
                         let offset = query.get("offset").and_then(|value| value.parse::<usize>().ok()).unwrap_or(0);
-                        let _guard = state.lock().await;
-                        let items = (offset..offset + 20)
-                            .take_while(|index| *index < 25)
-                            .map(|index| json!({"id":format!("org/model-{index}"),"tags":["mlx"],"siblings":[{"rfilename":"config.json","size":1}]}))
-                            .collect::<Vec<_>>();
+                        let guard = state.lock().await;
+                        let items = if guard.search_models.is_empty() {
+                            (offset..offset + 20)
+                                .take_while(|index| *index < 25)
+                                .map(|index| json!({"id":format!("org/model-{index}"),"tags":["mlx"],"siblings":[{"rfilename":"config.json","size":1}]}))
+                                .collect::<Vec<_>>()
+                        } else {
+                            guard.search_models.iter().skip(offset).take(20).cloned().collect()
+                        };
                         Json(items)
                     }
                 }

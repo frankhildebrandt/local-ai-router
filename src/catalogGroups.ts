@@ -36,7 +36,8 @@ function compareQuantizations(left: CatalogEntry, right: CatalogEntry): number {
 function ramRank(fit: RamFit): number {
   if (fit === "fits") return 0;
   if (fit === "tight") return 1;
-  return 2;
+  if (fit === "unsuitable") return 2;
+  return 3;
 }
 
 function quantizationQuality(entry: CatalogEntry): number {

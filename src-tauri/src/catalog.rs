@@ -15,6 +15,7 @@ pub enum RamFit {
     Fits,
     Tight,
     Unsuitable,
+    Unknown,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -97,6 +98,8 @@ pub const LLM_TYPES: &[&str] = &[
     "qwen2",
     "qwen3",
     "qwen3_moe",
+    "qwen3_5",
+    "qwen3_5_moe",
     "gemma",
     "gemma2",
     "gemma3",
@@ -142,6 +145,8 @@ pub const VLM_TYPES: &[&str] = &[
     "qwen2_vl",
     "qwen2_5_vl",
     "qwen3_vl",
+    "qwen3_5",
+    "qwen3_5_moe",
     "gemma3",
     "paligemma",
     "idefics3",
@@ -278,6 +283,44 @@ pub fn curated_models() -> Vec<CuratedModel> {
             None,
         ),
         curated(
+            "qwen-3-0-6b",
+            "Qwen 3 0.6B 4-bit",
+            "Qwen 3",
+            "mlx-community/Qwen3-0.6B-4bit",
+            CatalogCategory::ChatVision,
+            "chat",
+            "mlx_chat",
+            "4-bit",
+            "apache-2.0",
+            "qwen-3-0-6b",
+            CHAT,
+            mb(335.0),
+            mb(420.0),
+            "qwen3",
+            &[],
+            true,
+            None,
+        ),
+        curated(
+            "qwen-3-5-0-8b",
+            "Qwen 3.5 0.8B 4-bit",
+            "Qwen 3.5",
+            "mlx-community/Qwen3.5-0.8B-4bit",
+            CatalogCategory::ChatVision,
+            "chat",
+            "mlx_chat",
+            "4-bit",
+            "apache-2.0",
+            "qwen-3-5-0-8b",
+            CHAT_VISION,
+            mb(625.0),
+            mb(940.0),
+            "qwen3_5",
+            &[],
+            true,
+            None,
+        ),
+        curated(
             "qwen-3-5-2b",
             "Qwen 3.5 2B 4-bit",
             "Qwen 3.5",
@@ -330,6 +373,44 @@ pub fn curated_models() -> Vec<CuratedModel> {
             gb(5.5),
             gb(7.0),
             "qwen3",
+            &[],
+            true,
+            None,
+        ),
+        curated(
+            "qwen-3-8-27b",
+            "Qwen 3.8 27B 4-bit",
+            "Qwen 3.8",
+            "mlx-community/Qwen3.8-27B-4bit",
+            CatalogCategory::ChatVision,
+            "chat",
+            "mlx_chat",
+            "4-bit",
+            "apache-2.0",
+            "qwen-3-8-27b",
+            CHAT_VISION,
+            gb(16.1),
+            gb(20.0),
+            "qwen3_5",
+            &[],
+            true,
+            None,
+        ),
+        curated(
+            "ornith-1-0-35b",
+            "Ornith 1.0 35B 4-bit",
+            "Ornith",
+            "mlx-community/Ornith-1.0-35B-4bit",
+            CatalogCategory::ChatVision,
+            "chat",
+            "mlx_chat",
+            "4-bit",
+            "mit",
+            "ornith-1-0-35b",
+            CHAT_VISION,
+            gb(20.4),
+            gb(20.9),
+            "qwen3_5_moe",
             &[],
             true,
             None,
@@ -622,6 +703,9 @@ pub fn classify_ram(estimated_bytes: u64, budget_bytes: u64) -> RamFit {
     if budget_bytes == 0 {
         return RamFit::Unsuitable;
     }
+    if estimated_bytes == 0 {
+        return RamFit::Unknown;
+    }
     if estimated_bytes <= budget_bytes.saturating_mul(80) / 100 {
         RamFit::Fits
     } else if estimated_bytes <= budget_bytes {
@@ -776,6 +860,7 @@ mod tests {
         assert_eq!(classify_ram(budget * 80 / 100 + 1, budget), RamFit::Tight);
         assert_eq!(classify_ram(budget, budget), RamFit::Tight);
         assert_eq!(classify_ram(budget + 1, budget), RamFit::Unsuitable);
+        assert_eq!(classify_ram(0, budget), RamFit::Unknown);
     }
 
     #[test]
@@ -801,6 +886,8 @@ mod tests {
             "Gemma 4",
             "gpt-oss",
             "Qwen 3.5",
+            "Qwen 3.8",
+            "Ornith",
             "Mistral",
             "Llama 3",
             "Phi",
@@ -828,6 +915,19 @@ mod tests {
                 .alias,
             "qwen-3-5-4b"
         );
+        let qwen38 = models
+            .iter()
+            .find(|model| model.id == "qwen-3-8-27b")
+            .expect("Qwen 3.8 27B");
+        assert_eq!(qwen38.model_type, "qwen3_5");
+        assert!(qwen38.capabilities.contains(&"vision"));
+        let ornith = models
+            .iter()
+            .find(|model| model.id == "ornith-1-0-35b")
+            .expect("Ornith");
+        assert_eq!(ornith.model_type, "qwen3_5_moe");
+        assert!(models.iter().any(|model| model.id == "qwen-3-0-6b"));
+        assert!(models.iter().any(|model| model.id == "qwen-3-5-0-8b"));
     }
 
     #[test]
@@ -862,6 +962,18 @@ mod tests {
                 .unwrap()
                 .0,
             "mlx_image"
+        );
+        assert_eq!(
+            runtime_for_model_type("qwen3_5", Some("image-text-to-text"))
+                .unwrap()
+                .2,
+            ModelTask::Vlm
+        );
+        assert_eq!(
+            runtime_for_model_type("qwen3_5_moe", Some("image-text-to-text"))
+                .unwrap()
+                .2,
+            ModelTask::Vlm
         );
     }
 
