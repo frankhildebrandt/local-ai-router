@@ -435,7 +435,7 @@ fn search_view(model: &CivitaiModel, budget_bytes: u64) -> Option<CatalogEntryVi
     let version = compatible_version(model)?;
     let file = primary_file(&version.files)?;
     let base = version.base_model.as_deref().unwrap_or_default();
-    let pipeline = pipeline_for_base_model(base)?;
+    pipeline_for_base_model(base)?;
     let bytes = file
         .size_kb
         .map(|value| (value * 1024.0) as u64)
@@ -468,7 +468,6 @@ fn search_view(model: &CivitaiModel, budget_bytes: u64) -> Option<CatalogEntryVi
         gated: false,
         source: "civitai".into(),
     })
-    .filter(|_| pipeline == "sd" || pipeline == "sdxl")
 }
 
 fn listing_from_version(

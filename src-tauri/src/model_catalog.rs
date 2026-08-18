@@ -346,23 +346,27 @@ struct Discovered {
 }
 
 fn parse_discovered(value: &Value) -> Discovered {
-    let mut discovered = Discovered::default();
-    discovered.context_window = first_u64(
-        value,
-        &[
-            "context_length",
-            "context_window",
-            "max_context_length",
-            "inputTokenLimit",
-            "input_token_limit",
-        ],
-    );
     let pricing = value.get("pricing").or_else(|| value.get("price"));
-    discovered.input_price_per_million = pricing_field(pricing, &["prompt", "input", "input_cost"])
-        .or_else(|| first_f64(value, &["input_price_per_million", "input_price"]));
-    discovered.output_price_per_million =
-        pricing_field(pricing, &["completion", "output", "output_cost"])
-            .or_else(|| first_f64(value, &["output_price_per_million", "output_price"]));
+    let mut discovered = Discovered {
+        context_window: first_u64(
+            value,
+            &[
+                "context_length",
+                "context_window",
+                "max_context_length",
+                "inputTokenLimit",
+                "input_token_limit",
+            ],
+        ),
+        input_price_per_million: pricing_field(pricing, &["prompt", "input", "input_cost"])
+            .or_else(|| first_f64(value, &["input_price_per_million", "input_price"])),
+        output_price_per_million: pricing_field(
+            pricing,
+            &["completion", "output", "output_cost"],
+        )
+        .or_else(|| first_f64(value, &["output_price_per_million", "output_price"])),
+        ..Default::default()
+    };
     push_unique(&mut discovered.capabilities, capabilities_from_api(value));
     discovered
 }
