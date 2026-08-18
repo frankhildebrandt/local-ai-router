@@ -2,6 +2,7 @@ pub mod catalog;
 pub mod civitai;
 pub mod commands;
 pub mod core;
+pub mod desktop;
 pub mod domain;
 pub mod gateway;
 pub mod hub;
@@ -22,7 +23,7 @@ pub mod storage;
 use std::{sync::Arc, time::Duration};
 
 use commands::AppServices;
-use tauri::{Emitter, Manager, WindowEvent};
+use tauri::{Emitter, Manager, RunEvent, WindowEvent};
 use tokio_util::sync::CancellationToken;
 
 pub fn run() {
@@ -69,6 +70,7 @@ pub fn run() {
                 "https://huggingface.co",
             ));
             tauri::async_runtime::block_on(install.interrupt_active())?;
+            let shutdown = CancellationToken::new();
             let handle = app.handle().clone();
             let mut events = install.subscribe();
             tauri::async_runtime::spawn(async move {
@@ -82,11 +84,11 @@ pub fn run() {
                 model_library: app_data.join("models"),
                 port,
                 install,
+                shutdown: shutdown.clone(),
             });
 
             let listener =
                 tauri::async_runtime::block_on(tokio::net::TcpListener::bind(("127.0.0.1", port)))?;
-            let shutdown = CancellationToken::new();
             let shutdown_server = shutdown.clone();
             let gateway_core = core.clone();
             let gateway_runtimes = runtimes.clone();
@@ -165,41 +167,10 @@ pub fn run() {
                 }
             });
 
-            let show = tauri::menu::MenuItem::with_id(
-                app,
-                "show",
-                "Open Local AI Router",
-                true,
-                None::<&str>,
-            )?;
-            let quit = tauri::menu::MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
-            let menu = tauri::menu::Menu::with_items(app, &[&show, &quit])?;
-            let mut tray = tauri::tray::TrayIconBuilder::new()
-                .menu(&menu)
-                .show_menu_on_left_click(false)
-                .on_menu_event({
-                    let runtimes = runtimes.clone();
-                    move |app, event| match event.id.as_ref() {
-                        "show" => {
-                            if let Some(window) = app.get_webview_window("main") {
-                                let _ = window.show();
-                                let _ = window.set_focus();
-                            }
-                        }
-                        "quit" => {
-                            shutdown.cancel();
-                            tauri::async_runtime::block_on(runtimes.stop_all());
-                            app.exit(0);
-                        }
-                        _ => {}
-                    }
-                });
-            if let Some(icon) = app.default_window_icon() {
-                tray = tray.icon(icon.clone());
-            }
-            tray.build(app)?;
+            desktop::install(app)?;
             Ok(())
         })
+        .on_menu_event(|app, event| desktop::handle_menu_event(app, event.id.as_ref()))
         .on_window_event(|window, event| {
             if let WindowEvent::CloseRequested { api, .. } = event {
                 api.prevent_close();
@@ -273,6 +244,11 @@ pub fn run() {
             commands::save_civitai_token,
             commands::forget_all_credentials
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running Local AI Router");
+        .build(tauri::generate_context!())
+        .expect("error while running Local AI Router")
+        .run(|app, event| match event {
+            RunEvent::ExitRequested { .. } => desktop::shutdown(app),
+            RunEvent::Reopen { .. } => desktop::show_main_window(app),
+            _ => {}
+        });
 }

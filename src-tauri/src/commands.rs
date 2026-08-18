@@ -3,6 +3,7 @@ use std::{collections::HashSet, path::PathBuf, sync::Arc};
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use tauri::State;
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::{
@@ -34,6 +35,7 @@ pub struct AppServices {
     pub model_library: PathBuf,
     pub port: u16,
     pub install: Arc<crate::install::InstallManager>,
+    pub shutdown: CancellationToken,
 }
 
 #[derive(Debug, Serialize)]

@@ -8,7 +8,7 @@ import {
   Pencil, Plus, RefreshCw, Route, Search, Settings, ShieldCheck, Sparkles,
   Trash2, X,
 } from "lucide-react";
-import { command, errorMessage, isTauri } from "./api";
+import { command, errorMessage, isTauri, listenDesktopNavigate } from "./api";
 import type { DashboardData, LocalApiKey, LocalApiKeyWithToken, LogFacets, LogQuery, LogResult, ModelMetadata, ModelRoute, ModelTarget, Provider, ProviderModel, ProviderPreset, PublicModel, RequestLog, ResourcePolicy, ResourceProfile, RoutingAttempt, RoutingConfigExport, RoutingEvaluation, RoutingPolicy, RoutingTaskDefinition, TargetRoutingProfile, UsageData, WireProtocol } from "./types";
 import { LocalPage } from "./LocalPage";
 
@@ -65,13 +65,22 @@ export default function App() {
 
   useEffect(() => { void refresh(); const timer = window.setInterval(() => { if (page === "overview" || page === "usage" || page === "logs") void refresh(); }, 10_000); return () => clearInterval(timer); }, [refresh, page]);
 
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    void listenDesktopNavigate(next => {
+      if (nav.some(item => item.page === next)) setPage(next as Page);
+    }).then(fn => { unlisten = fn; }).catch(() => undefined);
+    return () => unlisten?.();
+  }, []);
+
   const success = (text: string) => { setNotice({ type: "success", text }); window.setTimeout(() => setNotice(null), 3500); };
   const fail = (error: unknown) => setNotice({ type: "error", text: errorMessage(error) });
   const common = { providers, providerPresets, targets, routes, routingPolicies, routingProfiles, routingTasks, logs, localKeys, settings, resourcePolicy, refresh, success, fail };
 
   return <div className="shell">
     <aside className={sidebar ? "sidebar" : "sidebar collapsed"}>
-      <div className="brand"><div className="brand-mark"><Layers3 size={20} /></div>{sidebar && <div><strong>Local AI Router</strong><span>Private model gateway</span></div>}</div>
+      <div className="sidebar-drag" data-tauri-drag-region aria-hidden="true" />
+      <div className="brand" data-tauri-drag-region><div className="brand-mark"><Layers3 size={20} /></div>{sidebar && <div><strong>Local AI Router</strong><span>Private model gateway</span></div>}</div>
       <nav>{nav.map(({ page: item, label, icon: Icon }) => <button key={item} className={page === item ? "active" : ""} onClick={() => setPage(item)} title={label}><Icon size={18} />{sidebar && <span>{label}</span>}</button>)}</nav>
       <div className="sidebar-foot">
         <div className={`server-pill ${dashboard.running ? "online" : ""}`}><i />{sidebar && <span>{dashboard.running ? "Gateway online" : "Gateway offline"}</span>}</div>
@@ -79,7 +88,7 @@ export default function App() {
       </div>
     </aside>
     <main>
-      <header className="topbar"><button className="icon-button" onClick={() => setSidebar(!sidebar)}><Menu size={19} /></button><div className="crumb"><span>Local AI Router</span><ChevronRight size={14} /><strong>{nav.find(item => item.page === page)?.label}</strong></div><button className="icon-button" onClick={() => void refresh()}><RefreshCw size={17} /></button></header>
+      <header className="topbar"><button className="icon-button" onClick={() => setSidebar(!sidebar)}><Menu size={19} /></button><div className="crumb" data-tauri-drag-region><span>Local AI Router</span><ChevronRight size={14} /><strong>{nav.find(item => item.page === page)?.label}</strong></div><button className="icon-button" onClick={() => void refresh()}><RefreshCw size={17} /></button></header>
       {notice && <div className={`toast ${notice.type}`}>{notice.type === "success" ? <Check size={17} /> : <CircleAlert size={17} />}<span>{notice.text}</span><button onClick={() => setNotice(null)}><X size={15} /></button></div>}
       <div className="content">
         {loading ? <Loading /> : page === "overview" ? <Overview dashboard={dashboard} targets={targets} publicModels={publicModels} onNavigate={setPage} />

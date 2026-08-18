@@ -14,6 +14,12 @@ export async function listenInstallJobs(handler: (event: InstallJobEvent) => voi
   return listen<InstallJobEvent>("install-job", event => handler(event.payload));
 }
 
+export async function listenDesktopNavigate(handler: (page: string) => void): Promise<() => void> {
+  if (!isTauri()) return () => undefined;
+  const { listen } = await import("@tauri-apps/api/event");
+  return listen<string>("desktop-navigate", event => handler(event.payload));
+}
+
 export function errorMessage(error: unknown): string {
   if (typeof error === "string") return error;
   if (error instanceof Error) return error.message;

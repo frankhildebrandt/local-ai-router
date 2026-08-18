@@ -3,7 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import App from "./App";
 
 const command = vi.fn();
-vi.mock("./api", () => ({ command: (...args: unknown[]) => command(...args), listenInstallJobs: async () => () => undefined, errorMessage: (error: unknown) => String(error), isTauri: () => true }));
+vi.mock("./api", () => ({ command: (...args: unknown[]) => command(...args), listenInstallJobs: async () => () => undefined, listenDesktopNavigate: async () => () => undefined, errorMessage: (error: unknown) => String(error), isTauri: () => true }));
 
 beforeEach(() => {
   command.mockImplementation((name: string, args?: unknown) => {
@@ -83,6 +83,17 @@ describe("Local AI Router shell", () => {
     expect(await screen.findByText("Your models, one local endpoint.")).toBeTruthy();
     expect(screen.getAllByText("http://127.0.0.1:11435/v1").length).toBeGreaterThan(0);
     expect(command).toHaveBeenCalledWith("list_logs", { query: { legacy_only: false, limit: 100 } });
+  });
+
+  it("keeps window chrome draggable without capturing toolbar buttons", async () => {
+    const { container } = render(<App />);
+    await screen.findByText("Your models, one local endpoint.");
+    expect(container.querySelector(".sidebar-drag")).toHaveAttribute("data-tauri-drag-region");
+    expect(container.querySelector(".brand")).toHaveAttribute("data-tauri-drag-region");
+    expect(container.querySelector(".crumb")).toHaveAttribute("data-tauri-drag-region");
+    for (const button of container.querySelectorAll(".topbar button")) {
+      expect(button).not.toHaveAttribute("data-tauri-drag-region");
+    }
   });
 
   it("exposes usage, named keys, and structured request-log filters", async () => {

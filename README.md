@@ -5,6 +5,7 @@ A private, multi-protocol model gateway for Apple Silicon Macs. Local AI Router 
 ## What works
 
 - Tauri 2 menu-bar app for macOS 15+
+- Closing the window hides to the menu bar; quit from the app menu, tray, or Cmd+Q stops the gateway
 - Presets for OpenAI, Anthropic, OpenRouter, Poolside, MiniMax, Z.AI, OpenCode Zen, Gemini, Groq, Cerebras, Mistral, Hugging Face, NVIDIA NIM and SambaNova
 - API keys and experimental OpenAI Subscription OAuth tokens stored in macOS Keychain
 - Provider model discovery and manually entered model IDs, with features and list prices from the provider API or known-model defaults
