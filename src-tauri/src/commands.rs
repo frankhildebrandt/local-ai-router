@@ -540,13 +540,9 @@ async fn hub_client(state: &AppServices) -> Result<crate::hub::HubClient, String
     ))
 }
 
-fn civitai_client(
-    state: &AppServices,
-    host: crate::civitai::CivitaiHost,
-) -> Result<crate::civitai::CivitaiClient, String> {
-    Ok(crate::civitai::CivitaiClient::new(
+fn civitai_http(state: &AppServices) -> Result<(reqwest::Client, Option<String>), String> {
+    Ok((
         crate::hub::hub_http_client().map_err(err)?,
-        host,
         state.core.secrets.get(CIVITAI_ACCOUNT).map_err(err)?,
     ))
 }
@@ -570,15 +566,17 @@ pub async fn search_mlx_catalog(
     input: SearchCatalogInput,
 ) -> Result<crate::hub::SearchPage, String> {
     let (_, budget) = budget_from_store(&state.core.store).await.map_err(err)?;
-    if let Some(host) = crate::civitai::CivitaiHost::parse(input.source.as_deref().unwrap_or("")) {
-        return civitai_client(&state, host)?
-            .search(
-                input.query.as_deref().unwrap_or(""),
-                input.cursor.as_deref(),
-                budget,
-            )
-            .await
-            .map_err(err);
+    if crate::civitai::CivitaiHost::parse(input.source.as_deref().unwrap_or("")).is_some() {
+        let (http, token) = civitai_http(&state)?;
+        return crate::civitai::search(
+            http,
+            token,
+            input.query.as_deref().unwrap_or(""),
+            input.cursor.as_deref(),
+            budget,
+        )
+        .await
+        .map_err(err);
     }
     hub_client(&state)
         .await?
@@ -598,9 +596,8 @@ pub async fn inspect_mlx_model(
 ) -> Result<crate::hub::ModelInspection, String> {
     let (_, budget) = budget_from_store(&state.core.store).await.map_err(err)?;
     if crate::civitai::is_civitai_repo(&input.repo_id) {
-        let host = crate::civitai::host_from_repo(&input.repo_id);
-        return civitai_client(&state, host)?
-            .inspect(&input.repo_id, budget)
+        let (http, token) = civitai_http(&state)?;
+        return crate::civitai::inspect(http, token, &input.repo_id, budget)
             .await
             .map_err(err);
     }
@@ -631,9 +628,8 @@ pub async fn install_catalog_model(
         }
     }
     let inspection = if crate::civitai::is_civitai_repo(&input.repo_id) {
-        let host = crate::civitai::host_from_repo(&input.repo_id);
-        civitai_client(&state, host)?
-            .inspect(&input.repo_id, budget)
+        let (http, token) = civitai_http(&state)?;
+        crate::civitai::inspect(http, token, &input.repo_id, budget)
             .await
             .map_err(err)?
     } else {

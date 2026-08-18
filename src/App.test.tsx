@@ -53,8 +53,8 @@ beforeEach(() => {
     if (name === "list_install_jobs") return Promise.resolve([{ id: "job-1", repo_id: "mlx-community/Qwen3.5-2B-4bit", revision: "abc", status: "downloading", catalog_id: "qwen-3-5-2b", alias: "qwen-3-5-2b", engine: "mlx_chat", task: "chat", capabilities: ["chat"], bytes_downloaded: 500, bytes_total: 1000, current_file: "model.safetensors", staging_dir: "/tmp", error: null, confirm_over_budget: false, created_at: "2026-08-17T10:00:00Z", updated_at: "2026-08-17T10:00:00Z" }]);
     if (name === "search_mlx_catalog") {
       const source = (args as { input?: { source?: string } } | undefined)?.input?.source;
-      if (source === "civitai" || source === "civitai.red") {
-        return Promise.resolve({ items: [{ id: `${source}/models/4201@130072`, name: "Realistic Vision", family: "SD 1.5", repo_id: `${source}/models/4201@130072`, category: "image", task: "image", runtime_engine: "mlx_image", quantization: "fp16", license: "civitai", alias: "realistic-vision", capabilities: ["images"], download_bytes: 2_000_000_000, estimated_memory_bytes: 4_000_000_000, ram_fit: "fits", trust_status: "untested", installable: true, lock_reason: null, voices: [], gated: false, source }], next_cursor: null });
+      if (source === "civitai") {
+        return Promise.resolve({ items: [{ id: "civitai/models/4201@130072", name: "Realistic Vision", family: "SD 1.5", repo_id: "civitai/models/4201@130072", category: "image", task: "image", runtime_engine: "mlx_image", quantization: "fp16", license: "civitai", alias: "realistic-vision", capabilities: ["images"], download_bytes: 2_000_000_000, estimated_memory_bytes: 4_000_000_000, ram_fit: "fits", trust_status: "untested", installable: true, lock_reason: null, voices: [], gated: false, source: "civitai" }], next_cursor: null });
       }
       return Promise.resolve({ items: [{ id: "org/untested", name: "Untested MLX", family: "Unknown", repo_id: "org/untested", category: "chat_vision", task: "chat", runtime_engine: "mlx_chat", quantization: "unknown", license: "unknown", alias: "untested", capabilities: ["chat"], download_bytes: 1, estimated_memory_bytes: 2, ram_fit: "fits", trust_status: "untested", installable: false, lock_reason: "unknown architecture", voices: [], gated: false }], next_cursor: null });
     }
@@ -153,7 +153,7 @@ describe("Local AI Router shell", () => {
     expect(screen.getByText("Stable Diffusion 2.1 Base")).toBeInTheDocument();
     expect(screen.getByText("Unsuitable")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "CivitAI" })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "civitai.red" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "civitai.red" })).not.toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "CivitAI" }));
     fireEvent.change(screen.getByPlaceholderText("Search CivitAI checkpoints (SD and SDXL)"), { target: { value: "realistic" } });
     expect(await screen.findByText("Realistic Vision")).toBeInTheDocument();
@@ -167,7 +167,7 @@ describe("Local AI Router shell", () => {
     fireEvent.click(screen.getByRole("button", { name: "Download" }));
     expect(screen.getByRole("button", { name: "Hugging Face" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "CivitAI" })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "civitai.red" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "civitai.red" })).not.toBeInTheDocument();
     expect(screen.getByText("GGUF · llama.cpp")).toBeInTheDocument();
   });
 

@@ -12,7 +12,7 @@ import { displayModelName, groupCatalogEntries, preferredQuantization } from "./
 
 type Common = { targets: ModelTarget[]; resourcePolicy: ResourcePolicy; refresh: () => Promise<void>; success: (text: string) => void; fail: (error: unknown) => void };
 type CatalogTab = "chat_vision" | "image" | "speech" | "library" | "import";
-type DownloadSource = "huggingface" | "civitai" | "civitai.red";
+type DownloadSource = "huggingface" | "civitai";
 
 const emptyCatalog: LocalCatalog = {
   platform: { apple_silicon: true, macos_15_plus: true, compatible: true, reason: null },
@@ -111,7 +111,7 @@ export function LocalPage({ targets, resourcePolicy, refresh, success, fail }: C
       <section className="panel catalog-toolbar">
         <div className="search"><Search size={17} /><input value={query} onChange={event => setQuery(event.target.value)} placeholder={tab === "image" && downloadSource !== "huggingface" ? "Search CivitAI checkpoints (SD and SDXL)" : "Search curated models or every Hugging Face MLX repository"} /></div>
         {tab === "image" && <div className="segmented small catalog-sources" role="group" aria-label="Download source">
-          {([["huggingface", "Hugging Face"], ["civitai", "CivitAI"], ["civitai.red", "civitai.red"]] as const).map(([id, label]) =>
+          {([["huggingface", "Hugging Face"], ["civitai", "CivitAI"]] as const).map(([id, label]) =>
             <button key={id} type="button" className={downloadSource === id ? "selected" : ""} onClick={() => setDownloadSource(id)}>{label}</button>)}
         </div>}
         <div className="filter-grid catalog-filters">
@@ -122,8 +122,8 @@ export function LocalPage({ targets, resourcePolicy, refresh, success, fail }: C
       </section>
       {!!jobs.length && <InstallJobs jobs={jobs} onChange={load} fail={fail} />}
       <div className="catalog-grid">{curated.map(group => <CatalogCard key={quantizationGroupKey(group)} variants={group} onInstall={entry => void install(entry)} />)}</div>
-      {searching && <p className="catalog-hint">{tab === "image" && downloadSource !== "huggingface" ? `Searching ${downloadSource}…` : "Searching Hugging Face…"}</p>}
-      {!!visibleSearch.length && <><h3 className="catalog-section">{tab === "image" && downloadSource !== "huggingface" ? `Untested ${downloadSource} matches` : "Untested Hugging Face matches"}</h3><p className="catalog-hint">{tab === "image" && downloadSource !== "huggingface" ? "SD and SDXL checkpoints download from the selected CivitAI host. Diffusers-layout models can generate immediately; classic single-file checkpoints are stored for the SD/SDXL engine." : "Visibility does not mean the model can be installed or run. Architecture, files and license are checked first."}</p><div className="catalog-grid">{visibleSearch.map(group => <CatalogCard key={quantizationGroupKey(group)} variants={group} onInstall={entry => void install(entry)} />)}</div></>}
+      {searching && <p className="catalog-hint">{tab === "image" && downloadSource !== "huggingface" ? "Searching CivitAI…" : "Searching Hugging Face…"}</p>}
+      {!!visibleSearch.length && <><h3 className="catalog-section">{tab === "image" && downloadSource !== "huggingface" ? "Untested CivitAI matches" : "Untested Hugging Face matches"}</h3><p className="catalog-hint">{tab === "image" && downloadSource !== "huggingface" ? "SD and SDXL checkpoints download from CivitAI. Diffusers-layout models can generate immediately; classic single-file checkpoints are stored for the SD/SDXL engine." : "Visibility does not mean the model can be installed or run. Architecture, files and license are checked first."}</p><div className="catalog-grid">{visibleSearch.map(group => <CatalogCard key={quantizationGroupKey(group)} variants={group} onInstall={entry => void install(entry)} />)}</div></>}
       {!curated.length && !visibleSearch.length && !searching && <div className="empty"><div><Box /></div><h3>No models in this category</h3><p>Try another filter or search the Hugging Face MLX catalog.</p></div>}
     </>}
     {tab === "library" && <InstalledLibrary local={local} resourcePolicy={resourcePolicy} refresh={refresh} success={success} fail={fail} />}
@@ -219,7 +219,7 @@ function ManualImport({ refresh, success, fail }: Pick<Common, "refresh" | "succ
       if (tab === "import") {
         await command("import_local_model", { input: { source, name, kind, aliasModel: name, capabilities: ["chat"] } });
       } else if (civitai) {
-        const repoId = source.includes("civitai") ? source : `${downloadSource}/models/${source.replace(/^models\//, "")}`;
+        const repoId = source.includes("civitai") ? source : `civitai/models/${source.replace(/^models\//, "")}`;
         await command("install_catalog_model", { input: { repoId, catalogId: null, confirmOverBudget: false, name: name || repoId } });
       } else {
         await command("download_local_model", { input: { repoId: source, filename: filename || null, name: name || source.split("/").pop(), kind, aliasModel: name || source, capabilities: ["chat"], source: downloadSource } });
@@ -230,8 +230,8 @@ function ManualImport({ refresh, success, fail }: Pick<Common, "refresh" | "succ
     } catch (e) { fail(e); } finally { setBusy(false); }
   };
   return <section className="panel add-model"><div className="segmented small"><button className={tab === "import" ? "selected" : ""} onClick={() => setTab("import")}><FileDown size={15} />Import</button><button className={tab === "download" ? "selected" : ""} onClick={() => setTab("download")}><Download size={15} />Download</button></div>
-    {tab === "download" && <div className="segmented small catalog-sources" role="group" aria-label="Download source">{([["huggingface", "Hugging Face"], ["civitai", "CivitAI"], ["civitai.red", "civitai.red"]] as const).map(([id, label]) => <button key={id} type="button" className={downloadSource === id ? "selected" : ""} onClick={() => { setDownloadSource(id); if (id !== "huggingface") setKind("mlx"); }}>{label}</button>)}</div>}
-    <form onSubmit={submit}>{!civitai && <select value={kind} onChange={e => setKind(e.target.value as TargetKind)}><option value="gguf">GGUF · llama.cpp</option><option value="mlx">MLX · Apple Silicon</option></select>}<div className="input-action"><input value={source} onChange={e => setSource(e.target.value)} placeholder={tab === "import" ? "Model file or folder" : civitai ? "https://civitai.com/models/… or models/12345" : "org/model-repository"} required />{tab === "import" && <button type="button" className="secondary" onClick={() => void browse()}>Browse</button>}</div>{tab === "download" && kind === "gguf" && !civitai && <input value={filename} onChange={e => setFilename(e.target.value)} placeholder="quantized-model.Q4_K_M.gguf" required />}<input value={name} onChange={e => setName(e.target.value)} placeholder="Display name" required={tab === "import"} /><button className="primary" disabled={busy}>{busy ? <LoaderCircle className="spin" size={17} /> : tab === "import" ? <FileDown size={17} /> : <Download size={17} />}{tab === "import" ? "Import" : "Download"}</button></form></section>;
+    {tab === "download" && <div className="segmented small catalog-sources" role="group" aria-label="Download source">{([["huggingface", "Hugging Face"], ["civitai", "CivitAI"]] as const).map(([id, label]) => <button key={id} type="button" className={downloadSource === id ? "selected" : ""} onClick={() => { setDownloadSource(id); if (id !== "huggingface") setKind("mlx"); }}>{label}</button>)}</div>}
+    <form onSubmit={submit}>{!civitai && <select value={kind} onChange={e => setKind(e.target.value as TargetKind)}><option value="gguf">GGUF · llama.cpp</option><option value="mlx">MLX · Apple Silicon</option></select>}<div className="input-action"><input value={source} onChange={e => setSource(e.target.value)} placeholder={tab === "import" ? "Model file or folder" : civitai ? "https://civitai.com/models/… or civitai.red/models/…" : "org/model-repository"} required />{tab === "import" && <button type="button" className="secondary" onClick={() => void browse()}>Browse</button>}</div>{tab === "download" && kind === "gguf" && !civitai && <input value={filename} onChange={e => setFilename(e.target.value)} placeholder="quantized-model.Q4_K_M.gguf" required />}<input value={name} onChange={e => setName(e.target.value)} placeholder="Display name" required={tab === "import"} /><button className="primary" disabled={busy}>{busy ? <LoaderCircle className="spin" size={17} /> : tab === "import" ? <FileDown size={17} /> : <Download size={17} />}{tab === "import" ? "Import" : "Download"}</button></form></section>;
 }
 
 function ramLabel(fit: RamFit): { label: string; tone: "good" | "warn" | "bad" } {

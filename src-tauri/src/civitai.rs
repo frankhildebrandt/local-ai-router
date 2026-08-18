@@ -1,4 +1,5 @@
 use anyhow::Context;
+use serde::de::DeserializeOwned;
 use serde::Deserialize;
 
 use crate::catalog::{classify_ram, estimate_memory, CatalogCategory, CatalogEntryView, ModelTask};
@@ -26,13 +27,6 @@ impl CivitaiHost {
         match self {
             Self::Com => CIVITAI_COM,
             Self::Red => CIVITAI_RED,
-        }
-    }
-
-    pub fn source_id(self) -> &'static str {
-        match self {
-            Self::Com => "civitai",
-            Self::Red => "civitai.red",
         }
     }
 
@@ -106,8 +100,8 @@ fn parse_model_id(value: &str) -> Option<u64> {
     rest.split(['/', '?', '#', '@']).next()?.parse().ok()
 }
 
-pub fn repo_id(host: CivitaiHost, model_id: u64, version_id: u64) -> String {
-    format!("{}/models/{model_id}@{version_id}", host.source_id())
+pub fn repo_id(model_id: u64, version_id: u64) -> String {
+    format!("civitai/models/{model_id}@{version_id}")
 }
 
 pub fn pipeline_for_base_model(base: &str) -> Option<&'static str> {
@@ -247,21 +241,29 @@ impl CivitaiClient {
         request
     }
 
+    async fn send_json<T: DeserializeOwned>(
+        &self,
+        url: String,
+        invalid: &'static str,
+    ) -> anyhow::Result<T> {
+        let response = self.request(url).send().await?;
+        parse_civitai_json(response, invalid).await
+    }
+
     pub async fn search(
         &self,
         query: &str,
         cursor: Option<&str>,
         budget_bytes: u64,
     ) -> anyhow::Result<SearchPage> {
-        let mut url = format!(
-            "{}/api/v1/models?types=Checkpoint&limit=20&nsfw={}",
-            self.base_url,
-            self.host.nsfw()
-        );
-        if !query.trim().is_empty() {
+        let mut url = format!("{}/api/v1/models?types=Checkpoint&limit=20", self.base_url);
+        let query = query.trim();
+        if query.is_empty() {
+            url.push_str(&format!("&nsfw={}", self.host.nsfw()));
+        } else {
             url.push_str(&format!(
                 "&query={}",
-                url::form_urlencoded::byte_serialize(query.trim().as_bytes()).collect::<String>()
+                url::form_urlencoded::byte_serialize(query.as_bytes()).collect::<String>()
             ));
         }
         if let Some(cursor) = cursor.filter(|value| !value.is_empty()) {
@@ -275,17 +277,12 @@ impl CivitaiClient {
             }
         }
         let page: ModelsPage = self
-            .request(url)
-            .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await
-            .context("civitai search returned invalid JSON")?;
+            .send_json(url, "civitai search returned invalid JSON")
+            .await?;
         let items = page
             .items
             .iter()
-            .filter_map(|model| search_view(model, self.host, budget_bytes))
+            .filter_map(|model| search_view(model, budget_bytes))
             .collect();
         Ok(SearchPage {
             items,
@@ -298,7 +295,7 @@ impl CivitaiClient {
 
     pub async fn resolve(&self, value: &str) -> anyhow::Result<String> {
         if let Some((_, model_id, version_id)) = parse_repo(value) {
-            return Ok(repo_id(self.host, model_id, version_id));
+            return Ok(repo_id(model_id, version_id));
         }
         let model_id = parse_model_id(value).context("not a CivitAI model id")?;
         if let Some(version_id) = value
@@ -307,22 +304,16 @@ impl CivitaiClient {
             .and_then(|part| part.split(['&', '#', '/']).next())
             .and_then(|part| part.parse().ok())
         {
-            return Ok(repo_id(self.host, model_id, version_id));
+            return Ok(repo_id(model_id, version_id));
         }
         let url = format!("{}/api/v1/models/{model_id}", self.base_url);
         let model: CivitaiModel = self
-            .request(url)
-            .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await
-            .context("civitai model returned invalid JSON")?;
-        let version = model
-            .model_versions
-            .first()
+            .send_json(url, "civitai model returned invalid JSON")
+            .await?;
+        let version = compatible_version(&model)
+            .or_else(|| model.model_versions.first())
             .context("this CivitAI model has no versions")?;
-        Ok(repo_id(self.host, model.id, version.id))
+        Ok(repo_id(model.id, version.id))
     }
 
     pub async fn inspect(
@@ -331,18 +322,95 @@ impl CivitaiClient {
         budget_bytes: u64,
     ) -> anyhow::Result<ModelInspection> {
         let resolved = self.resolve(repo_id).await?;
-        let (host, _, version_id) = parse_repo(&resolved).context("not a CivitAI model id")?;
+        let (_, _, version_id) = parse_repo(&resolved).context("not a CivitAI model id")?;
         let url = format!("{}/api/v1/model-versions/{version_id}", self.base_url);
         let version: VersionResponse = self
-            .request(url)
-            .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await
-            .context("civitai model version returned invalid JSON")?;
-        listing_from_version(host, &resolved, version, budget_bytes)
+            .send_json(url, "civitai model version returned invalid JSON")
+            .await?;
+        listing_from_version(self.host, &resolved, version, budget_bytes)
     }
+}
+
+pub async fn search(
+    client: reqwest::Client,
+    token: Option<String>,
+    query: &str,
+    cursor: Option<&str>,
+    budget_bytes: u64,
+) -> anyhow::Result<SearchPage> {
+    search_hosts(
+        [CivitaiHost::Red, CivitaiHost::Com]
+            .into_iter()
+            .map(|host| CivitaiClient::new(client.clone(), host, token.clone())),
+        query,
+        cursor,
+        budget_bytes,
+    )
+    .await
+}
+
+async fn search_hosts(
+    clients: impl IntoIterator<Item = CivitaiClient>,
+    query: &str,
+    cursor: Option<&str>,
+    budget_bytes: u64,
+) -> anyhow::Result<SearchPage> {
+    let mut last_error = None;
+    for client in clients {
+        match client.search(query, cursor, budget_bytes).await {
+            Ok(page) => return Ok(page),
+            Err(error) => last_error = Some(error),
+        }
+    }
+    Err(last_error.unwrap_or_else(|| anyhow::anyhow!("civitai search failed")))
+}
+
+pub async fn inspect(
+    client: reqwest::Client,
+    token: Option<String>,
+    repo_id: &str,
+    budget_bytes: u64,
+) -> anyhow::Result<ModelInspection> {
+    let preferred = host_from_repo(repo_id);
+    let fallback = match preferred {
+        CivitaiHost::Red => CivitaiHost::Com,
+        CivitaiHost::Com => CivitaiHost::Red,
+    };
+    let mut last_error = None;
+    for host in [preferred, fallback] {
+        match CivitaiClient::new(client.clone(), host, token.clone())
+            .inspect(repo_id, budget_bytes)
+            .await
+        {
+            Ok(inspection) => return Ok(inspection),
+            Err(error) => last_error = Some(error),
+        }
+    }
+    Err(last_error.unwrap_or_else(|| anyhow::anyhow!("civitai inspect failed")))
+}
+
+async fn parse_civitai_json<T: DeserializeOwned>(
+    response: reqwest::Response,
+    invalid: &'static str,
+) -> anyhow::Result<T> {
+    let status = response.status();
+    let value: serde_json::Value = response.json().await.context(invalid)?;
+    if let Some(error) = civitai_error_message(&value) {
+        anyhow::bail!("{error}");
+    }
+    if !status.is_success() {
+        anyhow::bail!("civitai request failed ({status})");
+    }
+    serde_json::from_value(value).context(invalid)
+}
+
+fn civitai_error_message(value: &serde_json::Value) -> Option<String> {
+    value
+        .get("error")
+        .and_then(|item| item.as_str())
+        .or_else(|| value.get("message").and_then(|item| item.as_str()))
+        .filter(|message| !message.is_empty())
+        .map(str::to_owned)
 }
 
 fn primary_file(files: &[CivitaiFile]) -> Option<&CivitaiFile> {
@@ -356,12 +424,15 @@ fn primary_file(files: &[CivitaiFile]) -> Option<&CivitaiFile> {
     })
 }
 
-fn search_view(
-    model: &CivitaiModel,
-    host: CivitaiHost,
-    budget_bytes: u64,
-) -> Option<CatalogEntryView> {
-    let version = model.model_versions.first()?;
+fn compatible_version(model: &CivitaiModel) -> Option<&CivitaiVersion> {
+    model.model_versions.iter().find(|version| {
+        pipeline_for_base_model(version.base_model.as_deref().unwrap_or_default()).is_some()
+            && primary_file(&version.files).is_some()
+    })
+}
+
+fn search_view(model: &CivitaiModel, budget_bytes: u64) -> Option<CatalogEntryView> {
+    let version = compatible_version(model)?;
     let file = primary_file(&version.files)?;
     let base = version.base_model.as_deref().unwrap_or_default();
     let pipeline = pipeline_for_base_model(base)?;
@@ -370,7 +441,7 @@ fn search_view(
         .map(|value| (value * 1024.0) as u64)
         .unwrap_or(0);
     let estimated = estimate_memory(ModelTask::Diffusion, bytes, None);
-    let repo = repo_id(host, model.id, version.id);
+    let repo = repo_id(model.id, version.id);
     Some(CatalogEntryView {
         id: repo.clone(),
         name: model.name.clone(),
@@ -395,7 +466,7 @@ fn search_view(
         lock_reason: None,
         voices: Vec::new(),
         gated: false,
-        source: host.source_id().into(),
+        source: "civitai".into(),
     })
     .filter(|_| pipeline == "sd" || pipeline == "sdxl")
 }
@@ -498,6 +569,21 @@ mod tests {
         );
     }
 
+    #[test]
+    fn civitai_error_json_is_surfaced() {
+        assert_eq!(
+            civitai_error_message(
+                &json!({"error":"Model search is temporarily overloaded — please retry."})
+            ),
+            Some("Model search is temporarily overloaded — please retry.".into())
+        );
+        assert_eq!(
+            civitai_error_message(&json!({"message":"unauthorized"})),
+            Some("unauthorized".into())
+        );
+        assert_eq!(civitai_error_message(&json!({"items": []})), None);
+    }
+
     #[tokio::test]
     async fn search_returns_installable_sd_and_sdxl_checkpoints() {
         let server = mock_civitai().await;
@@ -511,15 +597,118 @@ mod tests {
             .iter()
             .map(|item| item.name.as_str())
             .collect::<Vec<_>>();
-        assert_eq!(names, ["Realistic Vision", "DreamShaper XL"]);
+        assert_eq!(names, ["Realistic Vision", "DreamShaper XL", "Pony Mix"]);
         assert_eq!(page.items[0].family, "SD 1.5");
         assert_eq!(page.items[1].family, "SDXL 1.0");
+        assert_eq!(page.items[2].family, "Pony");
+        assert_eq!(page.items[0].source, "civitai");
+        assert_eq!(page.items[0].repo_id, "civitai/models/4201@130072");
         assert!(page.items.iter().all(|item| item.installable));
         assert_eq!(page.next_cursor.as_deref(), Some("next-token"));
     }
 
+    #[tokio::test]
+    async fn search_surfaces_api_error_body() {
+        let server = serve(Router::new().route(
+            "/api/v1/models",
+            get(|| async {
+                Json(json!({"error":"Model search is temporarily overloaded — please retry."}))
+            }),
+        ))
+        .await;
+        let error = CivitaiClient::new(reqwest::Client::new(), CivitaiHost::Red, None)
+            .with_base_url(server)
+            .search("realistic", None, 32 * 1024 * 1024 * 1024)
+            .await
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("Model search is temporarily overloaded"));
+    }
+
+    #[tokio::test]
+    async fn search_omits_nsfw_when_query_is_present() {
+        let nsfw = std::sync::Arc::new(std::sync::Mutex::new(None::<String>));
+        let captured = nsfw.clone();
+        let server = serve(Router::new().route(
+            "/api/v1/models",
+            get(
+                move |axum::extract::Query(params): axum::extract::Query<
+                    std::collections::HashMap<String, String>,
+                >| {
+                    let captured = captured.clone();
+                    async move {
+                        *captured.lock().unwrap() = params.get("nsfw").cloned();
+                        Json(json!({"items": [], "metadata": {}}))
+                    }
+                },
+            ),
+        ))
+        .await;
+        CivitaiClient::new(reqwest::Client::new(), CivitaiHost::Red, None)
+            .with_base_url(server)
+            .search("realistic", None, 32 * 1024 * 1024 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(*nsfw.lock().unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn browse_keeps_nsfw_on_red() {
+        let nsfw = std::sync::Arc::new(std::sync::Mutex::new(None::<String>));
+        let captured = nsfw.clone();
+        let server = serve(Router::new().route(
+            "/api/v1/models",
+            get(
+                move |axum::extract::Query(params): axum::extract::Query<
+                    std::collections::HashMap<String, String>,
+                >| {
+                    let captured = captured.clone();
+                    async move {
+                        *captured.lock().unwrap() = params.get("nsfw").cloned();
+                        Json(json!({"items": [], "metadata": {}}))
+                    }
+                },
+            ),
+        ))
+        .await;
+        CivitaiClient::new(reqwest::Client::new(), CivitaiHost::Red, None)
+            .with_base_url(server)
+            .search("", None, 32 * 1024 * 1024 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(nsfw.lock().unwrap().as_deref(), Some("true"));
+    }
+
+    #[tokio::test]
+    async fn search_falls_back_when_first_host_errors() {
+        let failing = serve(Router::new().route(
+            "/api/v1/models",
+            get(|| async {
+                Json(json!({"error":"Model search is temporarily overloaded — please retry."}))
+            }),
+        ))
+        .await;
+        let ok = mock_civitai().await;
+        let page = search_hosts(
+            [
+                CivitaiClient::new(reqwest::Client::new(), CivitaiHost::Red, None)
+                    .with_base_url(failing),
+                CivitaiClient::new(reqwest::Client::new(), CivitaiHost::Com, None)
+                    .with_base_url(ok),
+            ],
+            "realistic",
+            None,
+            32 * 1024 * 1024 * 1024,
+        )
+        .await
+        .unwrap();
+        assert_eq!(page.items[0].name, "Realistic Vision");
+        assert_eq!(page.items[0].source, "civitai");
+    }
+
     async fn mock_civitai() -> String {
-        let app = Router::new().route(
+        serve(Router::new().route(
             "/api/v1/models",
             get(|| async {
                 Json(json!({
@@ -554,6 +743,30 @@ mod tests {
                             }]
                         }]
                     }, {
+                        "id": 77,
+                        "name": "Pony Mix",
+                        "modelVersions": [{
+                            "id": 1,
+                            "baseModel": "Flux.1 D",
+                            "files": [{
+                                "name": "flux.safetensors",
+                                "type": "Model",
+                                "sizeKB": 4096.0,
+                                "downloadUrl": "https://civitai.com/api/download/models/1",
+                                "metadata": { "format": "SafeTensor" }
+                            }]
+                        }, {
+                            "id": 2,
+                            "baseModel": "Pony",
+                            "files": [{
+                                "name": "pony.safetensors",
+                                "type": "Model",
+                                "sizeKB": 2048.0,
+                                "downloadUrl": "https://civitai.com/api/download/models/2",
+                                "metadata": { "format": "SafeTensor", "fp": "fp16" }
+                            }]
+                        }]
+                    }, {
                         "id": 999,
                         "name": "Flux Dev",
                         "modelVersions": [{
@@ -571,7 +784,11 @@ mod tests {
                     "metadata": { "nextCursor": "next-token" }
                 }))
             }),
-        );
+        ))
+        .await
+    }
+
+    async fn serve(app: Router) -> String {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         tokio::spawn(async move {

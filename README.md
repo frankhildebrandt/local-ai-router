@@ -18,7 +18,7 @@ A private, multi-protocol model gateway for Apple Silicon Macs. Local AI Router 
 - Named local client keys with per-key usage attribution
 - Built-in open-source chat playground, preconfigured for enabled chat models
 - Usage dashboard plus filterable metadata-only request logs, filtered CSV export and automatic 30-day retention
-- Curated MLX catalog with RAM-aware install, live Hugging Face MLX search, CivitAI / civitai.red image downloads, managed imports and resumable downloads
+- Curated MLX catalog with RAM-aware install, live Hugging Face MLX search, CivitAI image downloads, managed imports and resumable downloads
 - Stealth, Balanced, Performance and Custom resource profiles with automatic loading, idle unloading, prompt concurrency and per-model overrides
 - Native MLX chat, image and speech sidecars plus Metal-enabled llama.cpp
 
@@ -118,7 +118,7 @@ GGUF clients can opt into persistent llama.cpp KV snapshots by sending `X-Local-
 
 Local chat models accept OpenAI `input_audio` and the Local AI Router extension `input_video`, plus Gemini `inlineData` for image, audio and video. Anthropic remains text and image only. Remote media must be a data URL or public HTTPS URL; private, loopback and link-local destinations are blocked. Generated images and speech are returned to the client and are neither persisted nor written to request logs.
 
-`/v1/images/generations` for local targets supports `model`, `prompt`, `n: 1`, engine-compatible sizes and `response_format: "b64_json"`. The image sidecar runs FLUX.2, SDXL, and non-XL Stable Diffusion (SD 1.x / 2.x Diffusers layouts). Image search can download from Hugging Face, CivitAI, or civitai.red. `/v1/audio/speech` supports `model`, `input`, `voice`, `speed`, plus `wav` and `pcm`. New local speech targets must advertise `speech`; stored cloud targets may still use `audio`.
+`/v1/images/generations` for local targets supports `model`, `prompt`, `n: 1`, engine-compatible sizes and `response_format: "b64_json"`. The image sidecar runs FLUX.2, SDXL, and non-XL Stable Diffusion (SD 1.x / 2.x Diffusers layouts). Image search can download from Hugging Face or CivitAI. `/v1/audio/speech` supports `model`, `input`, `voice`, `speed`, plus `wav` and `pcm`. New local speech targets must advertise `speech`; stored cloud targets may still use `audio`.
 
 ## Provider notes
 
