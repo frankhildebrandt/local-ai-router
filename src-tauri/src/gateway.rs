@@ -24,6 +24,7 @@ use crate::{
         PublicProtocol, StreamTranslator,
     },
     providers::{provider_preset, AuthScheme, WireProtocol},
+    public_models::{advertised_public_models, resolve_public_model},
     routing::{
         evaluate_route, PolicyStatus, RouteEvaluationInput, RoutingAttemptRecord,
         RoutingEvaluation, RoutingMode,
@@ -256,24 +257,28 @@ async fn proxy(
             "The model field is required",
         );
     };
-    let Ok(Some(route)) = core.store.route(&alias).await else {
-        return request_error(
-            public_protocol,
-            StatusCode::NOT_FOUND,
-            "model_not_found",
-            "Unknown or unavailable model alias",
-        );
+    let resolved = match resolve_public_model(&core.store, &alias).await {
+        Ok(Some(resolved)) if resolved.route.enabled => resolved,
+        Ok(Some(_)) | Ok(None) => {
+            return request_error(
+                public_protocol,
+                StatusCode::NOT_FOUND,
+                "model_not_found",
+                "Unknown or unavailable model",
+            )
+        }
+        Err(_) => {
+            return request_error(
+                public_protocol,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "storage_error",
+                "Unable to resolve the requested model",
+            )
+        }
     };
-    if !route.enabled {
-        return request_error(
-            public_protocol,
-            StatusCode::NOT_FOUND,
-            "model_not_found",
-            "Unknown or unavailable model alias",
-        );
-    }
+    let route = resolved.route;
     let capability = endpoint_capability(uri.path());
-    let routing_policy = core.store.routing_policy(&alias).await.ok().flatten();
+    let routing_policy = resolved.policy;
     let adaptive_active = routing_policy.as_ref().is_some_and(|policy| {
         policy.mode == RoutingMode::Adaptive && policy.status == PolicyStatus::Active
     });
@@ -1223,38 +1228,7 @@ async fn proxy(
 }
 
 async fn advertised_routes(core: &AppCore) -> anyhow::Result<Vec<crate::domain::ModelRoute>> {
-    let mut routes = core.store.routes().await?;
-    for route in &mut routes {
-        let active = core
-            .store
-            .routing_policy(&route.alias)
-            .await?
-            .is_some_and(|policy| {
-                policy.mode == RoutingMode::Adaptive && policy.status == PolicyStatus::Active
-            });
-        if !active {
-            continue;
-        }
-        let mut capabilities = Vec::new();
-        for route_target in route.ordered_targets() {
-            if !route_target.enabled {
-                continue;
-            }
-            if let Some(target) = core.store.target(&route_target.id).await? {
-                if !target.enabled {
-                    continue;
-                }
-                for capability in target.capabilities {
-                    if !capabilities.contains(&capability) {
-                        capabilities.push(capability);
-                    }
-                }
-            }
-        }
-        capabilities.sort();
-        route.capabilities = capabilities;
-    }
-    Ok(routes)
+    advertised_public_models(&core.store).await
 }
 
 struct RoutingAttemptOutcome {
@@ -1761,6 +1735,36 @@ mod tests {
         router(Arc::new(core))
     }
 
+    async fn app_from_store(store: Store) -> Router {
+        let secrets: Arc<dyn SecretStore> = Arc::new(MemorySecrets::default());
+        secrets.set(LOCAL_API_KEY, "test-token").unwrap();
+        let core = AppCore::new(store.clone(), secrets).unwrap();
+        core.migrate_legacy_local_api_key().await.unwrap();
+        for target in store.targets().await.unwrap() {
+            core.local_activity()
+                .set_token(&target.id, "runtime-token".into());
+        }
+        router(Arc::new(core))
+    }
+
+    fn sample_target(id: &str, provider_model: &str, runtime_url: Option<String>) -> ModelTarget {
+        ModelTarget {
+            id: id.into(),
+            provider_id: None,
+            name: id.into(),
+            kind: TargetKind::Gguf,
+            provider_model: provider_model.into(),
+            local_path: None,
+            runtime_url,
+            wire_protocol: WireProtocol::OpenAiChat,
+            capabilities: vec!["chat".into()],
+            enabled: true,
+            state: "ready".into(),
+            size_bytes: None,
+            local: crate::storage::LocalModelMeta::default(),
+        }
+    }
+
     #[tokio::test]
     async fn models_rejects_missing_local_token() {
         let response = test_app()
@@ -1776,6 +1780,141 @@ mod tests {
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
         let body = response.into_body().collect().await.unwrap().to_bytes();
         assert!(String::from_utf8_lossy(&body).contains("invalid_api_key"));
+    }
+
+    #[tokio::test]
+    async fn models_lists_enabled_targets_and_global_adaptive_without_an_alias() {
+        let store = Store::memory().await.unwrap();
+        store
+            .upsert_target(&sample_target("local-chat", "qwen-3-5-4b", None))
+            .await
+            .unwrap();
+        let app = app_from_store(store).await;
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/models")
+                    .header("authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let payload: Value = serde_json::from_slice(&body).unwrap();
+        let ids: Vec<_> = payload["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|item| item["id"].as_str())
+            .collect();
+        assert_eq!(ids, vec!["adaptive-routing", "qwen-3-5-4b"]);
+    }
+
+    #[tokio::test]
+    async fn chat_completions_can_call_a_target_public_id_without_an_alias() {
+        let url = upstream(
+            StatusCode::OK,
+            json!({"id":"ok","choices":[{"message":{"role":"assistant","content":"direct"},"finish_reason":"stop"}]}),
+        )
+        .await;
+        let store = Store::memory().await.unwrap();
+        store
+            .upsert_target(&sample_target("local-chat", "qwen-3-5-4b", Some(url)))
+            .await
+            .unwrap();
+        let app = app_from_store(store).await;
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("authorization", "Bearer test-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"model":"qwen-3-5-4b","messages":[{"role":"user","content":"hello"}]}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get("x-local-ai-target").unwrap(),
+            "local-chat"
+        );
+    }
+
+    #[tokio::test]
+    async fn global_adaptive_routing_picks_by_task_quality_and_price() {
+        let cheap = upstream(
+            StatusCode::OK,
+            json!({"id":"cheap","choices":[{"message":{"role":"assistant","content":"cheap"},"finish_reason":"stop"}]}),
+        )
+        .await;
+        let expensive = upstream(
+            StatusCode::OK,
+            json!({"id":"expensive","choices":[{"message":{"role":"assistant","content":"expensive"},"finish_reason":"stop"}]}),
+        )
+        .await;
+        let store = Store::memory().await.unwrap();
+        store
+            .upsert_target(&sample_target("cheap", "cheap-coder", Some(cheap)))
+            .await
+            .unwrap();
+        store
+            .upsert_target(&sample_target(
+                "expensive",
+                "premium-coder",
+                Some(expensive),
+            ))
+            .await
+            .unwrap();
+        let mut cheap_profile =
+            crate::routing::TargetRoutingProfile::neutral("cheap", TargetKind::Gguf);
+        cheap_profile.task_quality.insert("coding".into(), 80.0);
+        cheap_profile.input_price_per_million = Some(1.0);
+        cheap_profile.output_price_per_million = Some(1.0);
+        store
+            .upsert_target_routing_profile(&cheap_profile)
+            .await
+            .unwrap();
+        let mut expensive_profile =
+            crate::routing::TargetRoutingProfile::neutral("expensive", TargetKind::Gguf);
+        expensive_profile.task_quality.insert("coding".into(), 90.0);
+        expensive_profile.input_price_per_million = Some(100.0);
+        expensive_profile.output_price_per_million = Some(100.0);
+        store
+            .upsert_target_routing_profile(&expensive_profile)
+            .await
+            .unwrap();
+        let app = app_from_store(store).await;
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("authorization", "Bearer test-token")
+                    .header("content-type", "application/json")
+                    .header("x-local-ai-task", "coding")
+                    .body(Body::from(
+                        r#"{"model":"adaptive-routing","messages":[{"role":"user","content":"write code"}]}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get("x-local-ai-target").unwrap(),
+            "cheap"
+        );
+        assert_eq!(
+            response.headers().get("x-local-ai-routing-mode").unwrap(),
+            "adaptive"
+        );
+        assert_eq!(response.headers().get("x-local-ai-task").unwrap(), "coding");
     }
 
     #[tokio::test]

@@ -476,6 +476,19 @@ impl AppCore {
         provider: &Provider,
         credential: &str,
     ) -> anyhow::Result<Vec<String>> {
+        Ok(self
+            .discover_provider_models(provider, credential)
+            .await?
+            .iter()
+            .filter_map(crate::model_catalog::extract_model_id)
+            .collect())
+    }
+
+    pub async fn discover_provider_models(
+        &self,
+        provider: &Provider,
+        credential: &str,
+    ) -> anyhow::Result<Vec<serde_json::Value>> {
         let preset = provider_preset(&provider.preset_id).context("provider preset missing")?;
         let mut request = self.client.get(format!(
             "{}/models",
@@ -507,13 +520,7 @@ impl AppCore {
             .and_then(|value| value.as_array())
             .into_iter()
             .flatten()
-            .filter_map(|value| {
-                value
-                    .get("id")
-                    .or_else(|| value.get("name"))
-                    .and_then(|id| id.as_str())
-                    .map(|id| id.trim_start_matches("models/").to_owned())
-            })
+            .cloned()
             .collect())
     }
 }

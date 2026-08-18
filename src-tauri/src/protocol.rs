@@ -717,6 +717,14 @@ pub fn validate_cross_protocol(protocol: PublicProtocol, value: &Value) -> anyho
             "text",
             "stream",
             "store",
+            // Dropped on translation: response extras and cache hints, not generation input.
+            "include",
+            "prompt_cache_key",
+            "prompt_cache_retention",
+            "previous_response_id",
+            "metadata",
+            "user",
+            "service_tier",
         ],
         PublicProtocol::Anthropic => &[
             "model",
@@ -1983,6 +1991,31 @@ mod tests {
                 .to_string()
                 .contains("vendor_secret_option")
         );
+        let responses = json!({"model":"m","input":"hello","vendor_secret_option":true});
+        assert!(
+            validate_cross_protocol(PublicProtocol::OpenAiResponses, &responses)
+                .unwrap_err()
+                .to_string()
+                .contains("vendor_secret_option")
+        );
+    }
+
+    #[test]
+    fn responses_include_and_cache_hints_are_dropped_when_translating_to_chat() {
+        let request = json!({
+            "model": "assistant",
+            "input": "hello",
+            "include": ["reasoning.encrypted_content"],
+            "prompt_cache_key": "hermes-session",
+            "prompt_cache_retention": "24h",
+            "store": false
+        });
+        validate_cross_protocol(PublicProtocol::OpenAiResponses, &request).unwrap();
+        let canonical = decode_request(PublicProtocol::OpenAiResponses, &request, None).unwrap();
+        let chat = encode_request(WireProtocol::OpenAiChat, &canonical, "m").unwrap();
+        assert_eq!(chat["messages"][0]["content"], "hello");
+        assert!(chat.get("include").is_none());
+        assert!(chat.get("prompt_cache_key").is_none());
     }
 
     #[test]

@@ -7,15 +7,17 @@ A private, multi-protocol model gateway for Apple Silicon Macs. Local AI Router 
 - Tauri 2 menu-bar app for macOS 15+
 - Presets for OpenAI, Anthropic, OpenRouter, Poolside, MiniMax, Z.AI, OpenCode Zen, Gemini, Groq, Cerebras, Mistral, Hugging Face, NVIDIA NIM and SambaNova
 - API keys and experimental OpenAI Subscription OAuth tokens stored in macOS Keychain
-- Provider model discovery and manually entered model IDs
-- Stable model aliases with ordered transient-error fallbacks
+- Provider model discovery and manually entered model IDs, with features and list prices from the provider API or known-model defaults
+- Configured local and cloud models are published automatically as public model IDs
+- Custom aliases remain optional named fallback stacks, with per-alias adaptive ranking off by default
+- Built-in `adaptive-routing` ranks every enabled model by task quality, price and inferred task
 - `/v1/chat/completions`, `/v1/responses`, Anthropic `/v1/messages`, and Gemini `/v1beta/models/*` with non-streaming, SSE, vision, audio/video input and tool translation
 - Local `/v1/images/generations` and `/v1/audio/speech` for installed MLX image and TTS models
 - Cloud proxying for Images, Audio and Moderations, including multipart uploads
 - Named local client keys with per-key usage attribution
-- Built-in open-source chat playground, preconfigured for enabled chat aliases
+- Built-in open-source chat playground, preconfigured for enabled chat models
 - Usage dashboard plus filterable metadata-only request logs, filtered CSV export and automatic 30-day retention
-- Curated MLX catalog with RAM-aware install, live Hugging Face MLX search, managed imports and resumable downloads
+- Curated MLX catalog with RAM-aware install, live Hugging Face MLX search, CivitAI / civitai.red image downloads, managed imports and resumable downloads
 - Stealth, Balanced, Performance and Custom resource profiles with automatic loading, idle unloading, prompt concurrency and per-model overrides
 - Native MLX chat, image and speech sidecars plus Metal-enabled llama.cpp
 
@@ -43,7 +45,7 @@ cargo test --manifest-path src-tauri/Cargo.toml
 
 ### SDK usage
 
-The same alias can be called through each supported client protocol, provided every target in its route has the required capabilities.
+The same public model ID can be called through each supported client protocol, provided the selected model has the required capabilities. Configured local and cloud models appear automatically; custom aliases are optional named stacks.
 
 OpenAI:
 
@@ -56,7 +58,7 @@ client = OpenAI(
 )
 
 response = client.chat.completions.create(
-    model="my-assistant",
+    model="adaptive-routing",
     messages=[{"role": "user", "content": "Hello"}],
 )
 ```
@@ -68,7 +70,7 @@ from anthropic import Anthropic
 
 client = Anthropic(base_url="http://127.0.0.1:11435", api_key="lar_...")
 message = client.messages.create(
-    model="my-assistant",
+    model="adaptive-routing",
     max_tokens=512,
     messages=[{"role": "user", "content": "Hello"}],
 )
@@ -84,14 +86,14 @@ client = genai.Client(
     api_key="lar_...",
     http_options=types.HttpOptions(base_url="http://127.0.0.1:11435/v1beta"),
 )
-response = client.models.generate_content(model="my-assistant", contents="Hello")
+response = client.models.generate_content(model="adaptive-routing", contents="Hello")
 ```
 
-Only configured aliases appear in `client.models.list()`. The alias must advertise the capability used by the endpoint.
+`client.models.list()` includes every enabled local and cloud model, custom routes, and `adaptive-routing` when at least one model is enabled. The selected model must advertise the capability used by the endpoint.
 
-### Adaptive task routing
+### Adaptive routing
 
-Every existing alias remains a fixed, ordered fallback route until an adaptive policy is explicitly activated. Adaptive policies filter candidates by capabilities, context, privacy and configured cost limits, then deterministically rank them by task quality, predicted cost, rolling latency, reliability and locality. Draft policies do not affect traffic; Shadow policies record the model they would select while the fixed route continues serving.
+`adaptive-routing` is always on and ranks every enabled model by task quality, predicted cost and the inferred task. Custom routes can still enable their own adaptive ranking; that extra stays off by default and only ranks the models in that route. Adaptive policies filter candidates by capabilities, context, privacy and configured cost limits, then deterministically rank them. Draft policies on custom routes do not affect traffic; Shadow policies record the model they would select while the fixed route continues serving.
 
 Clients can bypass automatic task rules with a local-only header:
 
@@ -100,7 +102,7 @@ curl http://127.0.0.1:11435/v1/chat/completions \
   -H "Authorization: Bearer lar_..." \
   -H "Content-Type: application/json" \
   -H "X-Local-AI-Task: coding" \
-  -d '{"model":"my-assistant","messages":[{"role":"user","content":"Refactor this function"}]}'
+  -d '{"model":"adaptive-routing","messages":[{"role":"user","content":"Refactor this function"}]}'
 ```
 
 The task header is validated and never forwarded upstream. Responses expose `X-Local-AI-Task`, `X-Local-AI-Target`, `X-Local-AI-Routing-Mode` and `X-Local-AI-Routing-Reason`. Routing profiles, policies and custom tasks can be previewed and imported/exported as `local-ai-router/routing-policy/v1` JSON; credentials, prompts, responses and measurement history are excluded.
@@ -115,7 +117,7 @@ GGUF clients can opt into persistent llama.cpp KV snapshots by sending `X-Local-
 
 Local chat models accept OpenAI `input_audio` and the Local AI Router extension `input_video`, plus Gemini `inlineData` for image, audio and video. Anthropic remains text and image only. Remote media must be a data URL or public HTTPS URL; private, loopback and link-local destinations are blocked. Generated images and speech are returned to the client and are neither persisted nor written to request logs.
 
-`/v1/images/generations` for local targets supports `model`, `prompt`, `n: 1`, engine-compatible sizes and `response_format: "b64_json"`. `/v1/audio/speech` supports `model`, `input`, `voice`, `speed`, plus `wav` and `pcm`. New local speech targets must advertise `speech`; stored cloud targets may still use `audio`.
+`/v1/images/generations` for local targets supports `model`, `prompt`, `n: 1`, engine-compatible sizes and `response_format: "b64_json"`. The image sidecar runs FLUX.2, SDXL, and non-XL Stable Diffusion (SD 1.x / 2.x Diffusers layouts). Image search can download from Hugging Face, CivitAI, or civitai.red. `/v1/audio/speech` supports `model`, `input`, `voice`, `speed`, plus `wav` and `pcm`. New local speech targets must advertise `speech`; stored cloud targets may still use `audio`.
 
 ## Provider notes
 

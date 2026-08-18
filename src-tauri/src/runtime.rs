@@ -378,16 +378,7 @@ impl RuntimeManager {
                         .arg(memory_mib.to_string());
                 }
                 if engine == "mlx_image" {
-                    command.args([
-                        "--pipeline",
-                        if target.local.catalog_id.as_deref() == Some("sdxl-turbo")
-                            || path.contains("sdxl")
-                        {
-                            "sdxl"
-                        } else {
-                            "flux2"
-                        },
-                    ]);
+                    command.args(["--pipeline", image_pipeline_for(target)]);
                 }
             }
             _ => unreachable!(),
@@ -862,6 +853,34 @@ fn tail_log(text: &str) -> String {
     text[start..].to_string()
 }
 
+pub fn image_pipeline_for(target: &ModelTarget) -> &'static str {
+    let catalog = target.local.catalog_id.as_deref().unwrap_or_default();
+    let path = target.local_path.as_deref().unwrap_or_default();
+    let haystack = format!("{catalog} {path}").to_ascii_lowercase();
+    if catalog == "sdxl-turbo"
+        || catalog == "sdxl"
+        || haystack.contains("sdxl")
+        || haystack.contains("stable-diffusion-xl")
+        || haystack.contains("sd-xl")
+        || Path::new(path).join("text_encoder_2").is_dir()
+    {
+        return "sdxl";
+    }
+    if catalog == "sd"
+        || catalog.starts_with("sd-")
+        || haystack.contains("stable-diffusion")
+        || haystack.contains("sd-1")
+        || haystack.contains("sd15")
+        || haystack.contains("sd-2")
+        || (Path::new(path).join("unet").join("config.json").is_file()
+            && Path::new(path).join("text_encoder").is_dir()
+            && !Path::new(path).join("text_encoder_2").is_dir())
+    {
+        return "sd";
+    }
+    "flux2"
+}
+
 pub fn bundled_bin_dir(resource_dir: &Path) -> PathBuf {
     let bundled = resource_dir.join("sidecars/bin");
     if bundled.join("llama-server-aarch64-apple-darwin").exists()
@@ -913,5 +932,79 @@ mod tests {
             duty_slices(25),
             (Duration::from_millis(100), Duration::from_millis(300))
         );
+    }
+
+    #[test]
+    fn image_pipeline_selects_sd_sdxl_and_flux_from_catalog_path_or_layout() {
+        assert_eq!(
+            image_pipeline_for(&image_target(Some("sd-2-1-base"), "/models/sd-2-1")),
+            "sd"
+        );
+        assert_eq!(
+            image_pipeline_for(&image_target(
+                None,
+                "/library/stabilityai--stable-diffusion-v1-5"
+            )),
+            "sd"
+        );
+        assert_eq!(
+            image_pipeline_for(&image_target(
+                None,
+                "/library/stabilityai--stable-diffusion-xl-base-1.0"
+            )),
+            "sdxl"
+        );
+        assert_eq!(
+            image_pipeline_for(&image_target(Some("sdxl-turbo"), "/models/anything")),
+            "sdxl"
+        );
+        assert_eq!(
+            image_pipeline_for(&image_target(None, "/library/org--sdxl-lightning")),
+            "sdxl"
+        );
+        assert_eq!(
+            image_pipeline_for(&image_target(Some("flux2-klein-4b"), "/models/flux")),
+            "flux2"
+        );
+
+        let root = tempfile::tempdir().unwrap();
+        let sd = root.path().join("imported-sd");
+        std::fs::create_dir_all(sd.join("unet")).unwrap();
+        std::fs::create_dir_all(sd.join("text_encoder")).unwrap();
+        std::fs::write(sd.join("unet/config.json"), "{}").unwrap();
+        assert_eq!(
+            image_pipeline_for(&image_target(None, sd.to_str().unwrap())),
+            "sd"
+        );
+
+        let sdxl = root.path().join("imported-sdxl");
+        std::fs::create_dir_all(sdxl.join("text_encoder_2")).unwrap();
+        assert_eq!(
+            image_pipeline_for(&image_target(None, sdxl.to_str().unwrap())),
+            "sdxl"
+        );
+    }
+
+    fn image_target(catalog_id: Option<&str>, path: &str) -> ModelTarget {
+        ModelTarget {
+            id: "img".into(),
+            provider_id: None,
+            name: "Image".into(),
+            kind: TargetKind::Mlx,
+            provider_model: "image".into(),
+            local_path: Some(path.into()),
+            runtime_url: None,
+            wire_protocol: crate::providers::WireProtocol::OpenAiChat,
+            capabilities: vec!["images".into()],
+            enabled: true,
+            state: "stopped".into(),
+            size_bytes: None,
+            local: crate::storage::LocalModelMeta {
+                catalog_id: catalog_id.map(str::to_owned),
+                runtime_engine: Some("mlx_image".into()),
+                task: Some("image".into()),
+                ..Default::default()
+            },
+        }
     }
 }

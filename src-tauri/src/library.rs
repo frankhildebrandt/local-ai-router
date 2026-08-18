@@ -217,17 +217,60 @@ pub async fn validate_model(path: &Path, kind: &TargetKind) -> anyhow::Result<()
             }
         }
         TargetKind::Mlx => {
-            if !path.is_dir() || !path.join("config.json").is_file() {
+            if !path.is_dir() {
                 anyhow::bail!("MLX model must be a directory containing config.json");
             }
-            let has_weights = std::fs::read_dir(path)?.flatten().any(|entry| {
-                entry.path().extension().and_then(|value| value.to_str()) == Some("safetensors")
-            });
+            let has_weights = has_safetensors(path)?;
             if !has_weights {
                 anyhow::bail!("MLX model has no safetensors weights");
             }
+            let mlx_config = path.join("config.json").is_file();
+            let diffusion = path.join("unet").join("config.json").is_file()
+                || path.join("model_index.json").is_file();
+            if !mlx_config && !diffusion && !is_single_weight_checkpoint(path)? {
+                anyhow::bail!("MLX model must be a directory containing config.json");
+            }
         }
         _ => anyhow::bail!("not a local model kind"),
+    }
+    Ok(())
+}
+
+fn has_safetensors(path: &Path) -> anyhow::Result<bool> {
+    fn walk(path: &Path) -> anyhow::Result<bool> {
+        if path.is_file() {
+            return Ok(path.extension().and_then(|value| value.to_str()) == Some("safetensors"));
+        }
+        if !path.is_dir() {
+            return Ok(false);
+        }
+        for entry in std::fs::read_dir(path)? {
+            if walk(&entry?.path())? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+    walk(path)
+}
+
+fn is_single_weight_checkpoint(path: &Path) -> anyhow::Result<bool> {
+    let mut weights = Vec::new();
+    collect_safetensors(path, &mut weights)?;
+    Ok(weights.len() == 1)
+}
+
+fn collect_safetensors(path: &Path, out: &mut Vec<PathBuf>) -> anyhow::Result<()> {
+    if path.is_file() {
+        if path.extension().and_then(|value| value.to_str()) == Some("safetensors") {
+            out.push(path.to_path_buf());
+        }
+        return Ok(());
+    }
+    if path.is_dir() {
+        for entry in std::fs::read_dir(path)? {
+            collect_safetensors(&entry?.path(), out)?;
+        }
     }
     Ok(())
 }
@@ -313,5 +356,24 @@ mod tests {
             safe_model_path("weights/model-01.safetensors").unwrap(),
             PathBuf::from("weights/model-01.safetensors")
         );
+    }
+
+    #[tokio::test]
+    async fn accepts_diffusers_sd_layout_and_single_file_checkpoints() {
+        let temp = tempfile::tempdir().unwrap();
+        let sd = temp.path().join("sd");
+        fs::create_dir_all(sd.join("unet")).await.unwrap();
+        fs::write(sd.join("unet/config.json"), b"{}").await.unwrap();
+        fs::write(sd.join("unet/model.safetensors"), b"weights")
+            .await
+            .unwrap();
+        validate_model(&sd, &TargetKind::Mlx).await.unwrap();
+
+        let checkpoint = temp.path().join("civitai");
+        fs::create_dir_all(&checkpoint).await.unwrap();
+        fs::write(checkpoint.join("model.safetensors"), b"weights")
+            .await
+            .unwrap();
+        validate_model(&checkpoint, &TargetKind::Mlx).await.unwrap();
     }
 }

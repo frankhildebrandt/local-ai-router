@@ -19,7 +19,9 @@ use crate::{
         RoutingTaskDefinition, TargetRoutingProfile,
     },
     runtime::{RuntimeManager, RuntimeStatus},
-    secrets::{local_api_key_account, provider_account, HF_ACCOUNT, LOCAL_API_KEY},
+    secrets::{
+        local_api_key_account, provider_account, CIVITAI_ACCOUNT, HF_ACCOUNT, LOCAL_API_KEY,
+    },
     storage::{
         LocalApiKey, LogFacets, LogQuery, LogResult, ModelTarget, Provider, ProviderModel, Store,
         UsageData,
@@ -105,10 +107,28 @@ pub struct DownloadModelInput {
     pub kind: TargetKind,
     pub alias_model: String,
     pub capabilities: Vec<String>,
+    #[serde(default)]
+    pub source: Option<String>,
 }
 
 fn err(error: impl std::fmt::Display) -> String {
     error.to_string()
+}
+
+fn provider_model_from_discovery(
+    preset_id: &str,
+    model_id: &str,
+    api: Option<&serde_json::Value>,
+) -> ProviderModel {
+    let meta = crate::model_catalog::resolve_model_metadata(model_id, api);
+    ProviderModel {
+        id: model_id.to_owned(),
+        wire_protocol: crate::providers::inferred_protocol(preset_id, model_id),
+        capabilities: meta.capabilities,
+        context_window: Some(meta.context_window).filter(|value| *value > 0),
+        input_price_per_million: meta.input_price_per_million,
+        output_price_per_million: meta.output_price_per_million,
+    }
 }
 
 #[tauri::command]
@@ -195,7 +215,7 @@ pub async fn client_chat(
 ) -> Result<ClientChatResponse, String> {
     let model = input.model.trim();
     if model.is_empty() {
-        return Err("a model alias is required".into());
+        return Err("a model is required".into());
     }
     if input.messages.is_empty() || input.messages.len() > 200 {
         return Err("a chat must contain between 1 and 200 messages".into());
@@ -426,41 +446,31 @@ pub async fn sync_provider_models(
         .await
         .map_err(err)?
         .ok_or("provider not found")?;
-    let model_ids = if provider.auth_mode == AuthMode::OpenAiSubscription {
-        vec![
-            "gpt-5.6-sol".into(),
-            "gpt-5.6-terra".into(),
-            "gpt-5.6-luna".into(),
-        ]
+    let models = if provider.preset_id == "opencode_zen" {
+        Vec::new()
+    } else if provider.auth_mode == AuthMode::OpenAiSubscription {
+        ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"]
+            .into_iter()
+            .map(|model_id| provider_model_from_discovery(&provider.preset_id, model_id, None))
+            .collect()
     } else {
         let credential = state.core.provider_api_key(&id).map_err(err)?;
         state
             .core
-            .validate_provider(&provider, &credential)
+            .discover_provider_models(&provider, &credential)
             .await
             .map_err(err)?
+            .iter()
+            .filter_map(|raw| {
+                let model_id = crate::model_catalog::extract_model_id(raw)?;
+                Some(provider_model_from_discovery(
+                    &provider.preset_id,
+                    &model_id,
+                    Some(raw),
+                ))
+            })
+            .collect()
     };
-    let trusted_capabilities = provider.preset_id == "openai_subscription";
-    let models = model_ids
-        .into_iter()
-        .filter(|_| provider.preset_id != "opencode_zen")
-        .map(|model_id| ProviderModel {
-            wire_protocol: crate::providers::inferred_protocol(&provider.preset_id, &model_id),
-            id: model_id,
-            capabilities: if trusted_capabilities {
-                vec![
-                    "chat".into(),
-                    "streaming".into(),
-                    "tools".into(),
-                    "vision".into(),
-                    "reasoning".into(),
-                    "structured_output".into(),
-                ]
-            } else {
-                vec!["chat".into(), "streaming".into()]
-            },
-        })
-        .collect::<Vec<_>>();
     state
         .core
         .store
@@ -483,6 +493,8 @@ pub async fn cached_provider_models(
 pub struct SearchCatalogInput {
     pub query: Option<String>,
     pub cursor: Option<String>,
+    #[serde(default)]
+    pub source: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -526,6 +538,17 @@ async fn hub_client(state: &AppServices) -> Result<crate::hub::HubClient, String
     ))
 }
 
+fn civitai_client(
+    state: &AppServices,
+    host: crate::civitai::CivitaiHost,
+) -> Result<crate::civitai::CivitaiClient, String> {
+    Ok(crate::civitai::CivitaiClient::new(
+        crate::hub::hub_http_client().map_err(err)?,
+        host,
+        state.core.secrets.get(CIVITAI_ACCOUNT).map_err(err)?,
+    ))
+}
+
 #[tauri::command]
 pub async fn list_local_catalog(
     state: State<'_, AppServices>,
@@ -545,6 +568,16 @@ pub async fn search_mlx_catalog(
     input: SearchCatalogInput,
 ) -> Result<crate::hub::SearchPage, String> {
     let (_, budget) = budget_from_store(&state.core.store).await.map_err(err)?;
+    if let Some(host) = crate::civitai::CivitaiHost::parse(input.source.as_deref().unwrap_or("")) {
+        return civitai_client(&state, host)?
+            .search(
+                input.query.as_deref().unwrap_or(""),
+                input.cursor.as_deref(),
+                budget,
+            )
+            .await
+            .map_err(err);
+    }
     hub_client(&state)
         .await?
         .search(
@@ -562,6 +595,13 @@ pub async fn inspect_mlx_model(
     input: InspectModelInput,
 ) -> Result<crate::hub::ModelInspection, String> {
     let (_, budget) = budget_from_store(&state.core.store).await.map_err(err)?;
+    if crate::civitai::is_civitai_repo(&input.repo_id) {
+        let host = crate::civitai::host_from_repo(&input.repo_id);
+        return civitai_client(&state, host)?
+            .inspect(&input.repo_id, budget)
+            .await
+            .map_err(err);
+    }
     let has_token = state.core.secrets.get(HF_ACCOUNT).map_err(err)?.is_some();
     hub_client(&state)
         .await?
@@ -576,7 +616,6 @@ pub async fn install_catalog_model(
     input: InstallCatalogInput,
 ) -> Result<crate::storage::InstallJob, String> {
     let (_, budget) = budget_from_store(&state.core.store).await.map_err(err)?;
-    let has_token = state.core.secrets.get(HF_ACCOUNT).map_err(err)?.is_some();
     let curated = input
         .catalog_id
         .as_deref()
@@ -589,11 +628,24 @@ pub async fn install_catalog_model(
                 .into());
         }
     }
-    let inspection = hub_client(&state)
-        .await?
-        .inspect(&input.repo_id, input.revision.as_deref(), budget, has_token)
-        .await
-        .map_err(err)?;
+    let inspection = if crate::civitai::is_civitai_repo(&input.repo_id) {
+        let host = crate::civitai::host_from_repo(&input.repo_id);
+        civitai_client(&state, host)?
+            .inspect(&input.repo_id, budget)
+            .await
+            .map_err(err)?
+    } else {
+        let has_token = state.core.secrets.get(HF_ACCOUNT).map_err(err)?.is_some();
+        hub_client(&state)
+            .await?
+            .inspect(&input.repo_id, input.revision.as_deref(), budget, has_token)
+            .await
+            .map_err(err)?
+    };
+    let catalog_id = input.catalog_id.clone().or_else(|| {
+        crate::civitai::is_civitai_repo(&input.repo_id)
+            .then(|| crate::civitai::catalog_id_from_inspection(&inspection).to_string())
+    });
     let (engine, task, capabilities, estimated, name) = if let Some(model) = curated {
         (
             model.runtime_engine.to_string(),
@@ -629,7 +681,7 @@ pub async fn install_catalog_model(
         .install
         .start(
             inspection,
-            input.catalog_id,
+            catalog_id,
             input.confirm_over_budget,
             budget,
             name,
@@ -683,13 +735,80 @@ pub async fn list_targets(state: State<'_, AppServices>) -> Result<Vec<ModelTarg
     state.core.store.targets().await.map_err(err)
 }
 
+fn apply_known_model_defaults(target: &mut ModelTarget) {
+    let meta = crate::model_catalog::resolve_model_metadata(&target.provider_model, None);
+    if crate::model_catalog::capabilities_are_placeholder(&target.capabilities)
+        && meta.source != crate::model_catalog::MetadataSource::Fallback
+    {
+        target.capabilities = meta.capabilities;
+    }
+}
+
+async fn seed_target_routing_profile(store: &Store, target: &ModelTarget) -> anyhow::Result<()> {
+    let mut profile = crate::routing::TargetRoutingProfile::for_target(target);
+    if let Some(provider_id) = &target.provider_id {
+        if let Some(cached) = store
+            .provider_models(provider_id)
+            .await?
+            .into_iter()
+            .find(|model| model.id == target.provider_model)
+        {
+            if let Some(value) = cached.input_price_per_million {
+                profile.input_price_per_million = Some(value);
+            }
+            if let Some(value) = cached.output_price_per_million {
+                profile.output_price_per_million = Some(value);
+            }
+            if let Some(value) = cached.context_window.filter(|window| *window > 0) {
+                profile.context_window = value;
+            }
+        }
+    }
+    store.upsert_target_routing_profile(&profile).await
+}
+
+async fn persist_target(store: &Store, mut target: ModelTarget) -> Result<ModelTarget, String> {
+    if let Some(provider_id) = &target.provider_id {
+        if let Some(cached) = store
+            .provider_models(provider_id)
+            .await
+            .map_err(err)?
+            .into_iter()
+            .find(|model| model.id == target.provider_model)
+        {
+            if crate::model_catalog::capabilities_are_placeholder(&target.capabilities) {
+                target.capabilities = cached.capabilities;
+            }
+        }
+    }
+    apply_known_model_defaults(&mut target);
+    let seed_profile = store
+        .target_routing_profile(&target.id)
+        .await
+        .map_err(err)?
+        .is_none();
+    store.upsert_target(&target).await.map_err(err)?;
+    if seed_profile {
+        seed_target_routing_profile(store, &target)
+            .await
+            .map_err(err)?;
+    }
+    Ok(target)
+}
+
+#[tauri::command]
+pub async fn lookup_model_metadata(
+    model: String,
+) -> Result<crate::model_catalog::ModelMetadata, String> {
+    Ok(crate::model_catalog::resolve_model_metadata(&model, None))
+}
+
 #[tauri::command]
 pub async fn save_target(
     state: State<'_, AppServices>,
     target: ModelTarget,
 ) -> Result<ModelTarget, String> {
-    state.core.store.upsert_target(&target).await.map_err(err)?;
-    Ok(target)
+    persist_target(&state.core.store, target).await
 }
 
 #[tauri::command]
@@ -725,8 +844,7 @@ pub async fn import_local_model(
         size_bytes: Some(imported.size_bytes as i64),
         local: crate::storage::LocalModelMeta::default(),
     };
-    state.core.store.upsert_target(&target).await.map_err(err)?;
-    Ok(target)
+    persist_target(&state.core.store, target).await
 }
 
 #[tauri::command]
@@ -759,8 +877,7 @@ pub async fn download_local_model(
         size_bytes: Some(imported.size_bytes as i64),
         local: crate::storage::LocalModelMeta::default(),
     };
-    state.core.store.upsert_target(&target).await.map_err(err)?;
-    Ok(target)
+    persist_target(&state.core.store, target).await
 }
 
 #[tauri::command]
@@ -823,12 +940,26 @@ pub async fn list_routes(state: State<'_, AppServices>) -> Result<Vec<ModelRoute
 }
 
 #[tauri::command]
+pub async fn list_public_models(
+    state: State<'_, AppServices>,
+) -> Result<Vec<crate::public_models::PublicModel>, String> {
+    crate::public_models::list_public_models(&state.core.store)
+        .await
+        .map_err(err)
+}
+
+#[tauri::command]
 pub async fn save_route(
     state: State<'_, AppServices>,
     mut route: ModelRoute,
 ) -> Result<ModelRoute, String> {
     if route.alias.trim().is_empty() || route.alias.contains(char::is_whitespace) {
         return Err("alias must be non-empty and contain no whitespace".into());
+    }
+    if crate::public_models::is_reserved_public_model_id(&route.alias) {
+        return Err(
+            "adaptive-routing is a built-in model and cannot be used as a custom alias".into(),
+        );
     }
     let mut shared: Option<Vec<String>> = None;
     for route_target in route.targets.iter().filter(|target| target.enabled) {
@@ -1055,21 +1186,15 @@ pub async fn simulate_routing(
     state: State<'_, AppServices>,
     input: RoutingSimulationInput,
 ) -> Result<crate::routing::RoutingEvaluation, String> {
-    let route = state
-        .core
-        .store
-        .route(&input.alias)
+    let resolved = crate::public_models::resolve_public_model(&state.core.store, &input.alias)
         .await
         .map_err(err)?
         .ok_or("route not found")?;
+    let route = resolved.route;
     let policy = match input.policy {
         Some(policy) => policy,
-        None => state
-            .core
-            .store
-            .routing_policy(&input.alias)
-            .await
-            .map_err(err)?
+        None => resolved
+            .policy
             .unwrap_or_else(|| RoutingPolicy::new(&input.alias)),
     };
     let mut canonical = crate::protocol::CanonicalRequest {
@@ -1387,6 +1512,16 @@ pub async fn get_settings(
             .is_some()
             .to_string(),
     );
+    result.insert(
+        "has_civitai_token".into(),
+        state
+            .core
+            .secrets
+            .get(CIVITAI_ACCOUNT)
+            .map_err(err)?
+            .is_some()
+            .to_string(),
+    );
     Ok(result)
 }
 
@@ -1616,6 +1751,19 @@ pub fn save_hugging_face_token(state: State<'_, AppServices>, token: String) -> 
 }
 
 #[tauri::command]
+pub fn save_civitai_token(state: State<'_, AppServices>, token: String) -> Result<(), String> {
+    if token.trim().is_empty() {
+        state.core.secrets.delete(CIVITAI_ACCOUNT).map_err(err)
+    } else {
+        state
+            .core
+            .secrets
+            .set(CIVITAI_ACCOUNT, token.trim())
+            .map_err(err)
+    }
+}
+
+#[tauri::command]
 pub async fn forget_all_credentials(state: State<'_, AppServices>) -> Result<(), String> {
     for provider in state.core.store.providers().await.map_err(err)? {
         state
@@ -1640,5 +1788,6 @@ pub async fn forget_all_credentials(state: State<'_, AppServices>) -> Result<(),
         }
     }
     state.core.secrets.delete(HF_ACCOUNT).map_err(err)?;
+    state.core.secrets.delete(CIVITAI_ACCOUNT).map_err(err)?;
     state.core.secrets.delete(LOCAL_API_KEY).map_err(err)
 }

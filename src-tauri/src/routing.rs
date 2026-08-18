@@ -227,6 +227,20 @@ impl TargetRoutingProfile {
         }
         Ok(())
     }
+
+    pub fn for_target(target: &crate::storage::ModelTarget) -> Self {
+        let meta = crate::model_catalog::resolve_model_metadata(&target.provider_model, None);
+        let mut profile = Self::neutral(&target.id, target.kind.clone());
+        profile.context_window = meta.context_window;
+        if matches!(target.kind, TargetKind::Cloud) {
+            profile.input_price_per_million = meta.input_price_per_million;
+            profile.output_price_per_million = meta.output_price_per_million;
+        }
+        if !meta.task_quality.is_empty() {
+            profile.task_quality = meta.task_quality;
+        }
+        profile
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -336,7 +350,7 @@ pub async fn evaluate_route(
         let profile = store
             .target_routing_profile(&target.id)
             .await?
-            .unwrap_or_else(|| TargetRoutingProfile::neutral(&target.id, target.kind.clone()));
+            .unwrap_or_else(|| TargetRoutingProfile::for_target(&target));
         let stats = store
             .routing_stats(&target.id, &selected.task, input.streaming)
             .await?;
@@ -989,5 +1003,28 @@ mod tests {
             .excluded
             .iter()
             .any(|item| item.target_id == "small" && item.reason == "context_window"));
+    }
+
+    #[test]
+    fn known_cloud_targets_get_catalog_prices_without_a_saved_profile() {
+        let target = crate::storage::ModelTarget {
+            id: "t".into(),
+            provider_id: None,
+            name: "GPT-4o".into(),
+            kind: TargetKind::Cloud,
+            provider_model: "openai/gpt-4o".into(),
+            local_path: None,
+            runtime_url: None,
+            wire_protocol: crate::providers::WireProtocol::OpenAiChat,
+            capabilities: vec!["chat".into()],
+            enabled: true,
+            state: "ready".into(),
+            size_bytes: None,
+            local: crate::storage::LocalModelMeta::default(),
+        };
+        let profile = TargetRoutingProfile::for_target(&target);
+        assert_eq!(profile.input_price_per_million, Some(2.50));
+        assert_eq!(profile.output_price_per_million, Some(10.00));
+        assert!(profile.task_quality.get("coding").copied().unwrap() > 50.0);
     }
 }

@@ -16,7 +16,9 @@ copy_first() {
   local candidate
   for candidate in "$@"; do
     if [[ -f "$candidate" ]]; then
+      chmod u+w "$dest" 2>/dev/null || true
       cp "$candidate" "$dest"
+      chmod u+w "$dest"
       return 0
     fi
   done
@@ -54,3 +56,4 @@ copy_first "$LICENSE_DIR/kokoro-swift-LICENSE" \
 
 "$PROJECT_DIR/scripts/build-mlx-metallib.sh" "$PROJECT_DIR/sidecars/mlx-server" "$BIN_DIR"
 chmod +x "$BIN_DIR"/*-aarch64-apple-darwin
+chmod u+w "$LICENSE_DIR"/* 2>/dev/null || true

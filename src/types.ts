@@ -84,6 +84,18 @@ export interface ProviderModel {
   id: string;
   wire_protocol: WireProtocol;
   capabilities: string[];
+  context_window?: number | null;
+  input_price_per_million?: number | null;
+  output_price_per_million?: number | null;
+}
+
+export interface ModelMetadata {
+  capabilities: string[];
+  context_window: number;
+  input_price_per_million: number | null;
+  output_price_per_million: number | null;
+  task_quality: Record<string, number>;
+  source: "provider_api" | "catalog" | "fallback";
 }
 
 export interface RouteTarget {
@@ -99,6 +111,12 @@ export interface ModelRoute {
   enabled: boolean;
   capabilities: string[];
   targets: RouteTarget[];
+}
+
+export interface PublicModel {
+  id: string;
+  source: "adaptive" | "target" | "alias";
+  capabilities: string[];
 }
 
 export type RoutingPolicyStatus = "draft" | "shadow" | "active";
@@ -284,6 +302,7 @@ export interface CatalogEntry {
   lock_reason: string | null;
   voices: string[];
   gated: boolean;
+  source?: string;
 }
 
 export interface LocalCatalog {

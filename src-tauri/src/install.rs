@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -19,10 +19,12 @@ use uuid::Uuid;
 
 use crate::{
     catalog::{classify_ram, curated_by_id, unique_alias, RamFit},
-    domain::{ModelRoute, RouteTarget, TargetKind},
+    domain::TargetKind,
     hub::{required_weight_files, HubClient, ModelInspection},
     library::{self, safe_model_path},
     providers::WireProtocol,
+    public_models::{preferred_public_id, GLOBAL_ADAPTIVE_MODEL_ID},
+    routing::TargetRoutingProfile,
     secrets::SecretStore,
     storage::{InstallJob, LocalModelMeta, ModelTarget, Store},
 };
@@ -362,7 +364,8 @@ impl InstallManager {
         job.status = "downloading".into();
         self.save_and_emit(&job).await?;
         let hub = self.hub().await?;
-        let token = self.secrets.get(crate::secrets::HF_ACCOUNT)?;
+        let hf_token = self.secrets.get(crate::secrets::HF_ACCOUNT)?;
+        let civitai_token = self.secrets.get(crate::secrets::CIVITAI_ACCOUNT)?;
         let mut downloaded = 0u64;
         let total = inspection.download_bytes;
         for file in &files {
@@ -384,13 +387,19 @@ impl InstallManager {
             if let Some(parent) = destination.parent() {
                 fs::create_dir_all(parent).await?;
             }
-            let url = hub
-                .download_url(&inspection.repo_id, &inspection.revision, file)
-                .await;
+            let (url, token) = if let Some(file_url) = inspection.file_url.as_deref() {
+                (file_url.to_owned(), civitai_token.as_deref())
+            } else {
+                (
+                    hub.download_url(&inspection.repo_id, &inspection.revision, file)
+                        .await,
+                    hf_token.as_deref(),
+                )
+            };
             let base = downloaded;
             downloaded += match download_resumable(
                 &self.client,
-                token.as_deref(),
+                token,
                 &url,
                 &destination,
                 &cancel,
@@ -432,7 +441,14 @@ impl InstallManager {
             unique_library_dir(&self.library, &inspection.repo_id, &inspection.revision).await;
         fs::create_dir_all(destination.parent().unwrap()).await?;
         fs::rename(&staging, &destination).await?;
-        let taken = self.store.aliases().await?.into_iter().collect();
+        let mut taken: HashSet<String> = self.store.aliases().await?.into_iter().collect();
+        taken.insert(GLOBAL_ADAPTIVE_MODEL_ID.to_owned());
+        for existing in self.store.targets().await? {
+            taken.insert(preferred_public_id(
+                &existing.provider_model,
+                &existing.name,
+            ));
+        }
         let preferred = curated_by_id(job.catalog_id.as_deref().unwrap_or(""))
             .map(|model| model.alias.to_string())
             .unwrap_or_else(|| crate::hub::slug(&inspection.repo_id));
@@ -471,18 +487,7 @@ impl InstallManager {
         };
         self.store.upsert_target(&target).await?;
         self.store
-            .upsert_route(&ModelRoute {
-                alias: alias.clone(),
-                enabled: true,
-                capabilities: target.capabilities.clone(),
-                targets: vec![RouteTarget {
-                    id: target.id.clone(),
-                    kind: TargetKind::Mlx,
-                    model: alias.clone(),
-                    priority: 10,
-                    enabled: true,
-                }],
-            })
+            .upsert_target_routing_profile(&TargetRoutingProfile::for_target(&target))
             .await?;
         job.alias = Some(alias);
         job.status = "completed".into();
@@ -692,7 +697,8 @@ mod tests {
             .route(targets[0].provider_model.as_str())
             .await
             .unwrap()
-            .is_some());
+            .is_none());
+        assert!(!targets[0].provider_model.is_empty());
         assert!(!root.path().join("library/.staging").join(&job.id).exists());
     }
 

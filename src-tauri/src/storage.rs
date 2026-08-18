@@ -86,11 +86,17 @@ pub struct InstallJob {
     pub updated_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ProviderModel {
     pub id: String,
     pub wire_protocol: WireProtocol,
     pub capabilities: Vec<String>,
+    #[serde(default)]
+    pub context_window: Option<u64>,
+    #[serde(default)]
+    pub input_price_per_million: Option<f64>,
+    #[serde(default)]
+    pub output_price_per_million: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -220,7 +226,7 @@ impl Store {
             "CREATE TABLE IF NOT EXISTS routes (alias TEXT PRIMARY KEY, enabled INTEGER NOT NULL DEFAULT 1, capabilities TEXT NOT NULL)",
             "CREATE TABLE IF NOT EXISTS route_targets (alias TEXT NOT NULL, target_id TEXT NOT NULL, priority INTEGER NOT NULL, PRIMARY KEY(alias, target_id), FOREIGN KEY(alias) REFERENCES routes(alias) ON DELETE CASCADE, FOREIGN KEY(target_id) REFERENCES model_targets(id) ON DELETE CASCADE)",
             "CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
-            "CREATE TABLE IF NOT EXISTS provider_models (provider_id TEXT NOT NULL, model_id TEXT NOT NULL, synced_at TEXT NOT NULL, wire_protocol TEXT NOT NULL DEFAULT 'open_ai_chat', capabilities TEXT NOT NULL DEFAULT '[\"chat\",\"streaming\"]', PRIMARY KEY(provider_id, model_id), FOREIGN KEY(provider_id) REFERENCES providers(id) ON DELETE CASCADE)",
+            "CREATE TABLE IF NOT EXISTS provider_models (provider_id TEXT NOT NULL, model_id TEXT NOT NULL, synced_at TEXT NOT NULL, wire_protocol TEXT NOT NULL DEFAULT 'open_ai_chat', capabilities TEXT NOT NULL DEFAULT '[\"chat\",\"streaming\"]', metadata TEXT NOT NULL DEFAULT '{}', PRIMARY KEY(provider_id, model_id), FOREIGN KEY(provider_id) REFERENCES providers(id) ON DELETE CASCADE)",
             "CREATE TABLE IF NOT EXISTS local_api_keys (id TEXT PRIMARY KEY, name TEXT NOT NULL, token_hash BLOB NOT NULL, created_at TEXT NOT NULL, last_used_at TEXT, revoked_at TEXT)",
             "CREATE TABLE IF NOT EXISTS request_logs (id TEXT PRIMARY KEY, created_at TEXT NOT NULL, endpoint TEXT NOT NULL, alias TEXT, target TEXT, attempts INTEGER NOT NULL, status INTEGER NOT NULL, latency_ms INTEGER NOT NULL, input_tokens INTEGER, output_tokens INTEGER, error_code TEXT)",
             "CREATE INDEX IF NOT EXISTS request_logs_created_idx ON request_logs(created_at DESC)",
@@ -317,6 +323,16 @@ impl Store {
             .any(|column| column.get::<String, _>("name") == "capabilities")
         {
             sqlx::query("ALTER TABLE provider_models ADD COLUMN capabilities TEXT NOT NULL DEFAULT '[\"chat\",\"streaming\"]'").execute(&self.pool).await?;
+        }
+        if !model_columns
+            .iter()
+            .any(|column| column.get::<String, _>("name") == "metadata")
+        {
+            sqlx::query(
+                "ALTER TABLE provider_models ADD COLUMN metadata TEXT NOT NULL DEFAULT '{}'",
+            )
+            .execute(&self.pool)
+            .await?;
         }
         for (name, definition) in [
             ("task", "TEXT"),
@@ -504,13 +520,14 @@ impl Store {
         let synced_at = Utc::now().to_rfc3339();
         for model in models {
             sqlx::query(
-                "INSERT INTO provider_models(provider_id, model_id, synced_at,wire_protocol,capabilities) VALUES(?,?,?,?,?)",
+                "INSERT INTO provider_models(provider_id, model_id, synced_at,wire_protocol,capabilities,metadata) VALUES(?,?,?,?,?,?)",
             )
             .bind(provider_id)
             .bind(&model.id)
             .bind(&synced_at)
             .bind(encode_wire_protocol(model.wire_protocol))
             .bind(serde_json::to_string(&model.capabilities)?)
+            .bind(encode_provider_model_metadata(model)?)
             .execute(&mut *transaction)
             .await?;
         }
@@ -520,13 +537,19 @@ impl Store {
 
     pub async fn provider_models(&self, provider_id: &str) -> anyhow::Result<Vec<ProviderModel>> {
         let rows = sqlx::query(
-            "SELECT model_id,wire_protocol,capabilities FROM provider_models WHERE provider_id=? ORDER BY model_id",
+            "SELECT model_id,wire_protocol,capabilities,metadata FROM provider_models WHERE provider_id=? ORDER BY model_id",
         )
         .bind(provider_id)
         .fetch_all(&self.pool)
         .await?;
         rows.into_iter()
             .map(|row| {
+                let metadata = decode_provider_model_metadata(
+                    row.try_get::<String, _>("metadata")
+                        .ok()
+                        .as_deref()
+                        .unwrap_or("{}"),
+                )?;
                 Ok(ProviderModel {
                     id: row.get("model_id"),
                     wire_protocol: decode_wire_protocol(
@@ -535,6 +558,9 @@ impl Store {
                     capabilities: serde_json::from_str(
                         row.get::<String, _>("capabilities").as_str(),
                     )?,
+                    context_window: metadata.context_window,
+                    input_price_per_million: metadata.input_price_per_million,
+                    output_price_per_million: metadata.output_price_per_million,
                 })
             })
             .collect()
@@ -1509,6 +1535,31 @@ fn decode_wire_protocol(value: &str) -> anyhow::Result<WireProtocol> {
         "gemini_generate_content" => Ok(WireProtocol::GeminiGenerateContent),
         _ => anyhow::bail!("unknown wire protocol {value}"),
     }
+}
+
+#[derive(Default, Serialize, Deserialize)]
+struct ProviderModelMetadata {
+    #[serde(default)]
+    context_window: Option<u64>,
+    #[serde(default)]
+    input_price_per_million: Option<f64>,
+    #[serde(default)]
+    output_price_per_million: Option<f64>,
+}
+
+fn encode_provider_model_metadata(model: &ProviderModel) -> anyhow::Result<String> {
+    Ok(serde_json::to_string(&ProviderModelMetadata {
+        context_window: model.context_window,
+        input_price_per_million: model.input_price_per_million,
+        output_price_per_million: model.output_price_per_million,
+    })?)
+}
+
+fn decode_provider_model_metadata(value: &str) -> anyhow::Result<ProviderModelMetadata> {
+    if value.trim().is_empty() || value == "{}" {
+        return Ok(ProviderModelMetadata::default());
+    }
+    Ok(serde_json::from_str(value)?)
 }
 
 #[cfg(test)]

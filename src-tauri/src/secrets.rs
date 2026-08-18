@@ -83,6 +83,7 @@ pub fn provider_account(id: &str) -> String {
     format!("provider:{id}")
 }
 pub const HF_ACCOUNT: &str = "hugging-face-token";
+pub const CIVITAI_ACCOUNT: &str = "civitai-token";
 
 #[cfg(test)]
 mod tests {

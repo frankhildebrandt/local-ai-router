@@ -40,6 +40,8 @@ pub struct ModelInspection {
     pub installable: bool,
     pub blockers: Vec<String>,
     pub trust_status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_url: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -224,7 +226,11 @@ impl HubClient {
             || files.iter().any(|file| file.ends_with(".safetensors"));
         let runtime = model_type
             .as_deref()
-            .and_then(|value| runtime_for_model_type(value, model.pipeline_tag.as_deref()));
+            .and_then(|value| runtime_for_model_type(value, model.pipeline_tag.as_deref()))
+            .or_else(|| runtime_for_model_type("", model.pipeline_tag.as_deref()))
+            .or_else(|| {
+                diffusion_layout(&files).then_some(("mlx_image", "image", ModelTask::Diffusion))
+            });
         let mut blockers = Vec::new();
         if model.gated.is_gated() && !has_token {
             blockers.push("this repository is gated; add a Hugging Face token in Settings".into());
@@ -278,6 +284,7 @@ impl HubClient {
             installable: blockers.is_empty(),
             blockers,
             trust_status: "untested".into(),
+            file_url: None,
         })
     }
 
@@ -405,6 +412,7 @@ fn search_view(model: &HfModel, budget_bytes: u64) -> CatalogEntryView {
         ),
         voices: Vec::new(),
         gated: model.gated.is_gated(),
+        source: "huggingface".into(),
     }
 }
 
@@ -444,13 +452,26 @@ pub fn required_weight_files(files: &[String]) -> anyhow::Result<Vec<String>> {
         })
         .cloned()
         .collect::<Vec<_>>();
-    if !selected.iter().any(|file| file.ends_with("config.json")) {
-        anyhow::bail!("repository is missing config.json");
-    }
     if !selected.iter().any(|file| file.ends_with(".safetensors")) {
         anyhow::bail!("repository is missing safetensors weights");
     }
+    let has_config = selected
+        .iter()
+        .any(|file| file.ends_with("config.json") || file.ends_with("model_index.json"));
+    if !has_config {
+        if selected.len() == 1 && selected[0].ends_with(".safetensors") {
+            return Ok(selected);
+        }
+        anyhow::bail!("repository is missing config.json");
+    }
     Ok(selected)
+}
+
+fn diffusion_layout(files: &[String]) -> bool {
+    files
+        .iter()
+        .any(|file| file == "unet/config.json" || file.ends_with("/unet/config.json"))
+        && files.iter().any(|file| file.contains("text_encoder"))
 }
 
 pub fn supported_architecture(model_type: &str) -> bool {

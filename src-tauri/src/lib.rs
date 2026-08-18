@@ -1,4 +1,5 @@
 pub mod catalog;
+pub mod civitai;
 pub mod commands;
 pub mod core;
 pub mod domain;
@@ -7,9 +8,11 @@ pub mod hub;
 pub mod install;
 pub mod library;
 pub mod media;
+pub mod model_catalog;
 pub mod oauth;
 pub mod protocol;
 pub mod providers;
+pub mod public_models;
 pub mod resource;
 pub mod routing;
 pub mod runtime;
@@ -224,6 +227,7 @@ pub fn run() {
             commands::test_provider_connection,
             commands::list_targets,
             commands::save_target,
+            commands::lookup_model_metadata,
             commands::delete_target,
             commands::import_local_model,
             commands::download_local_model,
@@ -239,6 +243,7 @@ pub fn run() {
             commands::start_local_model,
             commands::stop_local_model,
             commands::list_routes,
+            commands::list_public_models,
             commands::save_route,
             commands::delete_route,
             commands::list_routing_policies,
@@ -265,6 +270,7 @@ pub fn run() {
             commands::save_model_resource_overrides,
             commands::clear_kv_cache,
             commands::save_hugging_face_token,
+            commands::save_civitai_token,
             commands::forget_all_credentials
         ])
         .run(tauri::generate_context!())

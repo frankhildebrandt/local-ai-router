@@ -48,8 +48,8 @@ actor ImageEngine {
 
     func generate(prompt: String, width: Int, height: Int) async throws -> Data {
         if stub { return stubPNG(width: min(max(width, 1), 64), height: min(max(height, 1), 64)) }
-        if pipeline == "sdxl" {
-            return try generateSDXL(modelDirectory: URL(filePath: modelPath), prompt: prompt, width: width, height: height)
+        if pipeline == "sdxl" || pipeline == "sd" {
+            return try generateStableDiffusion(pipeline: pipeline, modelDirectory: URL(filePath: modelPath), prompt: prompt, width: width, height: height)
         }
         if flux == nil {
             let modelDirectory = URL(filePath: modelPath)
@@ -85,36 +85,61 @@ func configureFluxLocalCache(modelDirectory: URL) {
     TextEncoderModelDownloader.reconfigureHubApi()
 }
 
-func generateSDXL(modelDirectory: URL, prompt: String, width: Int, height: Int) throws -> Data {
-    let required = [
+func generateStableDiffusion(pipeline: String, modelDirectory: URL, prompt: String, width: Int, height: Int) throws -> Data {
+    let sdxl = pipeline == "sdxl"
+    var required = [
         "unet/config.json", "vae/config.json",
-        "text_encoder/config.json", "text_encoder_2/config.json",
+        "text_encoder/config.json",
         "tokenizer/vocab.json", "tokenizer/merges.txt",
-        "tokenizer_2/vocab.json", "tokenizer_2/merges.txt",
         "scheduler/scheduler_config.json",
     ]
+    if sdxl {
+        required.append(contentsOf: [
+            "text_encoder_2/config.json",
+            "tokenizer_2/vocab.json", "tokenizer_2/merges.txt",
+        ])
+    }
     for relative in required {
         let path = modelDirectory.appending(path: relative)
         if !FileManager.default.fileExists(atPath: path.path) {
-            throw ServerError.badRequest("SDXL Turbo is missing required artifact \(relative)")
+            throw ServerError.badRequest("\(sdxl ? "SDXL" : "Stable Diffusion") is missing required artifact \(relative)")
         }
     }
-    let hasUnetWeights = ["unet/diffusion_pytorch_model.safetensors", "unet/model.safetensors"].contains {
-        FileManager.default.fileExists(atPath: modelDirectory.appending(path: $0).path)
+    try ensureDiffusionWeight(
+        modelDirectory,
+        expected: "unet/diffusion_pytorch_model.safetensors",
+        alternatives: ["unet/model.safetensors"]
+    )
+    try ensureDiffusionWeight(
+        modelDirectory,
+        expected: "vae/diffusion_pytorch_model.safetensors",
+        alternatives: ["vae/model.safetensors"]
+    )
+    try ensureDiffusionWeight(
+        modelDirectory,
+        expected: "text_encoder/model.safetensors",
+        alternatives: ["text_encoder/diffusion_pytorch_model.safetensors"]
+    )
+    if sdxl {
+        try ensureDiffusionWeight(
+            modelDirectory,
+            expected: "text_encoder_2/model.safetensors",
+            alternatives: ["text_encoder_2/diffusion_pytorch_model.safetensors"]
+        )
     }
-    if !hasUnetWeights {
-        throw ServerError.badRequest("SDXL Turbo is missing unet safetensors weights")
-    }
+    let hubId = sdxl ? "stabilityai/sdxl-turbo" : "stabilityai/stable-diffusion-2-1-base"
     let hubRoot = modelDirectory.appending(path: ".hub")
-    let repoDir = hubRoot.appending(path: "models/stabilityai/sdxl-turbo")
+    let repoDir = hubRoot.appending(path: "models/\(hubId)")
     try FileManager.default.createDirectory(at: repoDir.deletingLastPathComponent(), withIntermediateDirectories: true)
     if !FileManager.default.fileExists(atPath: repoDir.path) {
         try FileManager.default.createSymbolicLink(at: repoDir, withDestinationURL: modelDirectory)
     }
     let hub = HubApi(downloadBase: hubRoot, useOfflineMode: true)
-    let configuration = StableDiffusionConfiguration.presetSDXLTurbo
+    let configuration = sdxl
+        ? StableDiffusionConfiguration.presetSDXLTurbo
+        : StableDiffusionConfiguration.presetStableDiffusion21Base
     guard let generator = try configuration.textToImageGenerator(hub: hub, configuration: .init()) else {
-        throw ServerError.badRequest("unable to create the SDXL Turbo generator")
+        throw ServerError.badRequest("unable to create the \(sdxl ? "SDXL" : "Stable Diffusion") generator")
     }
     generator.ensureLoaded()
     var parameters = configuration.defaultParameters()
@@ -126,10 +151,23 @@ func generateSDXL(modelDirectory: URL, prompt: String, width: Int, height: Int) 
         last = latent
         eval(latent)
     }
-    guard let last else { throw ServerError.badRequest("SDXL Turbo produced no latents") }
+    guard let last else { throw ServerError.badRequest("\(sdxl ? "SDXL" : "Stable Diffusion") produced no latents") }
     let decoded = generator.decode(xt: last)
     eval(decoded)
     return pngData(from: Image(decoded.squeezed()).asCGImage())
+}
+
+func ensureDiffusionWeight(_ directory: URL, expected: String, alternatives: [String]) throws {
+    let destination = directory.appending(path: expected)
+    if FileManager.default.fileExists(atPath: destination.path) { return }
+    for alternative in alternatives {
+        let source = directory.appending(path: alternative)
+        if FileManager.default.fileExists(atPath: source.path) {
+            try FileManager.default.createSymbolicLink(at: destination, withDestinationURL: source)
+            return
+        }
+    }
+    throw ServerError.badRequest("Stable Diffusion is missing weight file \(expected)")
 }
 
 final class HTTPServer: @unchecked Sendable {

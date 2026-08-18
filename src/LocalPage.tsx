@@ -8,9 +8,11 @@ import type {
   CatalogCategory, CatalogEntry, InstallJob, InstallJobEvent, LocalCatalog, ModelInspection,
   ModelTarget, RamFit, ResourceOverrides, ResourcePolicy, SearchPage, TargetKind,
 } from "./types";
+import { displayModelName, groupCatalogEntries, preferredQuantization } from "./catalogGroups";
 
 type Common = { targets: ModelTarget[]; resourcePolicy: ResourcePolicy; refresh: () => Promise<void>; success: (text: string) => void; fail: (error: unknown) => void };
 type CatalogTab = "chat_vision" | "image" | "speech" | "library" | "import";
+type DownloadSource = "huggingface" | "civitai" | "civitai.red";
 
 const emptyCatalog: LocalCatalog = {
   platform: { apple_silicon: true, macos_15_plus: true, compatible: true, reason: null },
@@ -29,6 +31,7 @@ export function LocalPage({ targets, resourcePolicy, refresh, success, fail }: C
   const [task, setTask] = useState("");
   const [searchHits, setSearchHits] = useState<CatalogEntry[]>([]);
   const [searching, setSearching] = useState(false);
+  const [downloadSource, setDownloadSource] = useState<DownloadSource>("huggingface");
 
   const load = useCallback(async () => {
     try {
@@ -54,27 +57,28 @@ export function LocalPage({ targets, resourcePolicy, refresh, success, fail }: C
   }, [load, refresh]);
 
   useEffect(() => {
-    if (!query.trim()) { setSearchHits([]); return; }
+    if (!query.trim() || tab === "library" || tab === "import") { setSearchHits([]); return; }
     const timer = window.setTimeout(async () => {
       setSearching(true);
       try {
-        const page = await command<SearchPage>("search_mlx_catalog", { input: { query, cursor: null } });
+        const source = tab === "image" ? downloadSource : "huggingface";
+        const page = await command<SearchPage>("search_mlx_catalog", { input: { query, cursor: null, source } });
         setSearchHits(page.items);
       } catch (error) { fail(error); }
       finally { setSearching(false); }
     }, 280);
     return () => window.clearTimeout(timer);
-  }, [query, fail]);
+  }, [query, fail, tab, downloadSource]);
 
   const families = useMemo(() => Array.from(new Set(catalog.entries.map(item => item.family))), [catalog.entries]);
   const tasks = useMemo(() => Array.from(new Set(catalog.entries.map(item => item.task))), [catalog.entries]);
-  const curated = catalog.entries.filter(item =>
+  const curated = groupCatalogEntries(catalog.entries.filter(item =>
     item.category === tab
     && (!family || item.family === family)
     && (!task || item.task === task)
     && (!query.trim() || `${item.name} ${item.repo_id} ${item.family}`.toLowerCase().includes(query.toLowerCase()))
-  );
-  const visibleSearch = tab === "library" || tab === "import" ? [] : searchHits;
+  ));
+  const visibleSearch = tab === "library" || tab === "import" ? [] : groupCatalogEntries(searchHits);
 
   const install = async (entry: CatalogEntry, inspected?: ModelInspection) => {
     if (entry.trust_status === "curated" && !entry.installable) {
@@ -97,15 +101,19 @@ export function LocalPage({ targets, resourcePolicy, refresh, success, fail }: C
   };
 
   return <>
-    <div className="page-head"><div><span className="eyebrow">On-device</span><h1>Local models</h1><p>Curated MLX models for Apple Silicon, plus live Hugging Face search. Import and GGUF downloads stay available.</p></div></div>
+    <div className="page-head"><div><span className="eyebrow">On-device</span><h1>Local models</h1><p>Installed models are published immediately as public model IDs. Catalog, Hugging Face search, import and GGUF downloads stay available.</p></div></div>
     {!catalog.platform.compatible && <div className="security-note catalog-banner"><span>{catalog.platform.reason ?? "This Mac is not compatible with the MLX catalog."}</span></div>}
     <div className="segmented catalog-tabs">
       {([["chat_vision", "Chat & Vision"], ["image", "Image"], ["speech", "Speech"], ["library", "Library"], ["import", "Import"]] as const).map(([id, label]) =>
-        <button key={id} className={tab === id ? "selected" : ""} onClick={() => setTab(id)}>{label}</button>)}
+        <button key={id} className={tab === id ? "selected" : ""} onClick={() => { setTab(id); setQuery(""); }}>{label}</button>)}
     </div>
     {tab !== "library" && tab !== "import" && <>
       <section className="panel catalog-toolbar">
-        <div className="search"><Search size={17} /><input value={query} onChange={event => setQuery(event.target.value)} placeholder="Search curated models or every Hugging Face MLX repository" /></div>
+        <div className="search"><Search size={17} /><input value={query} onChange={event => setQuery(event.target.value)} placeholder={tab === "image" && downloadSource !== "huggingface" ? "Search CivitAI checkpoints (SD and SDXL)" : "Search curated models or every Hugging Face MLX repository"} /></div>
+        {tab === "image" && <div className="segmented small catalog-sources" role="group" aria-label="Download source">
+          {([["huggingface", "Hugging Face"], ["civitai", "CivitAI"], ["civitai.red", "civitai.red"]] as const).map(([id, label]) =>
+            <button key={id} type="button" className={downloadSource === id ? "selected" : ""} onClick={() => setDownloadSource(id)}>{label}</button>)}
+        </div>}
         <div className="filter-grid catalog-filters">
           <select aria-label="Family" value={family} onChange={event => setFamily(event.target.value)}><option value="">All families</option>{families.map(item => <option key={item}>{item}</option>)}</select>
           <select aria-label="Task" value={task} onChange={event => setTask(event.target.value)}><option value="">All tasks</option>{tasks.map(item => <option key={item}>{item}</option>)}</select>
@@ -113,9 +121,9 @@ export function LocalPage({ targets, resourcePolicy, refresh, success, fail }: C
         </div>
       </section>
       {!!jobs.length && <InstallJobs jobs={jobs} onChange={load} fail={fail} />}
-      <div className="catalog-grid">{curated.map(entry => <CatalogCard key={entry.id} entry={entry} onInstall={() => void install(entry)} />)}</div>
-      {searching && <p className="catalog-hint">Searching Hugging Face…</p>}
-      {!!visibleSearch.length && <><h3 className="catalog-section">Untested Hugging Face matches</h3><p className="catalog-hint">Visibility does not mean the model can be installed or run. Architecture, files and license are checked first.</p><div className="catalog-grid">{visibleSearch.map(entry => <CatalogCard key={entry.repo_id} entry={entry} onInstall={() => void install(entry)} />)}</div></>}
+      <div className="catalog-grid">{curated.map(group => <CatalogCard key={quantizationGroupKey(group)} variants={group} onInstall={entry => void install(entry)} />)}</div>
+      {searching && <p className="catalog-hint">{tab === "image" && downloadSource !== "huggingface" ? `Searching ${downloadSource}…` : "Searching Hugging Face…"}</p>}
+      {!!visibleSearch.length && <><h3 className="catalog-section">{tab === "image" && downloadSource !== "huggingface" ? `Untested ${downloadSource} matches` : "Untested Hugging Face matches"}</h3><p className="catalog-hint">{tab === "image" && downloadSource !== "huggingface" ? "SD and SDXL checkpoints download from the selected CivitAI host. Diffusers-layout models can generate immediately; classic single-file checkpoints are stored for the SD/SDXL engine." : "Visibility does not mean the model can be installed or run. Architecture, files and license are checked first."}</p><div className="catalog-grid">{visibleSearch.map(group => <CatalogCard key={quantizationGroupKey(group)} variants={group} onInstall={entry => void install(entry)} />)}</div></>}
       {!curated.length && !visibleSearch.length && !searching && <div className="empty"><div><Box /></div><h3>No models in this category</h3><p>Try another filter or search the Hugging Face MLX catalog.</p></div>}
     </>}
     {tab === "library" && <InstalledLibrary local={local} resourcePolicy={resourcePolicy} refresh={refresh} success={success} fail={fail} />}
@@ -123,16 +131,25 @@ export function LocalPage({ targets, resourcePolicy, refresh, success, fail }: C
   </>;
 }
 
-function CatalogCard({ entry, onInstall }: { entry: CatalogEntry; onInstall: () => void }) {
+function quantizationGroupKey(group: CatalogEntry[]): string {
+  return group.map(item => item.id).join(":");
+}
+
+function CatalogCard({ variants, onInstall }: { variants: CatalogEntry[]; onInstall: (entry: CatalogEntry) => void }) {
+  const [selectedId, setSelectedId] = useState(() => preferredQuantization(variants).id);
+  const entry = variants.find(item => item.id === selectedId) ?? preferredQuantization(variants);
   const ram = ramLabel(entry.ram_fit);
   return <article className="catalog-card">
-    <div className="row"><h3>{entry.name}</h3><span className={`badge ${ram.tone}`}>{ram.label}</span></div>
-    <p>{entry.family} · {entry.quantization} · {entry.license}</p>
-    <p>{formatBytes(entry.download_bytes)} download · {formatBytes(entry.estimated_memory_bytes)} peak</p>
+    <div className="row"><h3>{displayModelName(entry)}</h3><span className={`badge ${ram.tone}`}>{ram.label}</span></div>
+    <p>{entry.family} · {entry.license}</p>
+    {variants.length > 1
+      ? <label className="field"><span>Quantization</span><select aria-label="Quantization" value={entry.id} onChange={event => setSelectedId(event.target.value)}>{variants.map(item => <option value={item.id} key={item.id}>{item.quantization} · {formatBytes(item.download_bytes)} · {ramLabel(item.ram_fit).label}</option>)}</select></label>
+      : <p>{entry.quantization} · {formatBytes(entry.download_bytes)} download · {formatBytes(entry.estimated_memory_bytes)} peak</p>}
+    {variants.length > 1 && <p>{formatBytes(entry.download_bytes)} download · {formatBytes(entry.estimated_memory_bytes)} peak</p>}
     <div className="capabilities">{entry.capabilities.map(item => <span key={item}>{item}</span>)}<span>{entry.trust_status}</span></div>
     {!!entry.voices.length && <p>Voices: {entry.voices.join(", ")}</p>}
     {entry.lock_reason && <p className="catalog-lock">{entry.lock_reason}</p>}
-    <button className="primary" disabled={entry.trust_status === "curated" && !entry.installable} onClick={onInstall}><Download size={15} />{entry.trust_status === "curated" && !entry.installable ? "Locked" : "Install"}</button>
+    <button className="primary" disabled={entry.trust_status === "curated" && !entry.installable} onClick={() => onInstall(entry)}><Download size={15} />{entry.trust_status === "curated" && !entry.installable ? "Locked" : "Install"}</button>
   </article>;
 }
 
@@ -192,9 +209,29 @@ function ManualImport({ refresh, success, fail }: Pick<Common, "refresh" | "succ
   const [filename, setFilename] = useState("");
   const [name, setName] = useState("");
   const [busy, setBusy] = useState(false);
+  const [downloadSource, setDownloadSource] = useState<DownloadSource>("huggingface");
+  const civitai = tab === "download" && downloadSource !== "huggingface";
   const browse = async () => { const result = await open({ directory: kind === "mlx", multiple: false, filters: kind === "gguf" ? [{ name: "GGUF model", extensions: ["gguf"] }] : undefined }); if (typeof result === "string") { setSource(result); setName(result.split("/").pop() ?? "Local model"); } };
-  const submit = async (event: FormEvent) => { event.preventDefault(); setBusy(true); try { if (tab === "import") await command("import_local_model", { input: { source, name, kind, aliasModel: name, capabilities: ["chat"] } }); else await command("download_local_model", { input: { repoId: source, filename: filename || null, name: name || source.split("/").pop(), kind, aliasModel: name || source, capabilities: ["chat"] } }); setSource(""); setName(""); setFilename(""); await refresh(); success("Local model added to the library"); } catch (e) { fail(e); } finally { setBusy(false); } };
-  return <section className="panel add-model"><div className="segmented small"><button className={tab === "import" ? "selected" : ""} onClick={() => setTab("import")}><FileDown size={15} />Import</button><button className={tab === "download" ? "selected" : ""} onClick={() => setTab("download")}><Download size={15} />Hugging Face</button></div><form onSubmit={submit}><select value={kind} onChange={e => setKind(e.target.value as TargetKind)}><option value="gguf">GGUF · llama.cpp</option><option value="mlx">MLX · Apple Silicon</option></select><div className="input-action"><input value={source} onChange={e => setSource(e.target.value)} placeholder={tab === "import" ? "Model file or folder" : "org/model-repository"} required />{tab === "import" && <button type="button" className="secondary" onClick={() => void browse()}>Browse</button>}</div>{tab === "download" && kind === "gguf" && <input value={filename} onChange={e => setFilename(e.target.value)} placeholder="quantized-model.Q4_K_M.gguf" required />}<input value={name} onChange={e => setName(e.target.value)} placeholder="Display name" required={tab === "import"} /><button className="primary" disabled={busy}>{busy ? <LoaderCircle className="spin" size={17} /> : tab === "import" ? <FileDown size={17} /> : <Download size={17} />}{tab === "import" ? "Import" : "Download"}</button></form></section>;
+  const submit = async (event: FormEvent) => {
+    event.preventDefault();
+    setBusy(true);
+    try {
+      if (tab === "import") {
+        await command("import_local_model", { input: { source, name, kind, aliasModel: name, capabilities: ["chat"] } });
+      } else if (civitai) {
+        const repoId = source.includes("civitai") ? source : `${downloadSource}/models/${source.replace(/^models\//, "")}`;
+        await command("install_catalog_model", { input: { repoId, catalogId: null, confirmOverBudget: false, name: name || repoId } });
+      } else {
+        await command("download_local_model", { input: { repoId: source, filename: filename || null, name: name || source.split("/").pop(), kind, aliasModel: name || source, capabilities: ["chat"], source: downloadSource } });
+      }
+      setSource(""); setName(""); setFilename("");
+      await refresh();
+      success(civitai ? "CivitAI download queued" : "Local model added to the library");
+    } catch (e) { fail(e); } finally { setBusy(false); }
+  };
+  return <section className="panel add-model"><div className="segmented small"><button className={tab === "import" ? "selected" : ""} onClick={() => setTab("import")}><FileDown size={15} />Import</button><button className={tab === "download" ? "selected" : ""} onClick={() => setTab("download")}><Download size={15} />Download</button></div>
+    {tab === "download" && <div className="segmented small catalog-sources" role="group" aria-label="Download source">{([["huggingface", "Hugging Face"], ["civitai", "CivitAI"], ["civitai.red", "civitai.red"]] as const).map(([id, label]) => <button key={id} type="button" className={downloadSource === id ? "selected" : ""} onClick={() => { setDownloadSource(id); if (id !== "huggingface") setKind("mlx"); }}>{label}</button>)}</div>}
+    <form onSubmit={submit}>{!civitai && <select value={kind} onChange={e => setKind(e.target.value as TargetKind)}><option value="gguf">GGUF · llama.cpp</option><option value="mlx">MLX · Apple Silicon</option></select>}<div className="input-action"><input value={source} onChange={e => setSource(e.target.value)} placeholder={tab === "import" ? "Model file or folder" : civitai ? "https://civitai.com/models/… or models/12345" : "org/model-repository"} required />{tab === "import" && <button type="button" className="secondary" onClick={() => void browse()}>Browse</button>}</div>{tab === "download" && kind === "gguf" && !civitai && <input value={filename} onChange={e => setFilename(e.target.value)} placeholder="quantized-model.Q4_K_M.gguf" required />}<input value={name} onChange={e => setName(e.target.value)} placeholder="Display name" required={tab === "import"} /><button className="primary" disabled={busy}>{busy ? <LoaderCircle className="spin" size={17} /> : tab === "import" ? <FileDown size={17} /> : <Download size={17} />}{tab === "import" ? "Import" : "Download"}</button></form></section>;
 }
 
 function ramLabel(fit: RamFit): { label: string; tone: "good" | "warn" | "bad" } {

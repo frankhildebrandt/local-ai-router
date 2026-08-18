@@ -67,6 +67,12 @@ pub struct CatalogEntryView {
     pub lock_reason: Option<String>,
     pub voices: Vec<String>,
     pub gated: bool,
+    #[serde(default = "huggingface_source")]
+    pub source: String,
+}
+
+fn huggingface_source() -> String {
+    "huggingface".into()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -148,7 +154,14 @@ pub const VLM_TYPES: &[&str] = &[
     "lfm2-vl",
 ];
 
-pub const IMAGE_TYPES: &[&str] = &["flux2", "flux", "stable-diffusion", "sdxl", "sdxl_turbo"];
+pub const IMAGE_TYPES: &[&str] = &[
+    "flux2",
+    "flux",
+    "sd",
+    "stable-diffusion",
+    "sdxl",
+    "sdxl_turbo",
+];
 pub const SPEECH_TYPES: &[&str] = &["kokoro"];
 
 const CHAT: &[&str] = &["chat", "streaming"];
@@ -512,6 +525,25 @@ pub fn curated_models() -> Vec<CuratedModel> {
             None,
         ),
         curated(
+            "sd-2-1-base",
+            "Stable Diffusion 2.1 Base",
+            "Stable Diffusion",
+            "stabilityai/stable-diffusion-2-1-base",
+            CatalogCategory::Image,
+            "image",
+            "mlx_image",
+            "fp16",
+            "openrail++",
+            "sd-2-1-base",
+            IMAGES,
+            gb(5.2),
+            gb(6.8),
+            "stable-diffusion",
+            &[],
+            true,
+            None,
+        ),
+        curated(
             "kokoro-82m",
             "Kokoro 82M",
             "Kokoro",
@@ -727,6 +759,7 @@ pub fn catalog_views(budget_bytes: u64) -> Vec<CatalogEntryView> {
                     .map(|item| (*item).to_string())
                     .collect(),
                 gated: false,
+                source: "huggingface".into(),
             }
         })
         .collect()
@@ -818,5 +851,30 @@ mod tests {
                 .0,
             "mlx_speech"
         );
+        assert_eq!(
+            runtime_for_model_type("stable-diffusion", Some("text-to-image"))
+                .unwrap()
+                .0,
+            "mlx_image"
+        );
+        assert_eq!(
+            runtime_for_model_type("sd", Some("text-to-image"))
+                .unwrap()
+                .0,
+            "mlx_image"
+        );
+    }
+
+    #[test]
+    fn curated_image_catalog_includes_sd_and_sdxl() {
+        let models = curated_models();
+        assert!(models.iter().any(|model| model.id == "sdxl-turbo"));
+        let sd = models
+            .iter()
+            .find(|model| model.id == "sd-2-1-base")
+            .expect("SD 2.1 base");
+        assert_eq!(sd.runtime_engine, "mlx_image");
+        assert_eq!(sd.model_type, "stable-diffusion");
+        assert!(!sd.repo_id.to_ascii_lowercase().contains("sdxl"));
     }
 }

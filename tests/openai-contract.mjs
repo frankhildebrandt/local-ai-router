@@ -3,7 +3,7 @@ import OpenAI from "openai";
 
 const client = new OpenAI({ baseURL: "http://127.0.0.1:11436/v1", apiKey: "contract-token" });
 const models = await client.models.list();
-assert.deepEqual(models.data.map(model => model.id), ["sdk-model"]);
+assert.deepEqual(models.data.map(model => model.id), ["adaptive-routing", "real-model", "sdk-model"]);
 
 const chat = await client.chat.completions.create({ model: "sdk-model", messages: [{ role: "user", content: "hello" }] });
 assert.equal(chat.choices[0].message.content, "hello");

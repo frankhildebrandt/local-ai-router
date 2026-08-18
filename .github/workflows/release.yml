@@ -19,6 +19,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - run: brew install cmake
       - run: npm ci
+      - run: npx tauri icon assets/app-icon.svg
       - run: xcodebuild -downloadComponent MetalToolchain
       - run: ./scripts/build-sidecars.sh
       - name: Configure Apple signing
