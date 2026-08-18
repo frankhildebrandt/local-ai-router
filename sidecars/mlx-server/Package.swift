@@ -12,9 +12,11 @@ let package = Package(
         .package(url: "https://github.com/huggingface/swift-huggingface.git", exact: "0.9.0")
     ],
     targets: [
+        .target(name: "MLXServerCore"),
         .executableTarget(
             name: "mlx-server",
             dependencies: [
+                "MLXServerCore",
                 .product(name: "MLXLLM", package: "mlx-swift-lm"),
                 .product(name: "MLXVLM", package: "mlx-swift-lm"),
                 .product(name: "MLXLMCommon", package: "mlx-swift-lm"),
@@ -23,6 +25,7 @@ let package = Package(
                 .product(name: "HuggingFace", package: "swift-huggingface"),
                 .product(name: "Tokenizers", package: "swift-transformers")
             ]
-        )
+        ),
+        .testTarget(name: "MLXServerTests", dependencies: ["MLXServerCore"])
     ]
 )

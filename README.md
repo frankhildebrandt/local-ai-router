@@ -129,7 +129,7 @@ New installations default to Stealth mode: local sidecars run at low process pri
 
 Stopped local models load automatically on their first request. Active prompts are limited per model, while additional authenticated requests wait in a FIFO queue until the client disconnects or the app shuts down. Resource changes restart loaded sidecars only after active and queued work has drained.
 
-GGUF clients can opt into persistent llama.cpp KV snapshots by sending `X-Local-AI-Session` with a stable value of at most 128 characters. Persistent KV requires one parallel prompt and the client must still send the full conversation history. Snapshots are isolated by API key, model and session, stored with private filesystem permissions under Application Support, and evicted least-recently-used above 10 GiB. They are not encrypted independently of the Mac filesystem.
+GGUF clients can opt into persistent llama.cpp KV snapshots by sending `X-Local-AI-Session` with a stable value of at most 128 characters. MLX chat reuses a token prefix KV in RAM without that header: each request still sends the full history, and the sidecar prefills only the suffix after a longest-common-prefix match. After idle unload, MLX restores from disk using SHA-256 hashes of token-block prefixes (256-token windows plus the exact saved length), so a session header is not required for a hit. `X-Local-AI-Session` remains optional isolation for two chats that share a system prompt, and it is still required for named GGUF snapshots. Persistent KV requires one parallel prompt. Snapshots are isolated by API key and model (and session when present), stored with private filesystem permissions under Application Support, and evicted least-recently-used above 10 GiB. They are not encrypted independently of the Mac filesystem.
 
 Local chat models accept OpenAI `input_audio` and the Local AI Router extension `input_video`, plus Gemini `inlineData` for image, audio and video. Anthropic remains text and image only. Remote media must be a data URL or public HTTPS URL; private, loopback and link-local destinations are blocked. Generated images and speech are returned to the client and are neither persisted nor written to request logs.
 
@@ -151,7 +151,7 @@ Local chat models accept OpenAI `input_audio` and the Local AI Router extension 
 - Local bearer tokens are stored in Keychain, compared in constant time and can be rotated or revoked immediately.
 - The gateway never binds to a LAN address.
 - Imported models are copied into the app-managed Application Support directory.
-- Optional GGUF KV snapshots can encode sensitive conversation state. They are unencrypted app-private files and can be removed from Settings at any time.
+- Optional local KV snapshots (GGUF slots and MLX prefix hashes) can encode sensitive conversation state. They are unencrypted app-private files and can be removed from Settings at any time.
 - Cloud prompts and tool data are sent to the provider selected by the route and remain subject to that provider's retention, training and regional-processing terms. Fallback targets may send a request to a different provider only after an eligible pre-stream failure.
 
 ## Release setup

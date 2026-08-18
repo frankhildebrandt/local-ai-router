@@ -1759,8 +1759,8 @@ pub async fn clear_kv_cache(
             .await
             .map_err(err)?
             .ok_or("model not found")?;
-        if target.kind != TargetKind::Gguf {
-            return Err("disk KV is only available for GGUF models".into());
+        if !matches!(target.kind, TargetKind::Gguf | TargetKind::Mlx) {
+            return Err("disk KV is only available for local chat models".into());
         }
     }
     state

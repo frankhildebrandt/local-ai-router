@@ -106,6 +106,24 @@ impl RuntimeManager {
         self.entries.lock().contains_key(id)
     }
 
+    #[cfg(test)]
+    pub(crate) fn insert_test_runtime(&self, id: &str, port: u16, child: Child) {
+        let pid = child.id().expect("test sidecar pid");
+        self.activity.set_token(id, "runtime-token".into());
+        self.entries.lock().insert(
+            id.to_string(),
+            RuntimeEntry {
+                child,
+                pid,
+                port,
+                size_bytes: 1,
+                policy: self.policy.read().clone(),
+                governor: CancellationToken::new(),
+                pending_restart: false,
+            },
+        );
+    }
+
     pub async fn clear_kv_cache(&self, target_id: Option<&str>) -> anyhow::Result<()> {
         let path = target_id
             .map(|id| self.cache_target_dir(id))
@@ -124,7 +142,7 @@ impl RuntimeManager {
         session_id: &str,
     ) -> anyhow::Result<bool> {
         let policy = self.effective_policy(target);
-        if target.kind != TargetKind::Gguf || !policy.disk_kv_enabled {
+        if !supports_named_kv(target) || !policy.disk_kv_enabled {
             return Ok(false);
         }
         let (directory, filename) = self.kv_snapshot(target, api_key_id, session_id);
@@ -154,7 +172,7 @@ impl RuntimeManager {
         session_id: &str,
     ) -> anyhow::Result<bool> {
         let policy = self.effective_policy(target);
-        if target.kind != TargetKind::Gguf || !policy.disk_kv_enabled {
+        if !supports_named_kv(target) || !policy.disk_kv_enabled {
             return Ok(false);
         }
         let (directory, filename) = self.kv_snapshot(target, api_key_id, session_id);
@@ -168,7 +186,7 @@ impl RuntimeManager {
             .send()
             .await?;
         if !response.status().is_success() {
-            anyhow::bail!("llama.cpp rejected the KV snapshot");
+            anyhow::bail!("sidecar rejected the KV snapshot");
         }
         set_private_file_permissions(&directory.join(filename))?;
         self.enforce_kv_budget(policy.disk_kv_max_bytes)?;
@@ -208,53 +226,54 @@ impl RuntimeManager {
             .map(|duration| duration.as_nanos())
             .unwrap_or_default();
         let policy = self.effective_policy(target);
-        let fingerprint = format!(
-            "v2\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}",
-            target.id,
-            path,
-            target.local.source_revision.as_deref().unwrap_or_default(),
-            metadata
-                .as_ref()
-                .map(|value| value.len())
-                .unwrap_or_default(),
-            modified,
-            policy.cpu_threads,
-            policy.max_parallel_prompts,
-            policy.gguf_gpu_layers,
-            policy.compute_duty_percent,
-            api_key_id,
-            session_id
-        );
+        let mlx = target.kind == TargetKind::Mlx;
+        let fingerprint = if mlx {
+            format!(
+                "v2-mlx\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}",
+                target.id,
+                path,
+                target.local.source_revision.as_deref().unwrap_or_default(),
+                metadata
+                    .as_ref()
+                    .map(|value| value.len())
+                    .unwrap_or_default(),
+                modified,
+                policy.max_parallel_prompts,
+                api_key_id,
+                session_id
+            )
+        } else {
+            format!(
+                "v2\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}",
+                target.id,
+                path,
+                target.local.source_revision.as_deref().unwrap_or_default(),
+                metadata
+                    .as_ref()
+                    .map(|value| value.len())
+                    .unwrap_or_default(),
+                modified,
+                policy.cpu_threads,
+                policy.max_parallel_prompts,
+                policy.gguf_gpu_layers,
+                policy.compute_duty_percent,
+                api_key_id,
+                session_id
+            )
+        };
         (
             self.cache_target_dir(&target.id),
-            format!("{}.bin", hex_digest(fingerprint.as_bytes())),
+            format!(
+                "{}.{}",
+                hex_digest(fingerprint.as_bytes()),
+                if mlx { "safetensors" } else { "bin" }
+            ),
         )
     }
 
     fn enforce_kv_budget(&self, max_bytes: u64) -> anyhow::Result<()> {
         let mut files = Vec::new();
-        if !self.kv_cache_dir.exists() {
-            return Ok(());
-        }
-        for directory in std::fs::read_dir(&self.kv_cache_dir)? {
-            let directory = directory?;
-            if !directory.file_type()?.is_dir() {
-                continue;
-            }
-            for file in std::fs::read_dir(directory.path())? {
-                let file = file?;
-                let metadata = file.metadata()?;
-                if metadata.is_file() {
-                    files.push((
-                        file.path(),
-                        metadata.len(),
-                        metadata
-                            .modified()
-                            .unwrap_or(std::time::SystemTime::UNIX_EPOCH),
-                    ));
-                }
-            }
-        }
+        collect_kv_files(&self.kv_cache_dir, &mut files)?;
         let mut total = files.iter().map(|(_, size, _)| *size).sum::<u64>();
         files.sort_by_key(|(_, _, modified)| *modified);
         for (path, size, _) in files {
@@ -377,6 +396,12 @@ impl RuntimeManager {
                     command
                         .arg("--memory-limit-mib")
                         .arg(memory_mib.to_string());
+                    if policy.disk_kv_enabled {
+                        let target_cache = self.cache_target_dir(&target.id);
+                        create_private_dir(&self.kv_cache_dir)?;
+                        create_private_dir(&target_cache)?;
+                        command.arg("--slot-save-path").arg(target_cache);
+                    }
                 }
                 if engine == "mlx_image" {
                     command.args(["--pipeline", image_pipeline_for(target)]);
@@ -747,6 +772,43 @@ fn hex_digest(value: &[u8]) -> String {
         .collect()
 }
 
+fn supports_named_kv(target: &ModelTarget) -> bool {
+    match target.kind {
+        TargetKind::Gguf => true,
+        TargetKind::Mlx => {
+            target.local.runtime_engine.as_deref().unwrap_or("mlx_chat") == "mlx_chat"
+        }
+        _ => false,
+    }
+}
+
+fn collect_kv_files(
+    path: &Path,
+    files: &mut Vec<(PathBuf, u64, std::time::SystemTime)>,
+) -> anyhow::Result<()> {
+    let entries = match std::fs::read_dir(path) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    for entry in entries {
+        let entry = entry?;
+        let metadata = entry.metadata()?;
+        if metadata.is_dir() {
+            collect_kv_files(&entry.path(), files)?;
+        } else if metadata.is_file() {
+            files.push((
+                entry.path(),
+                metadata.len(),
+                metadata
+                    .modified()
+                    .unwrap_or(std::time::SystemTime::UNIX_EPOCH),
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn create_private_dir(path: &Path) -> anyhow::Result<()> {
     std::fs::create_dir_all(path)?;
     #[cfg(unix)]
@@ -1008,5 +1070,67 @@ mod tests {
                 ..Default::default()
             },
         }
+    }
+
+    fn chat_target(id: &str, kind: TargetKind, engine: &str, path: &str) -> ModelTarget {
+        ModelTarget {
+            id: id.into(),
+            provider_id: None,
+            name: id.into(),
+            kind,
+            provider_model: id.into(),
+            local_path: Some(path.into()),
+            runtime_url: None,
+            wire_protocol: crate::providers::WireProtocol::OpenAiChat,
+            capabilities: vec!["chat".into()],
+            enabled: true,
+            state: "ready".into(),
+            size_bytes: None,
+            local: crate::storage::LocalModelMeta {
+                runtime_engine: Some(engine.into()),
+                task: Some("chat".into()),
+                ..Default::default()
+            },
+        }
+    }
+
+    #[test]
+    fn mlx_kv_snapshot_omits_gguf_fields_and_uses_safetensors() {
+        let cache = tempfile::tempdir().unwrap();
+        let manager = RuntimeManager::new(
+            PathBuf::new(),
+            cache.path().to_path_buf(),
+            ResourcePolicy::preset(ResourceProfile::Stealth, 8),
+            LocalActivityRegistry::default(),
+        );
+        let mlx = chat_target("mlx-chat", TargetKind::Mlx, "mlx_chat", "/models/qwen");
+        let gguf = chat_target("gguf-chat", TargetKind::Gguf, "llama", "/models/qwen.gguf");
+        let (_, mlx_file) = manager.kv_snapshot(&mlx, "key", "session");
+        let (_, gguf_file) = manager.kv_snapshot(&gguf, "key", "session");
+        assert!(mlx_file.ends_with(".safetensors"), "{mlx_file}");
+        assert!(gguf_file.ends_with(".bin"), "{gguf_file}");
+        assert_ne!(mlx_file, gguf_file);
+
+        let mut gpu_mlx = mlx.clone();
+        gpu_mlx.local.resource_overrides = Some(crate::resource::ResourceOverrides {
+            gguf_gpu_layers: Some(12),
+            ..Default::default()
+        });
+        let (_, gpu_file) = manager.kv_snapshot(&gpu_mlx, "key", "session");
+        assert_eq!(mlx_file, gpu_file);
+        assert!(!supports_named_kv(&image_target(None, "/models/flux")));
+    }
+
+    #[tokio::test]
+    async fn restore_kv_skips_mlx_when_disk_kv_is_disabled() {
+        let cache = tempfile::tempdir().unwrap();
+        let manager = RuntimeManager::new(
+            PathBuf::new(),
+            cache.path().to_path_buf(),
+            ResourcePolicy::preset(ResourceProfile::Balanced, 8),
+            LocalActivityRegistry::default(),
+        );
+        let mlx = chat_target("mlx-chat", TargetKind::Mlx, "mlx_chat", "/models/qwen");
+        assert!(!manager.restore_kv(&mlx, "key", "session").await.unwrap());
     }
 }

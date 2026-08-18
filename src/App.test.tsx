@@ -199,6 +199,7 @@ describe("Local AI Router shell", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "Settings" }));
     expect(await screen.findByLabelText("Inference profile")).toHaveValue("stealth");
+    expect(screen.getByRole("heading", { name: "Persistent local KV" })).toBeInTheDocument();
     expect(screen.queryByRole("heading", { name: "Local API keys" })).not.toBeInTheDocument();
     expect(screen.queryByPlaceholderText("New key name")).not.toBeInTheDocument();
     fireEvent.change(screen.getByLabelText("Inference profile"), { target: { value: "balanced" } });
@@ -294,6 +295,29 @@ describe("Local AI Router shell", () => {
     expect(screen.getByRole("button", { name: "CivitAI" })).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "civitai.red" })).not.toBeInTheDocument();
     expect(screen.getByText("GGUF · llama.cpp")).toBeInTheDocument();
+  });
+
+  it("shows persistent KV controls for an installed MLX chat model", async () => {
+    const previous = command.getMockImplementation();
+    command.mockImplementation((name: string, args?: unknown) => {
+      if (name === "list_targets") {
+        return Promise.resolve([
+          { id: "local-qwen", provider_id: null, name: "Qwen 3.5", kind: "mlx", wire_protocol: "open_ai_chat", provider_model: "qwen", local_path: "/models/qwen", runtime_url: "http://127.0.0.1:12100/v1", capabilities: ["chat", "streaming"], enabled: true, state: "ready", size_bytes: 4_000_000_000 },
+        ]);
+      }
+      return previous?.(name, args);
+    });
+    render(<App />);
+    await screen.findByText("Your models, one local endpoint.");
+    fireEvent.click(screen.getByRole("button", { name: "Local models" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Library" }));
+    expect(await screen.findByText("Qwen 3.5")).toBeInTheDocument();
+    fireEvent.click(screen.getByTitle("Resource overrides"));
+    expect(await screen.findByRole("heading", { name: "Qwen 3.5 resources" })).toBeInTheDocument();
+    expect(screen.getByText("Persistent KV (requires parallel = 1)")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /Clear KV cache/ })).toBeInTheDocument();
+    expect(screen.queryByText(/not supported by the MLX runtime/i)).not.toBeInTheDocument();
+    expect(screen.getByText(/Metal/)).toBeInTheDocument();
   });
 
   it("enables adaptive routing per alias and keeps performance by default", async () => {

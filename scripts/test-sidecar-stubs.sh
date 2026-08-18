@@ -52,6 +52,14 @@ curl --silent --fail -H "Authorization: Bearer $TOKEN" -H "content-type: applica
   http://127.0.0.1:12191/v1/chat/completions | grep -q stub-vision
 
 curl --silent --fail -H "Authorization: Bearer $TOKEN" -H "content-type: application/json" \
+  -d '{"filename":"probe.safetensors"}' \
+  "http://127.0.0.1:12191/slots/0?action=save" | grep -q ok
+
+curl --silent --fail -H "Authorization: Bearer $TOKEN" -H "content-type: application/json" \
+  -d '{"filename":"probe.safetensors"}' \
+  "http://127.0.0.1:12191/slots/0?action=restore" | grep -q ok
+
+curl --silent --fail -H "Authorization: Bearer $TOKEN" -H "content-type: application/json" \
   -d '{"model":"stub-image","prompt":"a cat","n":1,"response_format":"b64_json"}' \
   http://127.0.0.1:12192/v1/images/generations | grep -q b64_json
 

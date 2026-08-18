@@ -665,7 +665,10 @@ async fn proxy(
         let Ok((base_url, credential, account_id)) = core.target_endpoint(&target).await else {
             continue;
         };
-        let kv_context = if target.kind == crate::domain::TargetKind::Gguf {
+        let kv_context = if matches!(
+            target.kind,
+            crate::domain::TargetKind::Gguf | crate::domain::TargetKind::Mlx
+        ) {
             match (runtimes.as_ref(), session_id.as_deref()) {
                 (Some(runtimes), Some(session_id)) => {
                     if let Err(error) = runtimes.restore_kv(&target, &api_key_id, session_id).await
@@ -779,6 +782,12 @@ async fn proxy(
         let is_openrouter = provider
             .as_ref()
             .is_some_and(|provider| provider.preset_id == "openrouter");
+        if target.kind == crate::domain::TargetKind::Mlx {
+            request = request.header("x-local-ai-cache-namespace", &api_key_id);
+            if let Some(session_id) = session_id.as_deref() {
+                request = request.header("x-local-ai-session", session_id);
+            }
+        }
         if is_openrouter {
             request = request
                 .header("HTTP-Referer", "https://local-ai-router.app")
@@ -2337,9 +2346,9 @@ mod tests {
         secrets::{MemorySecrets, SecretStore, LOCAL_API_KEY},
         storage::{ModelTarget, Provider, Store},
     };
-    use axum::{body::Body, http::Request, Json};
+    use axum::{body::Body, http::{HeaderMap, HeaderValue, Request}, Json};
     use http_body_util::BodyExt;
-    use std::sync::Arc;
+    use std::{path::PathBuf, sync::Arc};
     use tower::ServiceExt;
 
     async fn test_app() -> Router {
@@ -4435,5 +4444,134 @@ mod tests {
         );
         let long = HeaderValue::from_str(&"x".repeat(129)).unwrap();
         assert!(validated_session_id(Some(&long)).is_err());
+    }
+
+    #[tokio::test]
+    async fn mlx_named_kv_hits_slots_only_with_a_session_header() {
+        let slot_calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let chat_headers = std::sync::Arc::new(std::sync::Mutex::new(Vec::<(Option<String>, Option<String>)>::new()));
+        let slot_for_server = slot_calls.clone();
+        let headers_for_server = chat_headers.clone();
+        let app = Router::new()
+            .route(
+                "/v1/chat/completions",
+                axum::routing::post({
+                    let headers_for_server = headers_for_server.clone();
+                    move |headers: HeaderMap| {
+                        let headers_for_server = headers_for_server.clone();
+                        async move {
+                            headers_for_server.lock().unwrap().push((
+                                headers
+                                    .get("x-local-ai-cache-namespace")
+                                    .and_then(|value| value.to_str().ok())
+                                    .map(str::to_owned),
+                                headers
+                                    .get("x-local-ai-session")
+                                    .and_then(|value| value.to_str().ok())
+                                    .map(str::to_owned),
+                            ));
+                            (
+                                StatusCode::OK,
+                                Json(json!({"id":"ok","choices":[{"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]})),
+                            )
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/slots/0",
+                axum::routing::post({
+                    let slot_for_server = slot_for_server.clone();
+                    move |axum::extract::Query(query): axum::extract::Query<std::collections::HashMap<String, String>>| {
+                        let slot_for_server = slot_for_server.clone();
+                        async move {
+                            slot_for_server
+                                .lock()
+                                .unwrap()
+                                .push(query.get("action").cloned().unwrap_or_default());
+                            (StatusCode::OK, Json(json!({"ok": true})))
+                        }
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let store = Store::memory().await.unwrap();
+        let mut target = sample_target(
+            "mlx-chat",
+            "qwen-local",
+            Some(format!("http://{address}/v1")),
+        );
+        target.kind = TargetKind::Mlx;
+        target.local.runtime_engine = Some("mlx_chat".into());
+        store.upsert_target(&target).await.unwrap();
+
+        let secrets: Arc<dyn SecretStore> = Arc::new(MemorySecrets::default());
+        secrets.set(LOCAL_API_KEY, "test-token").unwrap();
+        let core = AppCore::new(store, secrets).unwrap();
+        core.migrate_legacy_local_api_key().await.unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let runtimes = Arc::new(RuntimeManager::new(
+            PathBuf::new(),
+            cache.path().to_path_buf(),
+            crate::resource::ResourcePolicy::preset(crate::resource::ResourceProfile::Stealth, 8),
+            core.local_activity(),
+        ));
+        let child = tokio::process::Command::new("sleep")
+            .arg("60")
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        runtimes.insert_test_runtime(&target.id, address.port(), child);
+
+        let app = managed_router(Arc::new(core), runtimes);
+        let with_session = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("authorization", "Bearer test-token")
+                    .header("content-type", "application/json")
+                    .header("x-local-ai-session", "chat-1")
+                    .body(Body::from(
+                        r#"{"model":"qwen-local","messages":[{"role":"user","content":"hello"}]}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(with_session.status(), StatusCode::OK);
+        assert_eq!(slot_calls.lock().unwrap().as_slice(), ["save"]);
+        assert_eq!(
+            chat_headers.lock().unwrap()[0],
+            (Some("default".into()), Some("chat-1".into()))
+        );
+
+        slot_calls.lock().unwrap().clear();
+        let without_session = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("authorization", "Bearer test-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"model":"qwen-local","messages":[{"role":"user","content":"hello again"}]}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(without_session.status(), StatusCode::OK);
+        assert!(slot_calls.lock().unwrap().is_empty());
+        assert_eq!(
+            chat_headers.lock().unwrap()[1],
+            (Some("default".into()), None)
+        );
     }
 }
