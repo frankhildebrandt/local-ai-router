@@ -282,10 +282,15 @@ impl HubClient {
         let (engine, task, model_task) = runtime.unwrap_or(("mlx_chat", "chat", ModelTask::Llm));
         let estimated = estimate_memory(model_task, download_bytes, None);
         let capabilities = match model_task {
-            ModelTask::Vlm => vec!["chat".into(), "streaming".into(), "vision".into()],
+            ModelTask::Vlm => vec![
+                "chat".into(),
+                "streaming".into(),
+                "tools".into(),
+                "vision".into(),
+            ],
             ModelTask::Diffusion => vec!["images".into()],
             ModelTask::Tts => vec!["speech".into()],
-            ModelTask::Llm => vec!["chat".into(), "streaming".into()],
+            ModelTask::Llm => vec!["chat".into(), "streaming".into(), "tools".into()],
         };
         Ok(ModelInspection {
             repo_id: repo_id.into(),
@@ -730,6 +735,7 @@ mod tests {
         assert_eq!(inspected.revision, "commit-1");
         assert_eq!(inspected.download_bytes, 100);
         assert!(inspected.files.contains(&"model.safetensors".into()));
+        assert!(inspected.capabilities.contains(&"tools".into()));
     }
 
     fn gb(value: u64) -> u64 {

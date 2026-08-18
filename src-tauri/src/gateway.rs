@@ -21,8 +21,8 @@ use uuid::Uuid;
 use crate::{
     core::{AppCore, InFlightGuard, InFlightRequest},
     domain::{
-        first_byte_timeout_ms, is_fallback_status, is_transient_status, RATE_LIMIT_DEFAULT_SECS,
-        SLOW_WINDOW_SECS,
+        first_byte_timeout_ms, is_fallback_status, is_transient_status, supports_capability,
+        RATE_LIMIT_DEFAULT_SECS, SLOW_WINDOW_SECS,
     },
     protocol::{
         decode_request, decode_response, encode_request, encode_response, validate_cross_protocol,
@@ -328,12 +328,6 @@ async fn proxy(
         if !canonical.tools.is_empty() {
             required_capabilities.push("tools".into());
         }
-        if canonical.reasoning.is_some() {
-            required_capabilities.push("reasoning".into());
-        }
-        if canonical.response_format.is_some() {
-            required_capabilities.push("structured_output".into());
-        }
         for (needed, name) in [
             (
                 canonical
@@ -446,7 +440,7 @@ async fn proxy(
     let mut last_error_target_name: Option<String> = None;
     let mut last_error_detail: Option<(u16, Option<String>, Option<String>)> = None;
     let mut last_translation_error: Option<String> = None;
-    let mut last_capability_error: Option<&str> = None;
+    let mut last_capability_error: Option<String> = None;
     let mut previous_failure: Option<(u16, Option<String>)> = None;
     let mut request_logged = false;
     for target_id in &target_ids {
@@ -471,7 +465,7 @@ async fn proxy(
             .update(&target.id, &target.name, "trying");
         if !target_supports_capability(&target, capability) {
             last_capability_error =
-                Some("No target in this alias supports the requested capability");
+                Some("No target in this alias supports the requested capability".into());
             continue;
         }
         if decoded.is_none()
@@ -483,12 +477,18 @@ async fn proxy(
             continue;
         }
         let mut canonical = decoded.clone();
-        if let Some(canonical) = canonical.as_ref() {
+        if let Some(canonical) = canonical.as_mut() {
+            if canonical.reasoning.is_some() && !target_supports_capability(&target, "reasoning") {
+                canonical.reasoning = None;
+            }
+            if canonical.response_format.is_some()
+                && !target_supports_capability(&target, "structured_output")
+            {
+                canonical.response_format = None;
+            }
             let required = [
                 (is_stream, "streaming"),
                 (!canonical.tools.is_empty(), "tools"),
-                (canonical.reasoning.is_some(), "reasoning"),
-                (canonical.response_format.is_some(), "structured_output"),
                 (
                     canonical
                         .messages
@@ -514,11 +514,11 @@ async fn proxy(
                     "video_input",
                 ),
             ];
-            if required.into_iter().any(|(needed, capability)| {
-                needed && !target.capabilities.iter().any(|item| item == capability)
+            if let Some((_, missing)) = required.into_iter().find(|(needed, capability)| {
+                *needed && !target_supports_capability(&target, capability)
             }) {
                 last_capability_error =
-                    Some("No target in this alias supports the requested media capability");
+                    Some(format!("No target in this alias supports `{missing}`"));
                 continue;
             }
         }
@@ -770,9 +770,7 @@ async fn proxy(
             evaluation.peer_latency_ms,
             has_fallback,
         ));
-        match wait_with_timeout_or_cancel(attempt_timeout, &cancel, request.send())
-            .await
-        {
+        match wait_with_timeout_or_cancel(attempt_timeout, &cancel, request.send()).await {
             WaitOutcome::Cancelled => {
                 return cancelled_proxy_response(
                     &core,
@@ -828,99 +826,100 @@ async fn proxy(
                         upstream.headers().get(header::CONTENT_TYPE).cloned()
                     };
                     let mut upstream_stream = upstream.bytes_stream();
-                    let first_chunk =
-                        match wait_with_timeout_or_cancel(
-                            attempt_timeout,
-                            &cancel,
-                            upstream_stream.next(),
-                        )
-                        .await
+                    let first_chunk = match wait_with_timeout_or_cancel(
+                        attempt_timeout,
+                        &cancel,
+                        upstream_stream.next(),
+                    )
+                    .await
+                    {
+                        WaitOutcome::Cancelled => {
+                            return cancelled_proxy_response(
+                                &core,
+                                public_protocol,
+                                &request_id,
+                                &api_key_id,
+                                uri.path(),
+                                &alias,
+                                Some(&target.name),
+                                attempts,
+                                started,
+                            )
+                            .await;
+                        }
+                        WaitOutcome::Ready(Some(Ok(chunk))) => chunk,
+                        WaitOutcome::Ready(Some(Err(_)))
+                        | WaitOutcome::Ready(None)
+                        | WaitOutcome::Timeout
+                            if has_fallback =>
                         {
-                            WaitOutcome::Cancelled => {
-                                return cancelled_proxy_response(
-                                    &core,
-                                    public_protocol,
-                                    &request_id,
-                                    &api_key_id,
-                                    uri.path(),
-                                    &alias,
-                                    Some(&target.name),
-                                    attempts,
-                                    started,
-                                )
-                                .await;
-                            }
-                            WaitOutcome::Ready(Some(Ok(chunk))) => chunk,
-                            WaitOutcome::Ready(Some(Err(_)))
-                            | WaitOutcome::Ready(None)
-                            | WaitOutcome::Timeout
-                                if has_fallback => {
-                                let mut outcome = RoutingAttemptOutcome::from_previous(
-                                    504,
+                            let mut outcome = RoutingAttemptOutcome::from_previous(
+                                504,
+                                attempt_started.elapsed(),
+                                true,
+                                previous_failure.as_ref(),
+                            );
+                            outcome.retry_after_until =
+                                Some(Utc::now() + chrono::Duration::seconds(SLOW_WINDOW_SECS));
+                            outcome.error_code = Some("timeout".into());
+                            outcome.error_message =
+                                Some("The upstream stream ended before producing data".into());
+                            record_routing_attempt(
+                                &core,
+                                &evaluation,
+                                &request_id,
+                                &target.id,
+                                outcome,
+                            )
+                            .await;
+                            previous_failure = Some((504, Some("timeout".into())));
+                            continue;
+                        }
+                        WaitOutcome::Ready(Some(Err(_)))
+                        | WaitOutcome::Ready(None)
+                        | WaitOutcome::Timeout => {
+                            let outcome = RoutingAttemptOutcome {
+                                error_code: Some("upstream_stream_error".into()),
+                                error_message: Some(
+                                    "The upstream stream ended before producing data".into(),
+                                ),
+                                ..RoutingAttemptOutcome::from_previous(
+                                    502,
                                     attempt_started.elapsed(),
                                     true,
                                     previous_failure.as_ref(),
-                                );
-                                outcome.retry_after_until =
-                                    Some(Utc::now() + chrono::Duration::seconds(SLOW_WINDOW_SECS));
-                                outcome.error_code = Some("timeout".into());
-                                outcome.error_message =
-                                    Some("The upstream stream ended before producing data".into());
-                                record_routing_attempt(
-                                    &core,
-                                    &evaluation,
-                                    &request_id,
-                                    &target.id,
-                                    outcome,
                                 )
-                                .await;
-                                previous_failure = Some((504, Some("timeout".into())));
-                                continue;
-                            }
-                            WaitOutcome::Ready(Some(Err(_)))
-                            | WaitOutcome::Ready(None)
-                            | WaitOutcome::Timeout => {
-                                let outcome = RoutingAttemptOutcome {
-                                    error_code: Some("upstream_stream_error".into()),
-                                    error_message: Some(
-                                        "The upstream stream ended before producing data".into(),
-                                    ),
-                                    ..RoutingAttemptOutcome::from_previous(
-                                        502,
-                                        attempt_started.elapsed(),
-                                        true,
-                                        previous_failure.as_ref(),
-                                    )
-                                };
-                                record_routing_attempt(
-                                    &core,
-                                    &evaluation,
-                                    &request_id,
-                                    &target.id,
-                                    outcome,
-                                )
-                                .await;
-                                last_error = Some(request_error(
-                                    public_protocol,
-                                    StatusCode::BAD_GATEWAY,
-                                    "upstream_stream_error",
-                                    "The upstream stream ended before producing data",
-                                ));
-                                last_error_target_id = Some(target.id.clone());
-                                last_error_target_name = Some(target.name.clone());
-                                last_error_detail = Some((
-                                    502,
-                                    Some("upstream_stream_error".into()),
-                                    Some("The upstream stream ended before producing data".into()),
-                                ));
-                                continue;
-                            }
-                        };
+                            };
+                            record_routing_attempt(
+                                &core,
+                                &evaluation,
+                                &request_id,
+                                &target.id,
+                                outcome,
+                            )
+                            .await;
+                            last_error = Some(request_error(
+                                public_protocol,
+                                StatusCode::BAD_GATEWAY,
+                                "upstream_stream_error",
+                                "The upstream stream ended before producing data",
+                            ));
+                            last_error_target_id = Some(target.id.clone());
+                            last_error_target_name = Some(target.name.clone());
+                            last_error_detail = Some((
+                                502,
+                                Some("upstream_stream_error".into()),
+                                Some("The upstream stream ended before producing data".into()),
+                            ));
+                            continue;
+                        }
+                    };
                     attempt_ttft = Some(attempt_started.elapsed());
-                    inflight
-                        .as_ref()
-                        .expect("in-flight guard")
-                        .update(&target.id, &target.name, "streaming");
+                    inflight.as_ref().expect("in-flight guard").update(
+                        &target.id,
+                        &target.name,
+                        "streaming",
+                    );
                     let stream_guard = inflight.take().expect("in-flight guard");
                     let stream_core = core.clone();
                     let stream_request_id = request_id.clone();
@@ -1439,7 +1438,7 @@ async fn proxy(
             public_protocol,
             StatusCode::BAD_REQUEST,
             "unsupported_capability",
-            error,
+            &error,
         );
     }
     request_error(
@@ -1923,16 +1922,7 @@ fn route_supports_capability(route: &crate::domain::ModelRoute, capability: &str
 }
 
 fn target_supports_capability(target: &crate::storage::ModelTarget, capability: &str) -> bool {
-    if capability == "speech"
-        && matches!(
-            target.kind,
-            crate::domain::TargetKind::Gguf | crate::domain::TargetKind::Mlx
-        )
-    {
-        return target.capabilities.iter().any(|item| item == "speech");
-    }
-    target.capabilities.iter().any(|item| item == capability)
-        || (capability == "speech" && target.capabilities.iter().any(|item| item == "audio"))
+    supports_capability(target.kind, &target.capabilities, capability)
 }
 
 fn validate_local_image_request(payload: &Value) -> anyhow::Result<()> {
@@ -2248,7 +2238,7 @@ mod tests {
         secrets::{MemorySecrets, SecretStore, LOCAL_API_KEY},
         storage::{ModelTarget, Provider, Store},
     };
-    use axum::{body::Body, http::Request};
+    use axum::{body::Body, http::Request, Json};
     use http_body_util::BodyExt;
     use std::sync::Arc;
     use tower::ServiceExt;
@@ -2371,6 +2361,54 @@ mod tests {
             response.headers().get("x-local-ai-target").unwrap(),
             "local-chat"
         );
+    }
+
+    #[tokio::test]
+    async fn hermes_responses_tools_and_reasoning_hints_reach_local_chat_models() {
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
+        let captured_for_server = captured.clone();
+        let app = Router::new().fallback(move |Json(body): Json<Value>| {
+            let captured = captured_for_server.clone();
+            async move {
+                captured.lock().unwrap().push(body);
+                (
+                    StatusCode::OK,
+                    Json(json!({"id":"ok","choices":[{"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]})),
+                )
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let url = format!("http://{address}/v1");
+        let store = Store::memory().await.unwrap();
+        let mut target = sample_target("local-chat", "qwen-3-5-4b", Some(url));
+        target.kind = TargetKind::Mlx;
+        target.capabilities = vec!["chat".into(), "streaming".into()];
+        store.upsert_target(&target).await.unwrap();
+        let app = app_from_store(store).await;
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/responses")
+                    .header("authorization", "Bearer test-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"model":"qwen-3-5-4b","input":"hello","tools":[{"type":"function","name":"terminal","parameters":{"type":"object"}}],"reasoning":{"effort":"medium","summary":"auto"},"include":["reasoning.encrypted_content"],"store":false}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let forwarded = captured.lock().unwrap();
+        assert_eq!(forwarded.len(), 1);
+        assert_eq!(forwarded[0]["tools"][0]["function"]["name"], "terminal");
+        assert!(forwarded[0].get("reasoning_effort").is_none());
+        assert!(forwarded[0].get("reasoning").is_none());
     }
 
     #[tokio::test]

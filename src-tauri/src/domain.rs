@@ -22,7 +22,7 @@ impl RouteRole {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum TargetKind {
     #[serde(alias = "open_ai", alias = "open_router")]
@@ -40,6 +40,16 @@ impl TargetKind {
     pub fn is_alias(&self) -> bool {
         matches!(self, Self::Alias)
     }
+}
+
+pub fn supports_capability(kind: TargetKind, advertised: &[String], required: &str) -> bool {
+    if advertised.iter().any(|item| item == required) {
+        return true;
+    }
+    if required == "speech" && !kind.is_local() && advertised.iter().any(|item| item == "audio") {
+        return true;
+    }
+    required == "tools" && kind.is_local() && advertised.iter().any(|item| item == "chat")
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -240,6 +250,24 @@ mod tests {
         assert!(!is_slow_outlier(7_999, 1_000));
         assert!(is_slow_outlier(8_000, 1_000));
         assert!(is_slow_outlier(30_000, 2_000));
+    }
+
+    #[test]
+    fn local_chat_implies_tools_while_legacy_audio_is_not_speech() {
+        let chat = vec!["chat".into(), "streaming".into()];
+        assert!(supports_capability(TargetKind::Mlx, &chat, "tools"));
+        assert!(supports_capability(TargetKind::Gguf, &chat, "chat"));
+        assert!(!supports_capability(TargetKind::Cloud, &chat, "tools"));
+        assert!(!supports_capability(
+            TargetKind::Mlx,
+            &["audio".into()],
+            "speech"
+        ));
+        assert!(supports_capability(
+            TargetKind::Cloud,
+            &["audio".into()],
+            "speech"
+        ));
     }
 
     #[test]

@@ -5,7 +5,7 @@ use regex::RegexBuilder;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    domain::{ModelRoute, RouteRole, TargetKind},
+    domain::{supports_capability as advertised_capability, ModelRoute, RouteRole, TargetKind},
     protocol::{CanonicalRequest, ContentBlock},
     storage::Store,
 };
@@ -811,16 +811,7 @@ fn reserve_exclude_reason(
 }
 
 fn supports_capability(candidate: &CandidateInput, required: &str) -> bool {
-    candidate
-        .capabilities
-        .iter()
-        .any(|capability| capability == required)
-        || (required == "speech"
-            && matches!(candidate.kind, TargetKind::Cloud)
-            && candidate
-                .capabilities
-                .iter()
-                .any(|capability| capability == "audio"))
+    advertised_capability(candidate.kind, &candidate.capabilities, required)
 }
 
 fn normalized_weights(weights: &RoutingWeights) -> RoutingWeights {
@@ -1418,5 +1409,30 @@ mod tests {
             .excluded
             .iter()
             .any(|item| item.target_id == "chat-a" && item.reason == "capability"));
+    }
+
+    #[tokio::test]
+    async fn local_chat_models_stay_eligible_when_tools_are_required() {
+        let (store, route) = pool_fixture().await;
+        let evaluation = evaluate_route(
+            &store,
+            &route,
+            RouteEvaluationInput {
+                policy: None,
+                explicit_task: None,
+                endpoint: "/v1/responses",
+                canonical: None,
+                required_capabilities: vec!["chat".into(), "tools".into()],
+                streaming: false,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            evaluation.ordered_target_ids,
+            vec!["chat-a", "chat-b", "vision"]
+        );
+        assert!(evaluation.decision.excluded.is_empty());
     }
 }

@@ -169,8 +169,8 @@ pub const IMAGE_TYPES: &[&str] = &[
 ];
 pub const SPEECH_TYPES: &[&str] = &["kokoro"];
 
-const CHAT: &[&str] = &["chat", "streaming"];
-const CHAT_VISION: &[&str] = &["chat", "streaming", "vision"];
+const CHAT: &[&str] = &["chat", "streaming", "tools"];
+const CHAT_VISION: &[&str] = &["chat", "streaming", "tools", "vision"];
 const IMAGES: &[&str] = &["images"];
 const SPEECH: &[&str] = &["speech"];
 const KOKORO_VOICES: &[&str] = &[
@@ -915,6 +915,12 @@ mod tests {
                 .alias,
             "qwen-3-5-4b"
         );
+        assert!(models
+            .iter()
+            .find(|model| model.id == "qwen-3-5-4b")
+            .unwrap()
+            .capabilities
+            .contains(&"tools"));
         let qwen38 = models
             .iter()
             .find(|model| model.id == "qwen-3-8-27b")
