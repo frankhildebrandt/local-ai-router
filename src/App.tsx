@@ -6,11 +6,12 @@ import {
   Activity, BarChart3, BookOpen, Bot, Box, Check, ChevronRight, CircleAlert, Cloud, Copy, Database,
   Download, Eye, FileDown, Gauge, KeyRound, Layers3, ListRestart, LoaderCircle, Menu,
   Plus, RefreshCw, Route, Search, Settings, ShieldCheck, Sparkles, Timer,
-  Trash2, X,
+  Trash2, Wallet, X, Zap,
 } from "lucide-react";
 import { command, errorMessage, isTauri, listenDesktopNavigate, listenGatewayTraffic } from "./api";
 import type { DashboardData, InFlightRequest, LocalApiKey, LogFacets, LogQuery, LogResult, ModelMetadata, ModelRoute, ModelTarget, Provider, ProviderModel, ProviderPreset, PublicModel, RequestLog, ResourcePolicy, ResourceProfile, RouteRole, RouteTarget, RoutingAttempt, RoutingConfigExport, RoutingEvaluation, RoutingPolicy, RoutingTaskDefinition, TargetKind, TargetRoutingProfile, UsageData, WireProtocol } from "./types";
 import { ApiKeysPage } from "./ApiKeysPage";
+import { CandleLineChart } from "./CandleLineChart";
 import { LocalPage } from "./LocalPage";
 
 type Page = "overview" | "chat" | "keys" | "usage" | "providers" | "cloud" | "local" | "routes" | "logs" | "routing" | "settings";
@@ -143,8 +144,11 @@ function Overview({ dashboard, inflight, targets, publicModels, onNavigate, onSt
     </div>
     <div className="two-col">
       <section className="panel"><div className="panel-title"><div><h3>Quickstart</h3><p>Works with the official OpenAI SDK. Copy a token from API keys.</p></div><div className="button-row"><button className="text-button" onClick={() => onNavigate("keys")}>Create a key <ChevronRight size={15} /></button><CopyButton value={snippet} /></div></div><pre><code>{snippet}</code></pre></section>
-      <section className="panel"><div className="panel-title"><div><h3>Local runtimes</h3><p>{local.length} installed · {dashboard.runtimes.length} loaded</p></div><button className="text-button" onClick={() => onNavigate("local")}>Manage <ChevronRight size={15} /></button></div>
-        <div className="stack-list">{local.length ? local.slice(0, 4).map(model => <ModelRow key={model.id} model={model} runtime={dashboard.runtimes.find(runtime => runtime.target_id === model.id)} compact />) : <Empty icon={<Box />} title="No local models" text="Import an MLX folder or GGUF file." />}</div>
+      <section className="panel"><div className="panel-title"><div><h3>Local runtimes</h3><p>{dashboard.runtimes.length} loaded{local.length ? ` · ${local.length} installed` : ""}</p></div><button className="text-button" onClick={() => onNavigate("local")}>Manage <ChevronRight size={15} /></button></div>
+        <div className="stack-list">{dashboard.runtimes.length ? dashboard.runtimes.map(runtime => {
+          const model = targets.find(target => target.id === runtime.target_id);
+          return model ? <ModelRow key={runtime.target_id} model={model} runtime={runtime} compact /> : null;
+        }) : <Empty icon={<Box />} title="No models loaded" text="Load a local model from the library to see throughput here." />}</div>
       </section>
     </div>
     <section className="panel">
@@ -161,33 +165,55 @@ function Elapsed({ since }: { since: string }) {
   return <span>{ms < 1000 ? `${ms} ms` : `${(ms / 1000).toFixed(1)} s`}</span>;
 }
 
-const emptyUsage: UsageData = { request_count: 0, success_count: 0, average_latency_ms: 0, input_tokens: 0, output_tokens: 0, unknown_usage_count: 0, buckets: [], by_key: [] };
+const emptyUsage: UsageData = { request_count: 0, success_count: 0, average_latency_ms: 0, input_tokens: 0, output_tokens: 0, cache_read_tokens: 0, cache_write_tokens: 0, unknown_usage_count: 0, tokens_per_second: null, estimated_cost_usd: null, buckets: [], by_key: [], by_model: [], throughput_candles: [], cost_candles: [] };
 
 function UsagePage() {
   const [period, setPeriod] = useState<"24h" | "7d" | "30d" | "all">("7d");
+  const [target, setTarget] = useState<string | null>(null);
   const [usage, setUsage] = useState<UsageData>(emptyUsage);
   const [loading, setLoading] = useState(true);
   useEffect(() => {
     if (!isTauri()) { setLoading(false); return; }
     let active = true;
-    const load = async () => { try { const data = await command<UsageData>("get_usage", { period }); if (active) setUsage(data); } finally { if (active) setLoading(false); } };
+    const load = async () => { try { const data = await command<UsageData>("get_usage", target ? { period, target } : { period }); if (active) setUsage(data); } finally { if (active) setLoading(false); } };
     void load(); const timer = window.setInterval(() => void load(), 10_000); return () => { active = false; clearInterval(timer); };
-  }, [period]);
-  const maxRequests = Math.max(1, ...usage.buckets.map(bucket => bucket.request_count));
-  const maxTokens = Math.max(1, ...usage.buckets.map(bucket => bucket.input_tokens + bucket.output_tokens));
+  }, [period, target]);
   const successRate = usage.request_count ? `${Math.round(usage.success_count / usage.request_count * 100)}%` : "—";
+  const models = usage.by_model ?? [];
   return <>
-    <PageHead eyebrow="Observability" title="Usage" description="Provider-reported token usage and request health, without storing request content." action={<div className="segmented small period-picker">{(["24h", "7d", "30d", "all"] as const).map(value => <button key={value} className={period === value ? "selected" : ""} onClick={() => setPeriod(value)}>{value === "all" ? "All" : value}</button>)}</div>} />
+    <PageHead eyebrow="Observability" title="Usage" description="Provider-reported token usage, generation speed and theoretical list-price cost, without storing request content." action={<div className="segmented small period-picker">{(["24h", "7d", "30d", "all"] as const).map(value => <button key={value} className={period === value ? "selected" : ""} onClick={() => setPeriod(value)}>{value === "all" ? "All" : value}</button>)}</div>} />
     <div className="metric-grid usage-metrics">
       <Metric icon={<Activity />} value={formatNumber(usage.request_count)} label="Requests" />
       <Metric icon={<Check />} value={successRate} label="Success rate" />
       <Metric icon={<Gauge />} value={`${Math.round(usage.average_latency_ms)} ms`} label="Average latency" />
+      <Metric icon={<Zap />} value={formatToks(usage.tokens_per_second)} label="Current tokens/s" />
+      <Metric icon={<Wallet />} value={formatUsd(usage.estimated_cost_usd)} label="Theoretical cost" />
       <Metric icon={<Download />} value={formatNumber(usage.input_tokens)} label="Input tokens" />
       <Metric icon={<BarChart3 />} value={formatNumber(usage.output_tokens)} label="Output tokens" />
       <Metric icon={<CircleAlert />} value={formatNumber(usage.unknown_usage_count)} label="Incomplete usage" />
     </div>
-    <section className="panel usage-chart-panel"><div className="panel-title"><div><h3>Usage over time</h3><p><i className="legend requests" /> Requests <i className="legend tokens" /> Tokens</p></div><small>{usage.unknown_usage_count} request{usage.unknown_usage_count === 1 ? "" : "s"} without complete usage</small></div>
-      {loading ? <Loading /> : usage.buckets.length ? <div className="usage-chart">{usage.buckets.map(bucket => <div className="usage-column" key={bucket.start} title={`${new Date(bucket.start).toLocaleString()} · ${bucket.request_count} requests · ${formatNumber(bucket.input_tokens + bucket.output_tokens)} tokens`}><div className="bars"><i className="request-bar" style={{ height: `${Math.max(3, bucket.request_count / maxRequests * 100)}%` }} /><i className="token-bar" style={{ height: `${Math.max(3, (bucket.input_tokens + bucket.output_tokens) / maxTokens * 100)}%` }} /></div><span>{new Date(bucket.start).toLocaleDateString(undefined, { month: "short", day: "numeric", ...(period === "24h" ? { hour: "2-digit" } : {}) })}</span></div>)}</div> : <Empty icon={<BarChart3 />} title="No usage yet" text="Authenticated inference requests will appear here." />}
+    <section className="panel usage-chart-panel"><div className="panel-title"><div><h3>Tokens / second</h3><p><i className="legend candles" /> OHLC <i className="legend line" /> Average{target ? ` · ${target}` : ""}</p></div><small>{usage.unknown_usage_count} request{usage.unknown_usage_count === 1 ? "" : "s"} without complete usage</small></div>
+      {loading ? <Loading /> : <CandleLineChart candles={usage.throughput_candles ?? []} unit="tok/s" formatValue={value => value.toFixed(1)} empty={<Empty icon={<Zap />} title="No throughput yet" text="Successful completions with output tokens will appear here." />} />}
+    </section>
+    <section className="panel usage-chart-panel"><div className="panel-title"><div><h3>Cost over time</h3><p>List prices × tokens, including cache read/write when reported.</p></div></div>
+      <CandleLineChart candles={usage.cost_candles ?? []} unit="USD" formatValue={value => formatUsd(value)} empty={<Empty icon={<Wallet />} title="No priced usage" text="Cloud requests with known list prices will estimate spend here. Local models are $0." />} />
+    </section>
+    <section className="panel"><div className="panel-title"><div><h3>Usage by model</h3><p>Click a row to filter the charts. Alias is the requested name; target is what served it.</p></div>{target && <button className="text-button" onClick={() => setTarget(null)}>Show all</button>}</div>
+      <div className="usage-table"><div className="usage-head model-stats-head"><span>Model</span><span>Requests</span><span>Tokens/s</span><span>Cost</span><span>Input</span><span>Output</span></div>
+        {models.map(item => {
+          const key = item.target ?? item.alias ?? "unknown";
+          const selected = target != null && item.target === target;
+          return <button type="button" className={`usage-row model-stats-row ${selected ? "selected" : ""}`} key={`${item.alias ?? ""}:${item.target ?? ""}`} onClick={() => setTarget(selected ? null : item.target)}>
+            <strong>{item.target ?? "—"}<small>{item.alias ?? "—"}</small></strong>
+            <span>{formatNumber(item.request_count)}</span>
+            <span>{formatToks(item.tokens_per_second)}</span>
+            <span>{formatUsd(item.estimated_cost_usd)}</span>
+            <span>{formatNumber(item.input_tokens)}</span>
+            <span>{formatNumber(item.output_tokens)}</span>
+          </button>;
+        })}
+      </div>
+      {!models.length && <Empty icon={<BarChart3 />} title="No model usage" text="Authenticated inference will group tokens by target here." />}
     </section>
     <section className="panel"><div className="panel-title"><div><h3>Usage by API key</h3><p>Revoked keys and legacy traffic remain attributable.</p></div></div><div className="usage-table"><div className="usage-head"><span>API key</span><span>Requests</span><span>Success</span><span>Latency</span><span>Input</span><span>Output</span></div>{usage.by_key.map(item => <div className="usage-row" key={item.api_key_id ?? "legacy"}><strong>{item.api_key_name}</strong><span>{formatNumber(item.request_count)}</span><span>{item.request_count ? `${Math.round(item.success_count / item.request_count * 100)}%` : "—"}</span><span>{Math.round(item.average_latency_ms)} ms</span><span>{formatNumber(item.input_tokens)}</span><span>{formatNumber(item.output_tokens)}</span></div>)}</div>{!usage.by_key.length && <Empty icon={<KeyRound />} title="No key usage" text="Usage will be grouped by the authenticating local key." />}</section>
   </>;
@@ -554,7 +580,10 @@ function SettingsPage({ settings, resourcePolicy, dashboard, refresh, success, f
   </>;
 }
 
-function ModelRow({ model, runtime, compact }: { model: ModelTarget; runtime?: DashboardData["runtimes"][number]; compact?: boolean }) { return <div className="model-row"><div className="model-icon small"><Box size={17} /></div><div className="grow"><strong>{model.name}</strong><span>{runtime ? `${runtime.profile} · ${runtime.compute_duty_percent}% duty · ${formatBytes(runtime.resident_bytes)} RSS · ${runtime.active} active / ${runtime.queued} queued${runtime.pending_restart ? " · restart pending" : ""}` : `${model.kind.toUpperCase()} ${model.size_bytes ? `· ${formatBytes(model.size_bytes)}` : ""}`}</span></div><Badge tone={runtime?.memory_warning ? "warn" : model.state === "ready" ? "good" : "neutral"}>{runtime?.memory_warning ? "Over budget" : compact && model.state === "stopped" ? "Installed" : model.state}</Badge></div>; }
+function ModelRow({ model, runtime, compact }: { model: ModelTarget; runtime?: DashboardData["runtimes"][number]; compact?: boolean }) {
+  const tps = runtime?.tokens_per_second != null ? `${runtime.tokens_per_second.toFixed(1)} tok/s · ` : "";
+  return <div className="model-row"><div className="model-icon small"><Box size={17} /></div><div className="grow"><strong>{model.name}</strong><span>{runtime ? `${tps}${runtime.profile} · ${runtime.compute_duty_percent}% duty · ${formatBytes(runtime.resident_bytes)} RSS · ${runtime.active} active / ${runtime.queued} queued${runtime.pending_restart ? " · restart pending" : ""}` : `${model.kind.toUpperCase()} ${model.size_bytes ? `· ${formatBytes(model.size_bytes)}` : ""}`}</span></div><Badge tone={runtime?.memory_warning ? "warn" : model.state === "ready" ? "good" : "neutral"}>{runtime?.memory_warning ? "Over budget" : compact && model.state === "stopped" ? "Installed" : model.state}</Badge></div>;
+}
 function Metric({ icon, value, label }: { icon: ReactNode; value: ReactNode; label: string }) { return <div className="metric"><span>{icon}</span><div><strong>{value}</strong><small>{label}</small></div></div>; }
 function CapabilityList({ items }: { items: string[] }) { return <div className="capabilities">{items.slice(0, 4).map(item => <span key={item}>{item}</span>)}</div>; }
 function Badge({ children, tone }: { children: ReactNode; tone: "good" | "warn" | "bad" | "neutral" }) { return <span className={`badge ${tone}`}>{children}</span>; }
@@ -571,6 +600,13 @@ function NumberSetting({ value: initial, suffix, onSave }: { value: string; suff
 function ResourceNumber({ label, value, min, max, suffix, onChange, onSave }: { label: string; value: number; min: number; max: number; suffix: string; onChange: (value: number) => void; onSave: () => void }) { return <label className="resource-number"><span>{label}</span><div className="number-setting"><input aria-label={label} type="number" min={min} max={max} value={value} onChange={event => onChange(Math.max(min, Math.min(max, Number(event.target.value))))} onBlur={onSave} /><span>{suffix}</span></div></label>; }
 function formatBytes(value: number | null) { if (!value) return "Size unknown"; const units = ["B", "KB", "MB", "GB", "TB"]; const index = Math.min(Math.floor(Math.log(value) / Math.log(1024)), units.length - 1); return `${(value / 1024 ** index).toFixed(index > 2 ? 1 : 0)} ${units[index]}`; }
 function formatNumber(value: number) { return new Intl.NumberFormat().format(value); }
+function formatToks(value?: number | null) { return value == null ? "—" : `${value.toFixed(1)} tok/s`; }
+function formatUsd(value?: number | null) {
+  if (value == null) return "Unknown";
+  if (value === 0) return "$0.00";
+  if (Math.abs(value) < 0.01) return `$${value.toFixed(4)}`;
+  return `$${value.toFixed(2)}`;
+}
 function statusTone(status: number): "good" | "warn" | "bad" | "neutral" { if (status >= 200 && status < 300) return "good"; if (status >= 400 && status < 500) return "warn"; if (status >= 500) return "bad"; return "neutral"; }
 function accessLabel(tier?: ProviderPreset["access_tier"]) { return ({ free_tier: "Free tier", starter_credits: "Starter credits", paid: "Paid", subscription: "Subscription", experimental: "Experimental" } as const)[tier ?? "paid"]; }
 function protocolLabel(protocol: WireProtocol) { return ({ open_ai_chat: "OpenAI Chat", open_ai_responses: "OpenAI Responses", anthropic_messages: "Anthropic Messages", gemini_generate_content: "Gemini GenerateContent" } as const)[protocol]; }

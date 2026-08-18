@@ -100,6 +100,10 @@ pub struct ProviderModel {
     pub input_price_per_million: Option<f64>,
     #[serde(default)]
     pub output_price_per_million: Option<f64>,
+    #[serde(default)]
+    pub cache_read_price_per_million: Option<f64>,
+    #[serde(default)]
+    pub cache_write_price_per_million: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -123,10 +127,33 @@ pub struct RequestLog {
     pub latency_ms: i64,
     pub input_tokens: Option<i64>,
     pub output_tokens: Option<i64>,
+    #[serde(default)]
+    pub cache_read_tokens: Option<i64>,
+    #[serde(default)]
+    pub cache_write_tokens: Option<i64>,
     pub error_code: Option<String>,
     pub error_message: Option<String>,
     pub api_key_id: Option<String>,
     pub api_key_name: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TokenUsage {
+    pub input_tokens: Option<i64>,
+    pub output_tokens: Option<i64>,
+    #[serde(default)]
+    pub cache_read_tokens: Option<i64>,
+    #[serde(default)]
+    pub cache_write_tokens: Option<i64>,
+}
+
+impl TokenUsage {
+    pub fn is_present(self) -> bool {
+        self.input_tokens.is_some()
+            || self.output_tokens.is_some()
+            || self.cache_read_tokens.is_some()
+            || self.cache_write_tokens.is_some()
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -165,7 +192,25 @@ pub struct UsageSummary {
     pub average_latency_ms: f64,
     pub input_tokens: i64,
     pub output_tokens: i64,
+    #[serde(default)]
+    pub cache_read_tokens: i64,
+    #[serde(default)]
+    pub cache_write_tokens: i64,
     pub unknown_usage_count: i64,
+    #[serde(default)]
+    pub tokens_per_second: Option<f64>,
+    #[serde(default)]
+    pub estimated_cost_usd: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UsageCandle {
+    pub start: DateTime<Utc>,
+    pub open: f64,
+    pub high: f64,
+    pub low: f64,
+    pub close: f64,
+    pub avg: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -198,6 +243,12 @@ pub struct UsageData {
     pub summary: UsageSummary,
     pub buckets: Vec<UsageBucket>,
     pub by_key: Vec<KeyUsage>,
+    #[serde(default)]
+    pub by_model: Vec<ModelUsage>,
+    #[serde(default)]
+    pub throughput_candles: Vec<UsageCandle>,
+    #[serde(default)]
+    pub cost_candles: Vec<UsageCandle>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -355,6 +406,18 @@ impl Store {
             sqlx::query("ALTER TABLE request_logs ADD COLUMN error_message TEXT")
                 .execute(&self.pool)
                 .await?;
+        }
+        for column in ["cache_read_tokens", "cache_write_tokens"] {
+            if !log_columns
+                .iter()
+                .any(|entry| entry.get::<String, _>("name") == column)
+            {
+                sqlx::query(&format!(
+                    "ALTER TABLE request_logs ADD COLUMN {column} INTEGER"
+                ))
+                .execute(&self.pool)
+                .await?;
+            }
         }
         let provider_columns = sqlx::query("PRAGMA table_info(providers)")
             .fetch_all(&self.pool)
@@ -642,6 +705,8 @@ impl Store {
                     context_window: metadata.context_window,
                     input_price_per_million: metadata.input_price_per_million,
                     output_price_per_million: metadata.output_price_per_million,
+                    cache_read_price_per_million: metadata.cache_read_price_per_million,
+                    cache_write_price_per_million: metadata.cache_write_price_per_million,
                 })
             })
             .collect()
@@ -1164,22 +1229,20 @@ impl Store {
     }
 
     pub async fn insert_log(&self, log: &RequestLog) -> anyhow::Result<()> {
-        sqlx::query("INSERT INTO request_logs(id,created_at,endpoint,alias,target,attempts,status,latency_ms,input_tokens,output_tokens,error_code,error_message,api_key_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)")
+        sqlx::query("INSERT INTO request_logs(id,created_at,endpoint,alias,target,attempts,status,latency_ms,input_tokens,output_tokens,cache_read_tokens,cache_write_tokens,error_code,error_message,api_key_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
             .bind(&log.id).bind(log.created_at.to_rfc3339()).bind(&log.endpoint).bind(&log.alias).bind(&log.target)
-            .bind(log.attempts).bind(log.status).bind(log.latency_ms).bind(log.input_tokens).bind(log.output_tokens).bind(&log.error_code).bind(&log.error_message).bind(&log.api_key_id)
+            .bind(log.attempts).bind(log.status).bind(log.latency_ms).bind(log.input_tokens).bind(log.output_tokens)
+            .bind(log.cache_read_tokens).bind(log.cache_write_tokens).bind(&log.error_code).bind(&log.error_message).bind(&log.api_key_id)
             .execute(&self.pool).await?;
         Ok(())
     }
 
-    pub async fn update_log_usage(
-        &self,
-        id: &str,
-        input_tokens: Option<i64>,
-        output_tokens: Option<i64>,
-    ) -> anyhow::Result<()> {
-        sqlx::query("UPDATE request_logs SET input_tokens=?,output_tokens=? WHERE id=?")
-            .bind(input_tokens)
-            .bind(output_tokens)
+    pub async fn update_log_usage(&self, id: &str, usage: TokenUsage) -> anyhow::Result<()> {
+        sqlx::query("UPDATE request_logs SET input_tokens=?,output_tokens=?,cache_read_tokens=?,cache_write_tokens=? WHERE id=?")
+            .bind(usage.input_tokens)
+            .bind(usage.output_tokens)
+            .bind(usage.cache_read_tokens)
+            .bind(usage.cache_write_tokens)
             .bind(id)
             .execute(&self.pool)
             .await?;
@@ -1241,28 +1304,36 @@ impl Store {
     }
 
     pub async fn usage(&self, period: &str) -> anyhow::Result<UsageData> {
-        self.usage_at(period, Utc::now()).await
+        self.usage_at(period, Utc::now(), None).await
     }
 
-    async fn usage_at(&self, period: &str, now: DateTime<Utc>) -> anyhow::Result<UsageData> {
-        let (cutoff, hourly) = match period {
-            "24h" => (Some(now - chrono::Duration::hours(24)), true),
-            "7d" => (Some(now - chrono::Duration::days(7)), false),
-            "30d" => (Some(now - chrono::Duration::days(30)), false),
-            "all" => (None, false),
-            _ => anyhow::bail!("usage period must be 24h, 7d, 30d or all"),
-        };
+    pub async fn usage_for_target(
+        &self,
+        period: &str,
+        target: Option<&str>,
+    ) -> anyhow::Result<UsageData> {
+        self.usage_at(period, Utc::now(), target).await
+    }
 
-        let metrics = "COUNT(*) AS request_count, COALESCE(SUM(CASE WHEN l.status >= 200 AND l.status < 300 THEN 1 ELSE 0 END),0) AS success_count, COALESCE(AVG(l.latency_ms),0.0) AS average_latency_ms, COALESCE(SUM(l.input_tokens),0) AS input_tokens, COALESCE(SUM(l.output_tokens),0) AS output_tokens, COALESCE(SUM(CASE WHEN l.input_tokens IS NULL OR l.output_tokens IS NULL THEN 1 ELSE 0 END),0) AS unknown_usage_count";
+    async fn usage_at(
+        &self,
+        period: &str,
+        now: DateTime<Utc>,
+        target: Option<&str>,
+    ) -> anyhow::Result<UsageData> {
+        let (cutoff, hourly, candle_step) = usage_period(period, now)?;
+
+        let metrics = usage_metrics_sql();
         let mut summary_query =
             QueryBuilder::<Sqlite>::new(format!("SELECT {metrics} FROM request_logs l"));
-        push_usage_cutoff(&mut summary_query, cutoff);
-        let summary = usage_summary_from_row(summary_query.build().fetch_one(&self.pool).await?);
+        push_usage_filters(&mut summary_query, cutoff, target);
+        let mut summary =
+            usage_summary_from_row(summary_query.build().fetch_one(&self.pool).await?);
 
         let mut by_key_query = QueryBuilder::<Sqlite>::new(format!(
             "SELECT l.api_key_id,COALESCE(k.name,'Unknown / Legacy') AS api_key_name,{metrics} FROM request_logs l LEFT JOIN local_api_keys k ON k.id=l.api_key_id"
         ));
-        push_usage_cutoff(&mut by_key_query, cutoff);
+        push_usage_filters(&mut by_key_query, cutoff, target);
         by_key_query.push(" GROUP BY l.api_key_id,k.name ORDER BY request_count DESC,api_key_name");
         let by_key = by_key_query
             .build()
@@ -1276,6 +1347,24 @@ impl Store {
             })
             .collect();
 
+        let mut by_model_query = QueryBuilder::<Sqlite>::new(format!(
+            "SELECT l.alias,l.target,{metrics} FROM request_logs l"
+        ));
+        push_usage_cutoff(&mut by_model_query, cutoff);
+        by_model_query
+            .push(" GROUP BY l.alias,l.target ORDER BY request_count DESC,l.alias,l.target");
+        let mut by_model = by_model_query
+            .build()
+            .fetch_all(&self.pool)
+            .await?
+            .into_iter()
+            .map(|row| ModelUsage {
+                alias: row.get("alias"),
+                target: row.get("target"),
+                summary: usage_summary_from_row(row),
+            })
+            .collect::<Vec<_>>();
+
         let bucket_expression = if hourly {
             "strftime('%Y-%m-%dT%H:00:00Z',l.created_at)"
         } else {
@@ -1284,7 +1373,7 @@ impl Store {
         let mut bucket_query = QueryBuilder::<Sqlite>::new(format!(
             "SELECT {bucket_expression} AS bucket_start,COUNT(*) AS request_count,COALESCE(SUM(l.input_tokens),0) AS input_tokens,COALESCE(SUM(l.output_tokens),0) AS output_tokens FROM request_logs l"
         ));
-        push_usage_cutoff(&mut bucket_query, cutoff);
+        push_usage_filters(&mut bucket_query, cutoff, target);
         bucket_query.push(" GROUP BY bucket_start ORDER BY bucket_start");
         let buckets = bucket_query
             .build()
@@ -1301,11 +1390,134 @@ impl Store {
             })
             .collect::<anyhow::Result<_>>()?;
 
+        let samples = self.usage_samples(cutoff, None).await?;
+        let rates = self.cost_rate_map().await?;
+        let filtered: Vec<&UsageSample> = samples
+            .iter()
+            .filter(|sample| {
+                target
+                    .map(|name| sample.target.as_deref() == Some(name))
+                    .unwrap_or(true)
+            })
+            .collect();
+        summary.tokens_per_second = current_tokens_per_second(&filtered, now);
+        summary.estimated_cost_usd = total_estimated_cost(&filtered, &rates);
+        for model in &mut by_model {
+            let group: Vec<&UsageSample> = samples
+                .iter()
+                .filter(|sample| sample.alias == model.alias && sample.target == model.target)
+                .collect();
+            model.summary.tokens_per_second = current_tokens_per_second(&group, now);
+            model.summary.estimated_cost_usd = total_estimated_cost(&group, &rates);
+        }
+
         Ok(UsageData {
             summary,
             buckets,
             by_key,
+            by_model,
+            throughput_candles: usage_candles(&filtered, candle_step, |sample| {
+                sample.tokens_per_second()
+            }),
+            cost_candles: usage_candles(&filtered, candle_step, |sample| {
+                estimated_request_cost(sample, &rates)
+            }),
         })
+    }
+
+    pub async fn tokens_per_second_by_target(
+        &self,
+        now: DateTime<Utc>,
+    ) -> anyhow::Result<std::collections::HashMap<String, f64>> {
+        let cutoff = now - chrono::Duration::hours(24);
+        let samples = self.usage_samples(Some(cutoff), None).await?;
+        let mut grouped: std::collections::HashMap<String, Vec<&UsageSample>> =
+            std::collections::HashMap::new();
+        for sample in &samples {
+            let Some(target) = sample.target.as_ref() else {
+                continue;
+            };
+            grouped.entry(target.clone()).or_default().push(sample);
+        }
+        Ok(grouped
+            .into_iter()
+            .filter_map(|(target, group)| {
+                current_tokens_per_second(&group, now).map(|value| (target, value))
+            })
+            .collect())
+    }
+
+    async fn usage_samples(
+        &self,
+        cutoff: Option<DateTime<Utc>>,
+        target: Option<&str>,
+    ) -> anyhow::Result<Vec<UsageSample>> {
+        let mut query = QueryBuilder::<Sqlite>::new(
+            "SELECT created_at,alias,target,status,latency_ms,input_tokens,output_tokens,cache_read_tokens,cache_write_tokens FROM request_logs l",
+        );
+        push_usage_filters(&mut query, cutoff, target);
+        query.push(" ORDER BY created_at");
+        query
+            .build()
+            .fetch_all(&self.pool)
+            .await?
+            .into_iter()
+            .map(|row| {
+                Ok(UsageSample {
+                    created_at: parse_timestamp(row.get("created_at"))?,
+                    alias: row.get("alias"),
+                    target: row.get("target"),
+                    status: row.get("status"),
+                    latency_ms: row.get("latency_ms"),
+                    input_tokens: row.get("input_tokens"),
+                    output_tokens: row.get("output_tokens"),
+                    cache_read_tokens: row.get("cache_read_tokens"),
+                    cache_write_tokens: row.get("cache_write_tokens"),
+                })
+            })
+            .collect()
+    }
+
+    async fn cost_rate_map(&self) -> anyhow::Result<std::collections::HashMap<String, CostRates>> {
+        let targets = self.targets().await?;
+        let profiles = self.target_routing_profiles().await?;
+        let mut rates = std::collections::HashMap::new();
+        for target in targets {
+            let profile = profiles
+                .iter()
+                .find(|item| item.target_id == target.id)
+                .cloned()
+                .unwrap_or_else(|| TargetRoutingProfile::for_target(&target));
+            let meta = crate::model_catalog::resolve_model_metadata(&target.provider_model, None);
+            let mut cache_read = meta.cache_read_price_per_million;
+            let mut cache_write = meta.cache_write_price_per_million;
+            if let Some(provider_id) = &target.provider_id {
+                if let Some(cached) = self
+                    .provider_models(provider_id)
+                    .await?
+                    .into_iter()
+                    .find(|model| model.id == target.provider_model)
+                {
+                    if cached.cache_read_price_per_million.is_some() {
+                        cache_read = cached.cache_read_price_per_million;
+                    }
+                    if cached.cache_write_price_per_million.is_some() {
+                        cache_write = cached.cache_write_price_per_million;
+                    }
+                }
+            }
+            let resolved = CostRates {
+                local: target.kind.is_local(),
+                protocol: target.wire_protocol,
+                input: profile.input_price_per_million,
+                output: profile.output_price_per_million,
+                cache_read,
+                cache_write,
+            };
+            rates.insert(target.name.clone(), resolved);
+            rates.insert(target.id.clone(), resolved);
+        }
+        Ok(rates)
     }
 
     pub async fn usage_for_key(&self, id: &str, period: &str) -> anyhow::Result<KeyUsageData> {
@@ -1322,15 +1534,9 @@ impl Store {
             .local_api_key(id)
             .await?
             .ok_or_else(|| anyhow::anyhow!("local API key not found"))?;
-        let (cutoff, hourly) = match period {
-            "24h" => (Some(now - chrono::Duration::hours(24)), true),
-            "7d" => (Some(now - chrono::Duration::days(7)), false),
-            "30d" => (Some(now - chrono::Duration::days(30)), false),
-            "all" => (None, false),
-            _ => anyhow::bail!("usage period must be 24h, 7d, 30d or all"),
-        };
+        let (cutoff, hourly, _) = usage_period(period, now)?;
 
-        let metrics = "COUNT(*) AS request_count, COALESCE(SUM(CASE WHEN l.status >= 200 AND l.status < 300 THEN 1 ELSE 0 END),0) AS success_count, COALESCE(AVG(l.latency_ms),0.0) AS average_latency_ms, COALESCE(SUM(l.input_tokens),0) AS input_tokens, COALESCE(SUM(l.output_tokens),0) AS output_tokens, COALESCE(SUM(CASE WHEN l.input_tokens IS NULL OR l.output_tokens IS NULL THEN 1 ELSE 0 END),0) AS unknown_usage_count";
+        let metrics = usage_metrics_sql();
         let mut summary_query =
             QueryBuilder::<Sqlite>::new(format!("SELECT {metrics} FROM request_logs l"));
         push_key_usage_filters(&mut summary_query, id, cutoff);
@@ -1529,10 +1735,33 @@ fn push_log_filters(builder: &mut QueryBuilder<'_, Sqlite>, query: &LogQuery) {
 }
 
 fn push_usage_cutoff(builder: &mut QueryBuilder<'_, Sqlite>, cutoff: Option<DateTime<Utc>>) {
-    if let Some(cutoff) = cutoff {
-        builder
-            .push(" WHERE l.created_at >= ")
-            .push_bind(cutoff.to_rfc3339());
+    push_usage_filters(builder, cutoff, None);
+}
+
+fn push_usage_filters(
+    builder: &mut QueryBuilder<'_, Sqlite>,
+    cutoff: Option<DateTime<Utc>>,
+    target: Option<&str>,
+) {
+    match (cutoff, target.filter(|value| !value.is_empty())) {
+        (Some(cutoff), Some(target)) => {
+            builder
+                .push(" WHERE l.created_at >= ")
+                .push_bind(cutoff.to_rfc3339())
+                .push(" AND l.target = ")
+                .push_bind(target.to_owned());
+        }
+        (Some(cutoff), None) => {
+            builder
+                .push(" WHERE l.created_at >= ")
+                .push_bind(cutoff.to_rfc3339());
+        }
+        (None, Some(target)) => {
+            builder
+                .push(" WHERE l.target = ")
+                .push_bind(target.to_owned());
+        }
+        (None, None) => {}
     }
 }
 
@@ -1551,6 +1780,202 @@ fn push_key_usage_filters(
     }
 }
 
+fn usage_metrics_sql() -> &'static str {
+    "COUNT(*) AS request_count, COALESCE(SUM(CASE WHEN l.status >= 200 AND l.status < 300 THEN 1 ELSE 0 END),0) AS success_count, COALESCE(AVG(l.latency_ms),0.0) AS average_latency_ms, COALESCE(SUM(l.input_tokens),0) AS input_tokens, COALESCE(SUM(l.output_tokens),0) AS output_tokens, COALESCE(SUM(l.cache_read_tokens),0) AS cache_read_tokens, COALESCE(SUM(l.cache_write_tokens),0) AS cache_write_tokens, COALESCE(SUM(CASE WHEN l.input_tokens IS NULL OR l.output_tokens IS NULL THEN 1 ELSE 0 END),0) AS unknown_usage_count"
+}
+
+fn usage_period(
+    period: &str,
+    now: DateTime<Utc>,
+) -> anyhow::Result<(Option<DateTime<Utc>>, bool, chrono::Duration)> {
+    match period {
+        "24h" => Ok((
+            Some(now - chrono::Duration::hours(24)),
+            true,
+            chrono::Duration::minutes(15),
+        )),
+        "7d" => Ok((
+            Some(now - chrono::Duration::days(7)),
+            false,
+            chrono::Duration::hours(1),
+        )),
+        "30d" => Ok((
+            Some(now - chrono::Duration::days(30)),
+            false,
+            chrono::Duration::hours(4),
+        )),
+        "all" => Ok((None, false, chrono::Duration::days(1))),
+        _ => anyhow::bail!("usage period must be 24h, 7d, 30d or all"),
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CostRates {
+    local: bool,
+    protocol: WireProtocol,
+    input: Option<f64>,
+    output: Option<f64>,
+    cache_read: Option<f64>,
+    cache_write: Option<f64>,
+}
+
+struct UsageSample {
+    created_at: DateTime<Utc>,
+    alias: Option<String>,
+    target: Option<String>,
+    status: i64,
+    latency_ms: i64,
+    input_tokens: Option<i64>,
+    output_tokens: Option<i64>,
+    cache_read_tokens: Option<i64>,
+    cache_write_tokens: Option<i64>,
+}
+
+impl UsageSample {
+    fn tokens_per_second(&self) -> Option<f64> {
+        if !(200..300).contains(&self.status) {
+            return None;
+        }
+        let output = self.output_tokens.filter(|value| *value > 0)?;
+        if self.latency_ms <= 0 {
+            return None;
+        }
+        Some(output as f64 / (self.latency_ms as f64 / 1000.0))
+    }
+}
+
+fn cache_prices(rates: &CostRates) -> (f64, f64) {
+    let input = rates.input.unwrap_or(0.0);
+    let read = rates.cache_read.unwrap_or_else(|| match rates.protocol {
+        WireProtocol::AnthropicMessages => input * 0.1,
+        _ => input * 0.5,
+    });
+    let write = rates.cache_write.unwrap_or_else(|| match rates.protocol {
+        WireProtocol::AnthropicMessages => input * 1.25,
+        _ => input,
+    });
+    (read, write)
+}
+
+fn estimated_request_cost(
+    sample: &UsageSample,
+    rates: &std::collections::HashMap<String, CostRates>,
+) -> Option<f64> {
+    if sample.input_tokens.is_none()
+        && sample.output_tokens.is_none()
+        && sample.cache_read_tokens.is_none()
+        && sample.cache_write_tokens.is_none()
+    {
+        return None;
+    }
+    let rates = sample
+        .target
+        .as_ref()
+        .and_then(|target| rates.get(target))?;
+    if rates.local {
+        return Some(0.0);
+    }
+    let input_price = rates.input?;
+    let output_price = rates.output?;
+    let (read_price, write_price) = cache_prices(rates);
+    let input = sample.input_tokens.unwrap_or(0).max(0) as f64;
+    let output = sample.output_tokens.unwrap_or(0).max(0) as f64;
+    let cache_read = sample.cache_read_tokens.unwrap_or(0).max(0) as f64;
+    let cache_write = sample.cache_write_tokens.unwrap_or(0).max(0) as f64;
+    let uncached = if input >= cache_read {
+        input - cache_read
+    } else {
+        input
+    };
+    Some(
+        (uncached * input_price
+            + cache_read * read_price
+            + cache_write * write_price
+            + output * output_price)
+            / 1_000_000.0,
+    )
+}
+
+fn current_tokens_per_second(samples: &[&UsageSample], now: DateTime<Utc>) -> Option<f64> {
+    let window = now - chrono::Duration::minutes(5);
+    let recent: Vec<f64> = samples
+        .iter()
+        .filter(|sample| sample.created_at >= window)
+        .filter_map(|sample| sample.tokens_per_second())
+        .collect();
+    if !recent.is_empty() {
+        return Some(recent.iter().sum::<f64>() / recent.len() as f64);
+    }
+    samples
+        .iter()
+        .rev()
+        .find_map(|sample| sample.tokens_per_second())
+}
+
+fn total_estimated_cost(
+    samples: &[&UsageSample],
+    rates: &std::collections::HashMap<String, CostRates>,
+) -> Option<f64> {
+    let mut total = 0.0;
+    let mut priced = false;
+    for sample in samples {
+        match estimated_request_cost(sample, rates) {
+            Some(cost) => {
+                total += cost;
+                priced = true;
+            }
+            None if sample.input_tokens.is_some() || sample.output_tokens.is_some() => {
+                if sample
+                    .target
+                    .as_ref()
+                    .and_then(|target| rates.get(target))
+                    .is_some_and(|item| item.local)
+                {
+                    priced = true;
+                    continue;
+                }
+                return None;
+            }
+            None => {}
+        }
+    }
+    priced.then_some(total)
+}
+
+fn usage_candles(
+    samples: &[&UsageSample],
+    step: chrono::Duration,
+    value: impl Fn(&UsageSample) -> Option<f64>,
+) -> Vec<UsageCandle> {
+    let step_secs = step.num_seconds().max(1);
+    let mut buckets: std::collections::BTreeMap<i64, Vec<f64>> = std::collections::BTreeMap::new();
+    for sample in samples {
+        let Some(point) = value(sample) else {
+            continue;
+        };
+        let start = (sample.created_at.timestamp() / step_secs) * step_secs;
+        buckets.entry(start).or_default().push(point);
+    }
+    buckets
+        .into_iter()
+        .filter_map(|(start, values)| {
+            let open = *values.first()?;
+            let close = *values.last()?;
+            let high = values.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+            let low = values.iter().copied().fold(f64::INFINITY, f64::min);
+            let avg = values.iter().sum::<f64>() / values.len() as f64;
+            Some(UsageCandle {
+                start: DateTime::from_timestamp(start, 0)?.with_timezone(&Utc),
+                open,
+                high,
+                low,
+                close,
+                avg,
+            })
+        })
+        .collect()
+}
+
 fn usage_summary_from_row(row: sqlx::sqlite::SqliteRow) -> UsageSummary {
     UsageSummary {
         request_count: row.get("request_count"),
@@ -1558,7 +1983,11 @@ fn usage_summary_from_row(row: sqlx::sqlite::SqliteRow) -> UsageSummary {
         average_latency_ms: row.get("average_latency_ms"),
         input_tokens: row.get("input_tokens"),
         output_tokens: row.get("output_tokens"),
+        cache_read_tokens: row.try_get::<i64, _>("cache_read_tokens").unwrap_or(0),
+        cache_write_tokens: row.try_get::<i64, _>("cache_write_tokens").unwrap_or(0),
         unknown_usage_count: row.get("unknown_usage_count"),
+        tokens_per_second: None,
+        estimated_cost_usd: None,
     }
 }
 
@@ -1592,6 +2021,14 @@ fn row_to_request_log(row: sqlx::sqlite::SqliteRow) -> anyhow::Result<RequestLog
         latency_ms: row.get("latency_ms"),
         input_tokens: row.get("input_tokens"),
         output_tokens: row.get("output_tokens"),
+        cache_read_tokens: row
+            .try_get::<Option<i64>, _>("cache_read_tokens")
+            .ok()
+            .flatten(),
+        cache_write_tokens: row
+            .try_get::<Option<i64>, _>("cache_write_tokens")
+            .ok()
+            .flatten(),
         error_code: row.get("error_code"),
         error_message: row.get("error_message"),
         api_key_name: Some(stored_name.unwrap_or_else(|| {
@@ -1784,6 +2221,10 @@ struct ProviderModelMetadata {
     input_price_per_million: Option<f64>,
     #[serde(default)]
     output_price_per_million: Option<f64>,
+    #[serde(default)]
+    cache_read_price_per_million: Option<f64>,
+    #[serde(default)]
+    cache_write_price_per_million: Option<f64>,
 }
 
 fn encode_provider_model_metadata(model: &ProviderModel) -> anyhow::Result<String> {
@@ -1791,6 +2232,8 @@ fn encode_provider_model_metadata(model: &ProviderModel) -> anyhow::Result<Strin
         context_window: model.context_window,
         input_price_per_million: model.input_price_per_million,
         output_price_per_million: model.output_price_per_million,
+        cache_read_price_per_million: model.cache_read_price_per_million,
+        cache_write_price_per_million: model.cache_write_price_per_million,
     })?)
 }
 
@@ -2037,6 +2480,8 @@ mod tests {
                 latency_ms: 5,
                 input_tokens: Some(2),
                 output_tokens: Some(3),
+                cache_read_tokens: None,
+                cache_write_tokens: None,
                 error_code: None,
                 error_message: None,
                 api_key_id: None,
@@ -2079,6 +2524,8 @@ mod tests {
                 latency_ms: 10,
                 input_tokens: None,
                 output_tokens: None,
+                cache_read_tokens: None,
+                cache_write_tokens: None,
                 error_code: None,
                 error_message: None,
                 api_key_id: None,
@@ -2112,6 +2559,8 @@ mod tests {
                 latency_ms: 30,
                 input_tokens: Some(12),
                 output_tokens: Some(4),
+                cache_read_tokens: None,
+                cache_write_tokens: None,
                 error_code: Some("upstream".into()),
                 error_message: Some("provider failed".into()),
                 api_key_id: Some("client-one".into()),
@@ -2178,6 +2627,8 @@ mod tests {
                     latency_ms: 5,
                     input_tokens: Some(2),
                     output_tokens: Some(3),
+                    cache_read_tokens: None,
+                    cache_write_tokens: None,
                     error_code: None,
                     error_message: None,
                     api_key_id: None,
@@ -2187,10 +2638,10 @@ mod tests {
                 .unwrap();
         }
 
-        let daily = store.usage_at("7d", now).await.unwrap();
+        let daily = store.usage_at("7d", now, None).await.unwrap();
         assert_eq!(daily.summary.request_count, 3);
         assert_eq!(daily.buckets.len(), 2);
-        let hourly = store.usage_at("24h", now).await.unwrap();
+        let hourly = store.usage_at("24h", now, None).await.unwrap();
         assert_eq!(hourly.summary.request_count, 2);
         assert_eq!(hourly.buckets.len(), 2);
     }
@@ -2234,6 +2685,8 @@ mod tests {
                     latency_ms: 10,
                     input_tokens: Some(input),
                     output_tokens: Some(output),
+                    cache_read_tokens: None,
+                    cache_write_tokens: None,
                     error_code: None,
                     error_message: None,
                     api_key_id: Some(api_key_id.into()),
@@ -2555,5 +3008,98 @@ mod tests {
         let loaded = store.route("cheap").await.unwrap().unwrap();
         assert_eq!(loaded.targets[1].kind, TargetKind::Alias);
         assert_eq!(loaded.targets[1].id, "adaptive-routing");
+    }
+
+    #[tokio::test]
+    async fn usage_computes_tokens_per_second_cost_and_period_candles() {
+        let store = Store::memory().await.unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 8, 17, 12, 0, 0).unwrap();
+        store
+            .upsert_target(&ModelTarget {
+                id: "cloud".into(),
+                provider_id: None,
+                name: "Cloud chat".into(),
+                kind: TargetKind::Cloud,
+                provider_model: "gpt-4o-mini".into(),
+                local_path: None,
+                runtime_url: None,
+                wire_protocol: WireProtocol::OpenAiChat,
+                capabilities: vec!["chat".into()],
+                enabled: true,
+                state: "ready".into(),
+                size_bytes: None,
+                local: LocalModelMeta::default(),
+            })
+            .await
+            .unwrap();
+        let mut profile = crate::routing::TargetRoutingProfile::neutral("cloud", TargetKind::Cloud);
+        profile.input_price_per_million = Some(1.0);
+        profile.output_price_per_million = Some(2.0);
+        store.upsert_target_routing_profile(&profile).await.unwrap();
+
+        let log = |id: &str, created_at, latency_ms, input, output, cache_read| RequestLog {
+            id: id.into(),
+            created_at,
+            endpoint: "/v1/chat/completions".into(),
+            alias: Some("assistant".into()),
+            target: Some("Cloud chat".into()),
+            attempts: 1,
+            status: 200,
+            latency_ms,
+            input_tokens: Some(input),
+            output_tokens: Some(output),
+            cache_read_tokens: Some(cache_read),
+            cache_write_tokens: None,
+            error_code: None,
+            error_message: None,
+            api_key_id: None,
+            api_key_name: None,
+        };
+        store
+            .insert_log(&log(
+                "slow",
+                now - chrono::Duration::minutes(4),
+                1_000,
+                100,
+                10,
+                40,
+            ))
+            .await
+            .unwrap();
+        store
+            .insert_log(&log(
+                "fast",
+                now - chrono::Duration::minutes(1),
+                500,
+                20,
+                20,
+                0,
+            ))
+            .await
+            .unwrap();
+
+        let usage = store.usage_at("24h", now, None).await.unwrap();
+        assert_eq!(usage.summary.request_count, 2);
+        assert!((usage.summary.tokens_per_second.unwrap() - 25.0).abs() < 0.01);
+        assert!((usage.summary.estimated_cost_usd.unwrap() - 0.00016).abs() < 1e-9);
+        assert_eq!(usage.by_model.len(), 1);
+        assert_eq!(usage.throughput_candles.len(), 1);
+        let candle = &usage.throughput_candles[0];
+        assert!((candle.open - 10.0).abs() < 0.01);
+        assert!((candle.close - 40.0).abs() < 0.01);
+        assert!((candle.high - 40.0).abs() < 0.01);
+        assert!((candle.low - 10.0).abs() < 0.01);
+        assert!((candle.avg - 25.0).abs() < 0.01);
+        assert_eq!(usage.cost_candles.len(), 1);
+
+        let filtered = store
+            .usage_at("24h", now, Some("Cloud chat"))
+            .await
+            .unwrap();
+        assert_eq!(filtered.summary.request_count, 2);
+        assert_eq!(filtered.by_model.len(), 1);
+
+        let tps = store.tokens_per_second_by_target(now).await.unwrap();
+        assert!((tps.get("Cloud chat").copied().unwrap() - 25.0).abs() < 0.01);
     }
 }

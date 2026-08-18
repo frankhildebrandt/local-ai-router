@@ -35,7 +35,7 @@ use crate::{
         RoutingEvaluation, RoutingMode,
     },
     runtime::RuntimeManager,
-    storage::RequestLog,
+    storage::{RequestLog, TokenUsage},
 };
 
 #[derive(Clone)]
@@ -800,7 +800,7 @@ async fn proxy(
                             attempts,
                             status: 502,
                             latency_ms: started.elapsed().as_millis() as i64,
-                            usage: (None, None),
+                            usage: TokenUsage::default(),
                             error_code: Some("credential_redirect_rejected"),
                             error_message: Some("The upstream attempted an unexpected redirect"),
                         },
@@ -813,7 +813,7 @@ async fn proxy(
                         "The upstream attempted an unexpected redirect",
                     );
                 }
-                let mut usage = (None, None);
+                let mut usage = TokenUsage::default();
                 let mut error_code = None;
                 let mut error_message = None;
                 let mut attempt_ttft = None;
@@ -939,8 +939,8 @@ async fn proxy(
                         let mut stream_ok = true;
                         let mut usage_buffer = Vec::new();
                         let mut translator = translated_stream.map(|protocol| StreamTranslator::new(stream_wire_protocol, protocol, &stream_model));
-                        if let Some((input_tokens, output_tokens)) = extract_sse_usage(&mut usage_buffer, &first_chunk) {
-                            let _ = stream_core.store.update_log_usage(&stream_request_id, input_tokens, output_tokens).await;
+                        if let Some(usage) = extract_sse_usage(&mut usage_buffer, &first_chunk) {
+                            let _ = stream_core.store.update_log_usage(&stream_request_id, usage).await;
                         }
                         let first_output = translator.as_mut().map(|translator| Bytes::from(translator.push(&first_chunk))).unwrap_or(first_chunk);
                         if !first_output.is_empty() { yield Ok::<_, std::io::Error>(first_output); }
@@ -954,8 +954,8 @@ async fn proxy(
                             };
                             match chunk {
                                 Some(Ok(chunk)) => {
-                                    if let Some((input_tokens, output_tokens)) = extract_sse_usage(&mut usage_buffer, &chunk) {
-                                        let _ = stream_core.store.update_log_usage(&stream_request_id, input_tokens, output_tokens).await;
+                                    if let Some(usage) = extract_sse_usage(&mut usage_buffer, &chunk) {
+                                        let _ = stream_core.store.update_log_usage(&stream_request_id, usage).await;
                                     }
                                     let output = translator.as_mut().map(|translator| Bytes::from(translator.push(&chunk))).unwrap_or(chunk);
                                     if !output.is_empty() { yield Ok(output); }
@@ -1157,7 +1157,7 @@ async fn proxy(
                                 attempts,
                                 status: 502,
                                 latency_ms: started.elapsed().as_millis() as i64,
-                                usage: (None, None),
+                                usage: TokenUsage::default(),
                                 error_code: Some("invalid_upstream_response"),
                                 error_message: Some(
                                     "The upstream returned a non-JSON response that cannot be translated",
@@ -1294,7 +1294,7 @@ async fn proxy(
                             attempts,
                             status: 502,
                             latency_ms: started.elapsed().as_millis() as i64,
-                            usage: (None, None),
+                            usage: TokenUsage::default(),
                             error_code: Some(network_code),
                             error_message: Some("The selected backend could not be reached"),
                         },
@@ -1351,7 +1351,7 @@ async fn proxy(
                             attempts,
                             status: 504,
                             latency_ms: started.elapsed().as_millis() as i64,
-                            usage: (None, None),
+                            usage: TokenUsage::default(),
                             error_code: Some("timeout"),
                             error_message: Some("The selected backend timed out"),
                         },
@@ -1401,7 +1401,7 @@ async fn proxy(
                     attempts,
                     status,
                     latency_ms: started.elapsed().as_millis() as i64,
-                    usage: (None, None),
+                    usage: TokenUsage::default(),
                     error_code: error_code.as_deref(),
                     error_message: error_message.as_deref(),
                 },
@@ -1845,7 +1845,7 @@ fn join_api_url(base: &str, path: &str) -> String {
     }
 }
 
-fn usage_from_value(value: &Value) -> (Option<i64>, Option<i64>) {
+fn usage_from_value(value: &Value) -> TokenUsage {
     let usage = value
         .get("usage")
         .or_else(|| {
@@ -1854,26 +1854,70 @@ fn usage_from_value(value: &Value) -> (Option<i64>, Option<i64>) {
                 .and_then(|response| response.get("usage"))
         })
         .or_else(|| value.get("usageMetadata"));
-    let input = usage
-        .and_then(|usage| {
-            usage
-                .get("prompt_tokens")
-                .or_else(|| usage.get("input_tokens"))
-                .or_else(|| usage.get("promptTokenCount"))
-        })
-        .and_then(Value::as_i64);
-    let output = usage
-        .and_then(|usage| {
-            usage
-                .get("completion_tokens")
-                .or_else(|| usage.get("output_tokens"))
-                .or_else(|| usage.get("candidatesTokenCount"))
-        })
-        .and_then(Value::as_i64);
-    (input, output)
+    let Some(usage) = usage else {
+        return TokenUsage::default();
+    };
+    let input_tokens = usage_i64(
+        usage,
+        &["prompt_tokens", "input_tokens", "promptTokenCount"],
+    );
+    let output_tokens = usage_i64(
+        usage,
+        &["completion_tokens", "output_tokens", "candidatesTokenCount"],
+    );
+    TokenUsage {
+        input_tokens,
+        output_tokens,
+        cache_read_tokens: cache_read_tokens(usage),
+        cache_write_tokens: cache_write_tokens(usage),
+    }
 }
 
-fn extract_sse_usage(buffer: &mut Vec<u8>, chunk: &[u8]) -> Option<(Option<i64>, Option<i64>)> {
+fn usage_i64(usage: &Value, keys: &[&str]) -> Option<i64> {
+    keys.iter()
+        .find_map(|key| usage.get(*key).and_then(Value::as_i64))
+}
+
+fn cache_read_tokens(usage: &Value) -> Option<i64> {
+    usage
+        .pointer("/prompt_tokens_details/cached_tokens")
+        .or_else(|| usage.pointer("/input_tokens_details/cached_tokens"))
+        .and_then(Value::as_i64)
+        .or_else(|| {
+            usage_i64(
+                usage,
+                &[
+                    "cache_read_input_tokens",
+                    "cachedContentTokenCount",
+                    "cached_tokens",
+                ],
+            )
+        })
+}
+
+fn cache_write_tokens(usage: &Value) -> Option<i64> {
+    if let Some(total) = usage_i64(
+        usage,
+        &["cache_creation_input_tokens", "cache_creation_tokens"],
+    ) {
+        return Some(total);
+    }
+    let creation = usage.get("cache_creation")?;
+    if let Some(total) = creation.as_i64() {
+        return Some(total);
+    }
+    let five = creation
+        .get("ephemeral_5m_input_tokens")
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    let hour = creation
+        .get("ephemeral_1h_input_tokens")
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    Some(five + hour).filter(|value| *value > 0)
+}
+
+fn extract_sse_usage(buffer: &mut Vec<u8>, chunk: &[u8]) -> Option<TokenUsage> {
     buffer.extend_from_slice(chunk);
     let mut found = None;
     while let Some(newline) = buffer.iter().position(|byte| *byte == b'\n') {
@@ -1892,7 +1936,7 @@ fn extract_sse_usage(buffer: &mut Vec<u8>, chunk: &[u8]) -> Option<(Option<i64>,
         }
         if let Ok(value) = serde_json::from_str::<Value>(payload) {
             let usage = usage_from_value(&value);
-            if usage.0.is_some() || usage.1.is_some() {
+            if usage.is_present() {
                 found = Some(usage);
             }
         }
@@ -2097,7 +2141,7 @@ async fn cancelled_proxy_response(
             attempts,
             status: cancelled_status().as_u16(),
             latency_ms: started.elapsed().as_millis() as i64,
-            usage: (None, None),
+            usage: TokenUsage::default(),
             error_code: Some("cancelled"),
             error_message: Some("The request was cancelled"),
         },
@@ -2201,7 +2245,7 @@ struct LogMetadata<'a> {
     attempts: i64,
     status: u16,
     latency_ms: i64,
-    usage: (Option<i64>, Option<i64>),
+    usage: TokenUsage,
     error_code: Option<&'a str>,
     error_message: Option<&'a str>,
 }
@@ -2218,8 +2262,10 @@ async fn log_request(core: &AppCore, metadata: LogMetadata<'_>) {
             attempts: metadata.attempts,
             status: metadata.status as i64,
             latency_ms: metadata.latency_ms,
-            input_tokens: metadata.usage.0,
-            output_tokens: metadata.usage.1,
+            input_tokens: metadata.usage.input_tokens,
+            output_tokens: metadata.usage.output_tokens,
+            cache_read_tokens: metadata.usage.cache_read_tokens,
+            cache_write_tokens: metadata.usage.cache_write_tokens,
             error_code: metadata.error_code.map(str::to_owned),
             error_message: metadata.error_message.map(str::to_owned),
             api_key_id: Some(metadata.api_key_id.into()),
@@ -2518,7 +2564,11 @@ mod tests {
         );
         assert_eq!(
             extract_sse_usage(&mut buffer, b"_tokens\":5}}\n\ndata: [DONE]\n\n"),
-            Some((Some(3), Some(5)))
+            Some(TokenUsage {
+                input_tokens: Some(3),
+                output_tokens: Some(5),
+                ..TokenUsage::default()
+            })
         );
 
         let mut responses_buffer = Vec::new();
@@ -2527,7 +2577,61 @@ mod tests {
                 &mut responses_buffer,
                 b"data: {\"response\":{\"usage\":{\"input_tokens\":7,\"output_tokens\":11}}}\n\n",
             ),
-            Some((Some(7), Some(11)))
+            Some(TokenUsage {
+                input_tokens: Some(7),
+                output_tokens: Some(11),
+                ..TokenUsage::default()
+            })
+        );
+    }
+
+    #[test]
+    fn usage_parser_reads_openai_anthropic_and_gemini_cache_tokens() {
+        assert_eq!(
+            usage_from_value(&json!({
+                "usage": {
+                    "prompt_tokens": 100,
+                    "completion_tokens": 20,
+                    "prompt_tokens_details": { "cached_tokens": 80 }
+                }
+            })),
+            TokenUsage {
+                input_tokens: Some(100),
+                output_tokens: Some(20),
+                cache_read_tokens: Some(80),
+                cache_write_tokens: None,
+            }
+        );
+        assert_eq!(
+            usage_from_value(&json!({
+                "usage": {
+                    "input_tokens": 10,
+                    "output_tokens": 8,
+                    "cache_read_input_tokens": 50,
+                    "cache_creation_input_tokens": 40
+                }
+            })),
+            TokenUsage {
+                input_tokens: Some(10),
+                output_tokens: Some(8),
+                cache_read_tokens: Some(50),
+                cache_write_tokens: Some(40),
+            }
+        );
+        assert_eq!(
+            usage_from_value(&json!({
+                "usageMetadata": {
+                    "promptTokenCount": 30,
+                    "candidatesTokenCount": 4,
+                    "cachedContentTokenCount": 12
+                }
+            })),
+            TokenUsage {
+                input_tokens: Some(30),
+                output_tokens: Some(4),
+                cache_read_tokens: Some(12),
+                cache_write_tokens: None,
+            }
         );
     }
 

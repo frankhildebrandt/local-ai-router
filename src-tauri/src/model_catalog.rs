@@ -28,6 +28,10 @@ pub struct ModelMetadata {
     pub context_window: u64,
     pub input_price_per_million: Option<f64>,
     pub output_price_per_million: Option<f64>,
+    #[serde(default)]
+    pub cache_read_price_per_million: Option<f64>,
+    #[serde(default)]
+    pub cache_write_price_per_million: Option<f64>,
     pub task_quality: BTreeMap<String, f64>,
     pub source: MetadataSource,
 }
@@ -319,6 +323,8 @@ fn known_to_metadata(model: &KnownModel) -> ModelMetadata {
         context_window: model.context_window,
         input_price_per_million: model.input_price_per_million,
         output_price_per_million: model.output_price_per_million,
+        cache_read_price_per_million: None,
+        cache_write_price_per_million: None,
         task_quality,
         source: MetadataSource::Catalog,
     }
@@ -332,6 +338,8 @@ fn fallback_metadata() -> ModelMetadata {
         context_window: 8_192,
         input_price_per_million: None,
         output_price_per_million: None,
+        cache_read_price_per_million: None,
+        cache_write_price_per_million: None,
         task_quality,
         source: MetadataSource::Fallback,
     }
@@ -343,6 +351,8 @@ struct Discovered {
     context_window: Option<u64>,
     input_price_per_million: Option<f64>,
     output_price_per_million: Option<f64>,
+    cache_read_price_per_million: Option<f64>,
+    cache_write_price_per_million: Option<f64>,
 }
 
 fn parse_discovered(value: &Value) -> Discovered {
@@ -362,6 +372,14 @@ fn parse_discovered(value: &Value) -> Discovered {
             .or_else(|| first_f64(value, &["input_price_per_million", "input_price"])),
         output_price_per_million: pricing_field(pricing, &["completion", "output", "output_cost"])
             .or_else(|| first_f64(value, &["output_price_per_million", "output_price"])),
+        cache_read_price_per_million: pricing_field(
+            pricing,
+            &["input_cache_read", "cache_read", "input_cache_read_cost"],
+        ),
+        cache_write_price_per_million: pricing_field(
+            pricing,
+            &["input_cache_write", "cache_write", "input_cache_write_cost"],
+        ),
         ..Default::default()
     };
     push_unique(&mut discovered.capabilities, capabilities_from_api(value));
@@ -430,6 +448,8 @@ fn merge_metadata(catalog: Option<&KnownModel>, discovered: Option<Discovered>) 
     if discovered.context_window.is_some()
         || discovered.input_price_per_million.is_some()
         || discovered.output_price_per_million.is_some()
+        || discovered.cache_read_price_per_million.is_some()
+        || discovered.cache_write_price_per_million.is_some()
         || discovered.capabilities.iter().any(|item| {
             !placeholder_capabilities().contains(item) && !meta.capabilities.contains(item)
         })
@@ -444,6 +464,12 @@ fn merge_metadata(catalog: Option<&KnownModel>, discovered: Option<Discovered>) 
     }
     if discovered.output_price_per_million.is_some() {
         meta.output_price_per_million = discovered.output_price_per_million;
+    }
+    if discovered.cache_read_price_per_million.is_some() {
+        meta.cache_read_price_per_million = discovered.cache_read_price_per_million;
+    }
+    if discovered.cache_write_price_per_million.is_some() {
+        meta.cache_write_price_per_million = discovered.cache_write_price_per_million;
     }
     for capability in discovered.capabilities {
         push_unique(&mut meta.capabilities, [capability]);
@@ -593,7 +619,7 @@ mod tests {
         let api = json!({
             "id": "openai/gpt-4o",
             "context_length": 200000,
-            "pricing": { "prompt": "0.000001", "completion": "0.000004" },
+            "pricing": { "prompt": "0.000001", "completion": "0.000004", "input_cache_read": "0.00000025", "input_cache_write": "0.00000125" },
             "architecture": { "modality": "text+image+audio->text" },
             "supported_parameters": ["tools", "response_format"]
         });
@@ -603,6 +629,8 @@ mod tests {
         assert_eq!(meta.context_window, 200_000);
         assert!(meta.capabilities.contains(&"audio_input".to_string()));
         assert_eq!(meta.source, MetadataSource::ProviderApi);
+        assert_eq!(meta.cache_read_price_per_million, Some(0.25));
+        assert_eq!(meta.cache_write_price_per_million, Some(1.25));
     }
 
     #[test]

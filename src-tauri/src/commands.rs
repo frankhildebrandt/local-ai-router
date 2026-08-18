@@ -131,6 +131,8 @@ fn provider_model_from_discovery(
         context_window: Some(meta.context_window).filter(|value| *value > 0),
         input_price_per_million: meta.input_price_per_million,
         output_price_per_million: meta.output_price_per_million,
+        cache_read_price_per_million: meta.cache_read_price_per_million,
+        cache_write_price_per_million: meta.cache_write_price_per_million,
     }
 }
 
@@ -140,6 +142,22 @@ pub async fn dashboard(state: State<'_, AppServices>) -> Result<Dashboard, Strin
     let targets = state.core.store.targets().await.map_err(err)?;
     let routes = state.core.store.routes().await.map_err(err)?;
     let recent_requests = state.core.store.logs(1000).await.map_err(err)?.len();
+    let throughput = state
+        .core
+        .store
+        .tokens_per_second_by_target(chrono::Utc::now())
+        .await
+        .map_err(err)?;
+    let mut runtimes = state.runtimes.statuses();
+    for runtime in &mut runtimes {
+        let name = targets
+            .iter()
+            .find(|target| target.id == runtime.target_id)
+            .map(|target| target.name.as_str());
+        runtime.tokens_per_second = name
+            .and_then(|name| throughput.get(name).copied())
+            .or_else(|| throughput.get(&runtime.target_id).copied());
+    }
     Ok(Dashboard {
         running: true,
         base_url: format!("http://127.0.0.1:{}/v1", state.port),
@@ -147,7 +165,7 @@ pub async fn dashboard(state: State<'_, AppServices>) -> Result<Dashboard, Strin
         target_count: targets.len(),
         route_count: routes.len(),
         recent_requests,
-        runtimes: state.runtimes.statuses(),
+        runtimes,
         inflight: state.core.traffic.snapshot(),
     })
 }
@@ -1476,8 +1494,17 @@ pub async fn list_logs(
 }
 
 #[tauri::command]
-pub async fn get_usage(state: State<'_, AppServices>, period: String) -> Result<UsageData, String> {
-    state.core.store.usage(&period).await.map_err(err)
+pub async fn get_usage(
+    state: State<'_, AppServices>,
+    period: String,
+    target: Option<String>,
+) -> Result<UsageData, String> {
+    state
+        .core
+        .store
+        .usage_for_target(&period, target.as_deref())
+        .await
+        .map_err(err)
 }
 
 #[tauri::command]
@@ -1529,7 +1556,7 @@ async fn logs_csv(store: &Store, mut query: LogQuery) -> anyhow::Result<String> 
         }
         query.offset = Some(logs.len() as i64);
     }
-    let mut csv = String::from("id,created_at,api_key_id,api_key_name,endpoint,alias,target,attempts,status,latency_ms,input_tokens,output_tokens,error_code,error_message\n");
+    let mut csv = String::from("id,created_at,api_key_id,api_key_name,endpoint,alias,target,attempts,status,latency_ms,input_tokens,output_tokens,cache_read_tokens,cache_write_tokens,error_code,error_message\n");
     for log in logs {
         let values = [
             log.id,
@@ -1545,6 +1572,12 @@ async fn logs_csv(store: &Store, mut query: LogQuery) -> anyhow::Result<String> 
             log.latency_ms.to_string(),
             log.input_tokens.map(|v| v.to_string()).unwrap_or_default(),
             log.output_tokens.map(|v| v.to_string()).unwrap_or_default(),
+            log.cache_read_tokens
+                .map(|v| v.to_string())
+                .unwrap_or_default(),
+            log.cache_write_tokens
+                .map(|v| v.to_string())
+                .unwrap_or_default(),
             log.error_code.unwrap_or_default(),
             log.error_message.unwrap_or_default(),
         ];
@@ -1794,6 +1827,8 @@ mod tests {
                     latency_ms: 5,
                     input_tokens: Some(1),
                     output_tokens: Some(1),
+                    cache_read_tokens: None,
+                    cache_write_tokens: None,
                     error_code: None,
                     error_message: None,
                     api_key_id: None,
@@ -1814,6 +1849,8 @@ mod tests {
                 latency_ms: 5,
                 input_tokens: None,
                 output_tokens: None,
+                cache_read_tokens: None,
+                cache_write_tokens: None,
                 error_code: None,
                 error_message: None,
                 api_key_id: None,

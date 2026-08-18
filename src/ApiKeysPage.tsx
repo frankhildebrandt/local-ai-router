@@ -13,7 +13,7 @@ type Props = {
   fail: (error: unknown) => void;
 };
 
-const emptyUsage: UsageData = { request_count: 0, success_count: 0, average_latency_ms: 0, input_tokens: 0, output_tokens: 0, unknown_usage_count: 0, buckets: [], by_key: [] };
+const emptyUsage: UsageData = { request_count: 0, success_count: 0, average_latency_ms: 0, input_tokens: 0, output_tokens: 0, cache_read_tokens: 0, cache_write_tokens: 0, unknown_usage_count: 0, tokens_per_second: null, estimated_cost_usd: null, buckets: [], by_key: [], by_model: [], throughput_candles: [], cost_candles: [] };
 
 export function ApiKeysPage({ localKeys, refresh, success, fail }: Props) {
   const [name, setName] = useState("");

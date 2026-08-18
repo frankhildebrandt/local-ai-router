@@ -87,6 +87,8 @@ export interface ProviderModel {
   context_window?: number | null;
   input_price_per_million?: number | null;
   output_price_per_million?: number | null;
+  cache_read_price_per_million?: number | null;
+  cache_write_price_per_million?: number | null;
 }
 
 export interface ModelMetadata {
@@ -94,6 +96,8 @@ export interface ModelMetadata {
   context_window: number;
   input_price_per_million: number | null;
   output_price_per_million: number | null;
+  cache_read_price_per_million?: number | null;
+  cache_write_price_per_million?: number | null;
   task_quality: Record<string, number>;
   source: "provider_api" | "catalog" | "fallback";
 }
@@ -218,6 +222,8 @@ export interface RequestLog {
   latency_ms: number;
   input_tokens: number | null;
   output_tokens: number | null;
+  cache_read_tokens?: number | null;
+  cache_write_tokens?: number | null;
   error_code: string | null;
   error_message: string | null;
   api_key_id: string | null;
@@ -267,12 +273,35 @@ export interface UsageSummary {
   average_latency_ms: number;
   input_tokens: number;
   output_tokens: number;
+  cache_read_tokens?: number;
+  cache_write_tokens?: number;
   unknown_usage_count: number;
+  tokens_per_second?: number | null;
+  estimated_cost_usd?: number | null;
+}
+
+export interface UsageCandle {
+  start: string;
+  open: number;
+  high: number;
+  low: number;
+  close: number;
+  avg: number;
+}
+
+export interface UsageBucket {
+  start: string;
+  request_count: number;
+  input_tokens: number;
+  output_tokens: number;
 }
 
 export interface UsageData extends UsageSummary {
-  buckets: Array<{ start: string; request_count: number; input_tokens: number; output_tokens: number }>;
+  buckets: UsageBucket[];
   by_key: Array<UsageSummary & { api_key_id: string | null; api_key_name: string }>;
+  by_model?: ModelUsage[];
+  throughput_candles?: UsageCandle[];
+  cost_candles?: UsageCandle[];
 }
 
 export interface ModelUsage extends UsageSummary {
@@ -293,7 +322,7 @@ export interface DashboardData {
   route_count: number;
   recent_requests: number;
   inflight: InFlightRequest[];
-  runtimes: Array<{ target_id: string; port: number; size_bytes: number; queued: number; active: number; resident_bytes: number; memory_warning: boolean; profile: ResourceProfile; compute_duty_percent: number; pending_restart: boolean }>;
+  runtimes: Array<{ target_id: string; port: number; size_bytes: number; queued: number; active: number; resident_bytes: number; memory_warning: boolean; profile: ResourceProfile; compute_duty_percent: number; pending_restart: boolean; tokens_per_second?: number | null }>;
 }
 
 export interface InFlightRequest {

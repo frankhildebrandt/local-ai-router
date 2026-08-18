@@ -46,6 +46,7 @@ pub struct RuntimeStatus {
     pub profile: ResourceProfile,
     pub compute_duty_percent: u8,
     pub pending_restart: bool,
+    pub tokens_per_second: Option<f64>,
 }
 
 pub struct RuntimeManager {
@@ -486,6 +487,7 @@ impl RuntimeManager {
                 profile: entry.policy.profile,
                 compute_duty_percent: entry.policy.compute_duty_percent,
                 pending_restart: entry.pending_restart,
+                tokens_per_second: None,
             })
             .collect()
     }

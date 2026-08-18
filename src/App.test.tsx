@@ -33,7 +33,7 @@ beforeEach(() => {
     if (name === "get_resource_policy") return Promise.resolve({ version: 1, profile: "stealth", memory_budget_percent: 50, memory_budget_mib: null, auto_load: true, idle_unload_minutes: 5, compute_duty_percent: 25, cpu_threads: 4, max_parallel_prompts: 1, process_priority: -1, gguf_gpu_layers: -1, disk_kv_enabled: true, disk_kv_max_bytes: 10 * 1024 ** 3 });
     if (name === "get_resource_profile_preset") return Promise.resolve({ version: 1, profile: "balanced", memory_budget_percent: 70, memory_budget_mib: null, auto_load: true, idle_unload_minutes: 15, compute_duty_percent: 60, cpu_threads: 8, max_parallel_prompts: 2, process_priority: 0, gguf_gpu_layers: -1, disk_kv_enabled: false, disk_kv_max_bytes: 10 * 1024 ** 3 });
     if (name === "get_log_facets") return Promise.resolve({ aliases: ["assistant"], targets: ["cloud"], endpoints: ["/v1/chat/completions"] });
-    if (name === "get_usage") return Promise.resolve({ request_count: 17, success_count: 16, average_latency_ms: 12, input_tokens: 128, output_tokens: 256, unknown_usage_count: 0, buckets: [{ start: "2026-08-17T10:00:00Z", request_count: 17, input_tokens: 128, output_tokens: 256 }], by_key: [{ api_key_id: "default", api_key_name: "Default", request_count: 17, success_count: 16, average_latency_ms: 12, input_tokens: 128, output_tokens: 256, unknown_usage_count: 0 }] });
+    if (name === "get_usage") return Promise.resolve({ request_count: 17, success_count: 16, average_latency_ms: 12, input_tokens: 128, output_tokens: 256, cache_read_tokens: 16, cache_write_tokens: 0, unknown_usage_count: 0, tokens_per_second: 21.3, estimated_cost_usd: 0.012, buckets: [{ start: "2026-08-17T10:00:00Z", request_count: 17, input_tokens: 128, output_tokens: 256 }], by_key: [{ api_key_id: "default", api_key_name: "Default", request_count: 17, success_count: 16, average_latency_ms: 12, input_tokens: 128, output_tokens: 256, unknown_usage_count: 0 }], by_model: [{ alias: "assistant", target: "coding", request_count: 17, success_count: 16, average_latency_ms: 12, input_tokens: 32, output_tokens: 64, unknown_usage_count: 0, tokens_per_second: 21.3, estimated_cost_usd: 0.012 }], throughput_candles: [{ start: "2026-08-17T10:00:00Z", open: 18, high: 24, low: 12, close: 21.3, avg: 20 }], cost_candles: [{ start: "2026-08-17T10:00:00Z", open: 0.01, high: 0.02, low: 0.008, close: 0.012, avg: 0.012 }] });
     if (name === "create_local_api_key") return Promise.resolve({ id: "new-key", name: "Automation", created_at: "2026-08-17T11:00:00Z", last_used_at: null, revoked_at: null, token: "lar_new" });
     if (name === "get_key_usage") return Promise.resolve({
       id: "default", name: "Default", created_at: "2026-08-17T10:00:00Z", last_used_at: null, revoked_at: null,
@@ -139,6 +139,37 @@ describe("Local AI Router shell", () => {
     await waitFor(() => expect(command).toHaveBeenCalledWith("cancel_all_inflight_requests"));
   });
 
+  it("shows loaded local runtimes with token throughput on overview", async () => {
+    const previous = command.getMockImplementation();
+    command.mockImplementation((name: string, args?: unknown) => {
+      if (name === "list_targets") {
+        return Promise.resolve([
+          { id: "local-qwen", provider_id: null, name: "Qwen 3.5", kind: "mlx", wire_protocol: "open_ai_chat", provider_model: "qwen", local_path: "/models/qwen", runtime_url: "http://127.0.0.1:12100/v1", capabilities: ["chat", "streaming"], enabled: true, state: "ready", size_bytes: 4_000_000_000 },
+          { id: "installed-only", provider_id: null, name: "Idle GGUF", kind: "gguf", wire_protocol: "open_ai_chat", provider_model: "idle", local_path: "/models/idle", runtime_url: null, capabilities: ["chat"], enabled: true, state: "stopped", size_bytes: 2_000_000_000 },
+        ]);
+      }
+      if (name === "dashboard") {
+        return Promise.resolve({
+          running: true,
+          base_url: "http://127.0.0.1:11435/v1",
+          provider_count: 0,
+          target_count: 2,
+          route_count: 0,
+          recent_requests: 1,
+          inflight: [],
+          runtimes: [{ target_id: "local-qwen", port: 12100, size_bytes: 4_000_000_000, queued: 0, active: 1, resident_bytes: 3_000_000_000, memory_warning: false, profile: "balanced", compute_duty_percent: 60, pending_restart: false, tokens_per_second: 12.4 }],
+        });
+      }
+      return previous?.(name, args);
+    });
+    render(<App />);
+    expect(await screen.findByText("Qwen 3.5")).toBeInTheDocument();
+    expect(screen.getByText(/12.4 tok\/s/)).toBeInTheDocument();
+    expect(screen.getByText("1 loaded · 2 installed")).toBeInTheDocument();
+    expect(screen.queryByText("Idle GGUF")).not.toBeInTheDocument();
+    expect(screen.queryByText("No models loaded")).not.toBeInTheDocument();
+  });
+
   it("keeps window chrome draggable without capturing toolbar buttons", async () => {
     const { container } = render(<App />);
     await screen.findByText("Your models, one local endpoint.");
@@ -156,10 +187,15 @@ describe("Local AI Router shell", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "Usage" }));
     expect(await screen.findByText("Usage by API key")).toBeInTheDocument();
+    expect(screen.getByText("Current tokens/s")).toBeInTheDocument();
+    expect(screen.getByText("Theoretical cost")).toBeInTheDocument();
+    expect(screen.getByText("Usage by model")).toBeInTheDocument();
     expect(screen.getByText("Input tokens")).toBeInTheDocument();
     expect(screen.getByText("Output tokens")).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "24h" }));
     await waitFor(() => expect(command).toHaveBeenCalledWith("get_usage", { period: "24h" }));
+    fireEvent.click(screen.getByRole("button", { name: /coding/ }));
+    await waitFor(() => expect(command).toHaveBeenCalledWith("get_usage", { period: "24h", target: "coding" }));
 
     fireEvent.click(screen.getByRole("button", { name: "Settings" }));
     expect(await screen.findByLabelText("Inference profile")).toHaveValue("stealth");
