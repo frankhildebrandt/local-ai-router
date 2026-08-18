@@ -522,6 +522,22 @@ async fn proxy(
                 continue;
             }
         }
+        let tools_for_salvage = canonical
+            .as_ref()
+            .map(|request| request.tools.clone())
+            .unwrap_or_default();
+        let emulation = canonical
+            .as_ref()
+            .map(|request| {
+                crate::tool_emulation::tool_emulation_for(&target, !request.tools.is_empty())
+            })
+            .unwrap_or(crate::tool_emulation::ToolEmulation::None);
+        if emulation == crate::tool_emulation::ToolEmulation::MlxInject {
+            if let Some(request) = canonical.as_mut() {
+                crate::tool_emulation::prepare_mlx_request(request);
+            }
+        }
+        let buffer_emulation = emulation == crate::tool_emulation::ToolEmulation::MlxInject;
         if matches!(
             target.kind,
             crate::domain::TargetKind::Gguf | crate::domain::TargetKind::Mlx
@@ -696,7 +712,7 @@ async fn proxy(
             };
         let mut request = core.client.post(upstream_url);
         if let Some(payload) = json_payload.as_mut() {
-            let outbound = if let Some(canonical) = canonical.as_ref() {
+            let mut outbound = if let Some(canonical) = canonical.as_ref() {
                 let protocol = public_protocol.unwrap();
                 if !matches!(
                     target.kind,
@@ -727,6 +743,9 @@ async fn proxy(
                 payload["model"] = Value::String(target.provider_model.clone());
                 payload.clone()
             };
+            if buffer_emulation {
+                crate::tool_emulation::strip_unsupported_mlx_fields(&mut outbound);
+            }
             request = request.json(&outbound);
         } else {
             request = request
@@ -817,7 +836,7 @@ async fn proxy(
                 let mut error_code = None;
                 let mut error_message = None;
                 let mut attempt_ttft = None;
-                let response = if is_stream && status.is_success() {
+                let response = if is_stream && !buffer_emulation && status.is_success() {
                     let translated_stream = public_protocol
                         .filter(|protocol| !protocol_matches(*protocol, target.wire_protocol));
                     let content_type = if translated_stream.is_some() {
@@ -1013,7 +1032,7 @@ async fn proxy(
                     };
                     response_from_body(status, content_type, Body::from_stream(stream), &request_id)
                 } else {
-                    let content_type = upstream.headers().get(header::CONTENT_TYPE).cloned();
+                    let mut content_type = upstream.headers().get(header::CONTENT_TYPE).cloned();
                     let bytes = match wait_with_timeout_or_cancel(
                         attempt_timeout,
                         &cancel,
@@ -1105,16 +1124,44 @@ async fn proxy(
                         usage = usage_from_value(&value);
                         if status.is_success() {
                             if let Some(protocol) = public_protocol {
-                                if !protocol_matches(protocol, target.wire_protocol) {
+                                let translate = !protocol_matches(protocol, target.wire_protocol)
+                                    || !matches!(
+                                        emulation,
+                                        crate::tool_emulation::ToolEmulation::None
+                                    );
+                                if translate {
                                     match decode_response(target.wire_protocol, &value) {
-                                        Ok(canonical_response) => {
-                                            response_bytes = encode_response(
-                                                protocol,
-                                                &canonical_response,
-                                                &alias,
-                                            )
-                                            .to_string()
-                                            .into()
+                                        Ok(mut canonical_response) => {
+                                            if !matches!(
+                                                emulation,
+                                                crate::tool_emulation::ToolEmulation::None
+                                            ) {
+                                                crate::tool_emulation::salvage_tool_calls(
+                                                    &mut canonical_response,
+                                                    &tools_for_salvage,
+                                                );
+                                            }
+                                            if is_stream {
+                                                content_type = Some(HeaderValue::from_static(
+                                                    "text/event-stream",
+                                                ));
+                                                let mut translator = StreamTranslator::new(
+                                                    target.wire_protocol,
+                                                    protocol,
+                                                    &alias,
+                                                );
+                                                response_bytes = translator
+                                                    .encode_canonical(&canonical_response)
+                                                    .into();
+                                            } else {
+                                                response_bytes = encode_response(
+                                                    protocol,
+                                                    &canonical_response,
+                                                    &alias,
+                                                )
+                                                .to_string()
+                                                .into();
+                                            }
                                         }
                                         Err(error) => {
                                             return protocol_error(
@@ -1966,6 +2013,12 @@ fn route_supports_capability(route: &crate::domain::ModelRoute, capability: &str
 }
 
 fn target_supports_capability(target: &crate::storage::ModelTarget, capability: &str) -> bool {
+    if capability == "tools"
+        && target.kind == crate::domain::TargetKind::Mlx
+        && !crate::tool_emulation::force_tool_support(target)
+    {
+        return false;
+    }
     supports_capability(target.kind, &target.capabilities, capability)
 }
 
@@ -2452,9 +2505,68 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let forwarded = captured.lock().unwrap();
         assert_eq!(forwarded.len(), 1);
-        assert_eq!(forwarded[0]["tools"][0]["function"]["name"], "terminal");
+        assert!(forwarded[0].get("tools").is_none());
+        let system = forwarded[0]["messages"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|message| message["role"] == "system")
+            .and_then(|message| message["content"].as_str())
+            .unwrap_or_default();
+        assert!(system.contains("terminal"), "{system}");
         assert!(forwarded[0].get("reasoning_effort").is_none());
         assert!(forwarded[0].get("reasoning").is_none());
+    }
+
+    #[tokio::test]
+    async fn mlx_force_tool_support_salvages_text_tool_calls() {
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
+        let captured_for_server = captured.clone();
+        let app = Router::new().fallback(move |Json(body): Json<Value>| {
+            let captured = captured_for_server.clone();
+            async move {
+                captured.lock().unwrap().push(body);
+                (
+                    StatusCode::OK,
+                    Json(json!({"id":"ok","choices":[{"message":{"role":"assistant","content":"<tool_call>{\"name\":\"terminal\",\"arguments\":{\"cmd\":\"ls\"}}</tool_call>"},"finish_reason":"stop"}]})),
+                )
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let url = format!("http://{address}/v1");
+        let store = Store::memory().await.unwrap();
+        let mut target = sample_target("local-chat", "qwen-3-5-4b", Some(url));
+        target.kind = TargetKind::Mlx;
+        target.capabilities = vec!["chat".into(), "streaming".into()];
+        store.upsert_target(&target).await.unwrap();
+        let app = app_from_store(store).await;
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("authorization", "Bearer test-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"model":"qwen-3-5-4b","messages":[{"role":"user","content":"list files"}],"tools":[{"type":"function","function":{"name":"terminal","parameters":{"type":"object"}}}]}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(captured.lock().unwrap()[0].get("tools").is_none());
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let payload: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            payload["choices"][0]["message"]["tool_calls"][0]["function"]["name"],
+            "terminal"
+        );
+        assert_eq!(payload["choices"][0]["finish_reason"], "tool_calls");
     }
 
     #[tokio::test]

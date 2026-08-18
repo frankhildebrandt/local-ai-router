@@ -47,6 +47,8 @@ pub struct LocalModelMeta {
     pub trust_status: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resource_overrides: Option<ResourceOverrides>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub force_tool_support: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -487,6 +489,7 @@ impl Store {
             ("catalog_id", "TEXT"),
             ("trust_status", "TEXT"),
             ("resource_overrides", "TEXT"),
+            ("force_tool_support", "INTEGER"),
         ] {
             if !target_columns
                 .iter()
@@ -736,10 +739,11 @@ impl Store {
             .as_ref()
             .map(serde_json::to_string)
             .transpose()?;
-        sqlx::query("INSERT INTO model_targets(id,provider_id,name,kind,provider_model,local_path,runtime_url,capabilities,enabled,state,size_bytes,wire_protocol,task,runtime_engine,source_repo,source_revision,estimated_memory_bytes,catalog_id,trust_status,resource_overrides) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET provider_id=excluded.provider_id,name=excluded.name,kind=excluded.kind,provider_model=excluded.provider_model,local_path=excluded.local_path,runtime_url=excluded.runtime_url,capabilities=excluded.capabilities,enabled=excluded.enabled,state=excluded.state,size_bytes=excluded.size_bytes,wire_protocol=excluded.wire_protocol,task=excluded.task,runtime_engine=excluded.runtime_engine,source_repo=excluded.source_repo,source_revision=excluded.source_revision,estimated_memory_bytes=excluded.estimated_memory_bytes,catalog_id=excluded.catalog_id,trust_status=excluded.trust_status,resource_overrides=excluded.resource_overrides")
+        let force_tool_support = target.local.force_tool_support.map(|value| value as i64);
+        sqlx::query("INSERT INTO model_targets(id,provider_id,name,kind,provider_model,local_path,runtime_url,capabilities,enabled,state,size_bytes,wire_protocol,task,runtime_engine,source_repo,source_revision,estimated_memory_bytes,catalog_id,trust_status,resource_overrides,force_tool_support) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET provider_id=excluded.provider_id,name=excluded.name,kind=excluded.kind,provider_model=excluded.provider_model,local_path=excluded.local_path,runtime_url=excluded.runtime_url,capabilities=excluded.capabilities,enabled=excluded.enabled,state=excluded.state,size_bytes=excluded.size_bytes,wire_protocol=excluded.wire_protocol,task=excluded.task,runtime_engine=excluded.runtime_engine,source_repo=excluded.source_repo,source_revision=excluded.source_revision,estimated_memory_bytes=excluded.estimated_memory_bytes,catalog_id=excluded.catalog_id,trust_status=excluded.trust_status,resource_overrides=excluded.resource_overrides,force_tool_support=excluded.force_tool_support")
             .bind(&target.id).bind(&target.provider_id).bind(&target.name).bind(encode_kind(&target.kind)).bind(&target.provider_model)
             .bind(&target.local_path).bind(&target.runtime_url).bind(capabilities).bind(target.enabled as i64).bind(&target.state).bind(target.size_bytes).bind(encode_wire_protocol(target.wire_protocol))
-            .bind(&target.local.task).bind(&target.local.runtime_engine).bind(&target.local.source_repo).bind(&target.local.source_revision).bind(target.local.estimated_memory_bytes).bind(&target.local.catalog_id).bind(&target.local.trust_status).bind(resource_overrides)
+            .bind(&target.local.task).bind(&target.local.runtime_engine).bind(&target.local.source_repo).bind(&target.local.source_revision).bind(target.local.estimated_memory_bytes).bind(&target.local.catalog_id).bind(&target.local.trust_status).bind(resource_overrides).bind(force_tool_support)
             .execute(&self.pool).await?;
         Ok(())
     }
@@ -2111,6 +2115,11 @@ fn row_to_target(row: sqlx::sqlite::SqliteRow) -> anyhow::Result<ModelTarget> {
                 .map(|value| serde_json::from_str(&value))
                 .transpose()
                 .context("invalid resource overrides")?,
+            force_tool_support: row
+                .try_get::<Option<i64>, _>("force_tool_support")
+                .ok()
+                .flatten()
+                .map(|value| value != 0),
         },
     })
 }

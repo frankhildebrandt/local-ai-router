@@ -1,7 +1,14 @@
 import { invoke } from "@tauri-apps/api/core";
 import type { InstallJobEvent, InFlightRequest } from "./types";
+import { version as packageVersion } from "../package.json";
 
 export const isTauri = () => "__TAURI_INTERNALS__" in window;
+
+export async function appVersion(): Promise<string> {
+  if (!isTauri()) return packageVersion;
+  const { getVersion } = await import("@tauri-apps/api/app");
+  return getVersion();
+}
 
 export async function command<T>(name: string, args: Record<string, unknown> = {}): Promise<T> {
   if (!isTauri()) throw new Error("Open this screen through the Local AI Router desktop app.");

@@ -483,6 +483,7 @@ impl InstallManager {
                     .into(),
                 ),
                 resource_overrides: None,
+                force_tool_support: None,
             },
         };
         self.store.upsert_target(&target).await?;

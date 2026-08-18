@@ -374,6 +374,7 @@ pub async fn evaluate_route(
         if stats.half_open_required {
             half_open_target_ids.push(target.id.clone());
         }
+        let force_tool_support = crate::tool_emulation::force_tool_support(&target);
         let candidate = CandidateInput {
             target_id: target.id,
             kind: target.kind,
@@ -381,6 +382,7 @@ pub async fn evaluate_route(
             priority: route_target.priority,
             enabled: target.enabled && route_target.enabled,
             capabilities: target.capabilities,
+            force_tool_support,
             profile,
             stats,
         };
@@ -590,6 +592,7 @@ pub struct CandidateInput {
     pub priority: i64,
     pub enabled: bool,
     pub capabilities: Vec<String>,
+    pub force_tool_support: bool,
     pub profile: TargetRoutingProfile,
     pub stats: RoutingStats,
 }
@@ -811,6 +814,9 @@ fn reserve_exclude_reason(
 }
 
 fn supports_capability(candidate: &CandidateInput, required: &str) -> bool {
+    if required == "tools" && candidate.kind == TargetKind::Mlx && !candidate.force_tool_support {
+        return false;
+    }
     advertised_capability(candidate.kind, &candidate.capabilities, required)
 }
 
@@ -1017,6 +1023,7 @@ mod tests {
                     priority: 10,
                     enabled: true,
                     capabilities: vec!["chat".into()],
+                    force_tool_support: false,
                     profile: unknown,
                     stats: RoutingStats::default(),
                 },
@@ -1027,6 +1034,7 @@ mod tests {
                     priority: 20,
                     enabled: true,
                     capabilities: vec!["chat".into()],
+                    force_tool_support: false,
                     profile: coding,
                     stats: RoutingStats::default(),
                 },
@@ -1116,6 +1124,7 @@ mod tests {
                 priority,
                 enabled: true,
                 capabilities: vec!["chat".into()],
+                force_tool_support: false,
                 profile,
                 stats: RoutingStats::default(),
             }
@@ -1191,6 +1200,7 @@ mod tests {
                 priority: 10,
                 enabled: true,
                 capabilities: vec!["chat".into()],
+                force_tool_support: false,
                 profile: TargetRoutingProfile::neutral(id, TargetKind::Cloud),
                 stats,
             }

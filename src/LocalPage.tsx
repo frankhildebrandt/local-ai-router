@@ -183,9 +183,10 @@ function InstalledLibrary({ local, resourcePolicy, refresh, success, fail }: { l
 
 function ModelResourceEditor({ model, global, close, done, success, fail }: { model: ModelTarget; global: ResourcePolicy; close: () => void; done: () => Promise<void>; success: (text: string) => void; fail: (error: unknown) => void }) {
   const [values, setValues] = useState<ResourceOverrides>({ ...model.resource_overrides });
+  const [forceTools, setForceTools] = useState(model.force_tool_support ?? model.kind === "mlx");
   const [busy, setBusy] = useState(false);
   const number = (key: keyof ResourceOverrides, fallback: number) => Number(values[key] ?? fallback);
-  const save = async (overrides: ResourceOverrides | null) => { setBusy(true); try { await command("save_model_resource_overrides", { id: model.id, overrides }); await done(); } catch (error) { fail(error); } finally { setBusy(false); } };
+  const save = async (overrides: ResourceOverrides | null) => { setBusy(true); try { await command("save_model_resource_overrides", { id: model.id, overrides, forceToolSupport: forceTools }); await done(); } catch (error) { fail(error); } finally { setBusy(false); } };
   const updateParallel = (value: number) => setValues(current => ({ ...current, max_parallel_prompts: value, disk_kv_enabled: value === 1 ? current.disk_kv_enabled : false }));
   return <div className="modal-backdrop" onMouseDown={close}><div className="modal" onMouseDown={event => event.stopPropagation()}><div className="modal-head"><h2>{model.name} resources</h2><button className="icon-button" onClick={close}>×</button></div><div className="form resource-override-form">
     <label className="field"><span>Compute duty %</span><input type="number" min="5" max="100" value={number("compute_duty_percent", global.compute_duty_percent)} onChange={event => setValues({ ...values, compute_duty_percent: Number(event.target.value) })} /></label>
@@ -198,6 +199,8 @@ function ModelResourceEditor({ model, global, close, done, success, fail }: { mo
     <label className="field"><span>Automatic load</span><input type="checkbox" checked={values.auto_load ?? global.auto_load} onChange={event => setValues({ ...values, auto_load: event.target.checked })} /></label>
     {model.kind === "gguf" && <label className="field"><span>Persistent KV (requires parallel = 1)</span><input type="checkbox" checked={values.disk_kv_enabled ?? global.disk_kv_enabled} onChange={event => setValues({ ...values, disk_kv_enabled: event.target.checked, max_parallel_prompts: event.target.checked ? 1 : values.max_parallel_prompts })} /></label>}
     {model.kind === "mlx" && <p className="catalog-hint">Persistent disk KV is not supported by the MLX runtime. MLX continues to use Metal; Apple Neural Engine quotas are unavailable.</p>}
+    {model.capabilities.includes("chat") && <label className="field"><span>Force tool support</span><input type="checkbox" checked={forceTools} onChange={event => setForceTools(event.target.checked)} /></label>}
+    {model.capabilities.includes("chat") && <p className="catalog-hint">Injects tools into the prompt and parses text tool calls. Less reliable than native provider tool APIs.</p>}
     <div className="modal-actions">{model.kind === "gguf" && <button className="secondary danger-text" disabled={busy} onClick={async () => { if (!confirm(`Delete persistent KV snapshots for “${model.name}”?`)) return; try { await command("clear_kv_cache", { targetId: model.id }); success("Model KV snapshots deleted"); } catch (error) { fail(error); } }}><Trash2 size={15} />Clear KV cache</button>}<button className="secondary" disabled={busy} onClick={() => void save(null)}>Use global profile</button><button className="primary" disabled={busy} onClick={() => void save(values)}>{busy && <LoaderCircle className="spin" size={15} />}Save overrides</button></div>
   </div></div></div>;
 }

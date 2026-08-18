@@ -3,13 +3,13 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import App from "./App";
 
 const command = vi.fn();
-vi.mock("./api", () => ({ command: (...args: unknown[]) => command(...args), listenInstallJobs: async () => () => undefined, listenDesktopNavigate: async () => () => undefined, listenGatewayTraffic: async () => () => undefined, errorMessage: (error: unknown) => String(error), isTauri: () => true }));
+vi.mock("./api", () => ({ command: (...args: unknown[]) => command(...args), appVersion: async () => "0.2.1", listenInstallJobs: async () => () => undefined, listenDesktopNavigate: async () => () => undefined, listenGatewayTraffic: async () => () => undefined, errorMessage: (error: unknown) => String(error), isTauri: () => true }));
 
 beforeEach(() => {
   command.mockImplementation((name: string, args?: unknown) => {
     if (name === "dashboard") return Promise.resolve({ running: true, base_url: "http://127.0.0.1:11435/v1", provider_count: 0, target_count: 0, route_count: 0, recent_requests: 1, inflight: [], runtimes: [] });
-    if (name === "list_providers") return Promise.resolve([]);
-    if (name === "list_targets") return Promise.resolve([{ id: "cloud", provider_id: null, name: "Coding model", kind: "cloud", wire_protocol: "open_ai_chat", provider_model: "coding", local_path: null, runtime_url: null, capabilities: ["chat", "streaming"], enabled: true, state: "ready", size_bytes: null }]);
+    if (name === "list_providers") return Promise.resolve([{ id: "openai", name: "OpenAI", preset_id: "openai", auth_mode: "api_key", base_url: "https://api.openai.com/v1", enabled: true, has_credential: true }]);
+    if (name === "list_targets") return Promise.resolve([{ id: "cloud", provider_id: "openai", name: "Coding model", kind: "cloud", wire_protocol: "open_ai_chat", provider_model: "coding", local_path: null, runtime_url: null, capabilities: ["chat", "streaming"], enabled: true, state: "ready", size_bytes: null }]);
     if (name === "list_routes") return Promise.resolve([{ alias: "assistant", enabled: true, capabilities: ["chat", "streaming"], targets: [{ id: "cloud", kind: "cloud", model: "coding", priority: 10, enabled: true }] }]);
     if (name === "list_public_models") return Promise.resolve([
       { id: "adaptive-routing", source: "adaptive", capabilities: ["chat", "streaming"] },
@@ -304,8 +304,12 @@ describe("Local AI Router shell", () => {
     expect(screen.getByRole("heading", { name: "adaptive-routing" })).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Create route" }));
     expect(await screen.findByText("Create custom route")).toBeInTheDocument();
-    expect(screen.getByRole("option", { name: "Coding model · cloud" })).toBeInTheDocument();
-    expect(screen.getByRole("option", { name: "adaptive-routing · alias" })).toBeInTheDocument();
+    fireEvent.focus(screen.getByRole("combobox", { name: "Primary" }));
+    expect(screen.getByRole("option", { name: "Coding model OpenAI" })).toBeInTheDocument();
+    expect(screen.getByRole("option", { name: "adaptive-routing Built-in" })).toBeInTheDocument();
+    fireEvent.change(screen.getByRole("combobox", { name: "Primary" }), { target: { value: "adaptive" } });
+    expect(screen.queryByRole("option", { name: "Coding model OpenAI" })).not.toBeInTheDocument();
+    expect(screen.getByRole("option", { name: "adaptive-routing Built-in" })).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
     expect(screen.getByRole("button", { name: "Performance routing for assistant" })).toHaveAttribute("aria-pressed", "true");
     expect(screen.getByRole("button", { name: "Adaptive routing for assistant" })).toHaveAttribute("aria-pressed", "false");

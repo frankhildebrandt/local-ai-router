@@ -8,11 +8,12 @@ import {
   Plus, RefreshCw, Route, Search, Settings, ShieldCheck, Sparkles, Timer,
   Trash2, Wallet, X, Zap,
 } from "lucide-react";
-import { command, errorMessage, isTauri, listenDesktopNavigate, listenGatewayTraffic } from "./api";
+import { command, appVersion, errorMessage, isTauri, listenDesktopNavigate, listenGatewayTraffic } from "./api";
 import type { DashboardData, InFlightRequest, LocalApiKey, LogFacets, LogQuery, LogResult, ModelMetadata, ModelRoute, ModelTarget, Provider, ProviderModel, ProviderPreset, PublicModel, RequestLog, ResourcePolicy, ResourceProfile, RouteRole, RouteTarget, RoutingAttempt, RoutingConfigExport, RoutingEvaluation, RoutingPolicy, RoutingTaskDefinition, TargetKind, TargetRoutingProfile, UsageData, WireProtocol } from "./types";
 import { ApiKeysPage } from "./ApiKeysPage";
 import { CandleLineChart } from "./CandleLineChart";
 import { LocalPage } from "./LocalPage";
+import { TypeaheadSelect } from "./TypeaheadSelect";
 
 type Page = "overview" | "chat" | "keys" | "usage" | "providers" | "cloud" | "local" | "routes" | "logs" | "routing" | "settings";
 
@@ -53,6 +54,7 @@ export default function App() {
   const [notice, setNotice] = useState<{ type: "error" | "success"; text: string } | null>(null);
   const [loading, setLoading] = useState(true);
   const [sidebar, setSidebar] = useState(true);
+  const [version, setVersion] = useState("");
 
   const refresh = useCallback(async () => {
     if (!isTauri()) { setLoading(false); return; }
@@ -69,6 +71,7 @@ export default function App() {
     finally { setLoading(false); }
   }, []);
 
+  useEffect(() => { void appVersion().then(setVersion).catch(() => undefined); }, []);
   useEffect(() => { void refresh(); const timer = window.setInterval(() => { if (page === "overview" || page === "keys" || page === "usage" || page === "logs" || page === "routing") void refresh(); }, 10_000); return () => clearInterval(timer); }, [refresh, page]);
 
   useEffect(() => {
@@ -98,7 +101,7 @@ export default function App() {
       <nav>{nav.map(({ page: item, label, icon: Icon }) => <button key={item} className={page === item ? "active" : ""} onClick={() => setPage(item)} title={label}><Icon size={18} />{sidebar && <span>{label}</span>}</button>)}</nav>
       <div className="sidebar-foot">
         <div className={`server-pill ${dashboard.running ? "online" : ""}`}><i />{sidebar && <span>{dashboard.running ? "Gateway online" : "Gateway offline"}</span>}</div>
-        {sidebar && <small>v0.1.0 · localhost only</small>}
+        {sidebar && <small>v{version || "…"} · localhost only</small>}
       </div>
     </aside>
     <main>
@@ -304,7 +307,7 @@ function CloudPage({ providers, targets, routingProfiles, refresh, success, fail
   </>;
 }
 
-function RoutesPage({ targets, routes, publicModels, routingPolicies, routingProfiles, routingTasks, refresh, success, fail }: Common & { publicModels: PublicModel[] }) {
+function RoutesPage({ providers, targets, routes, publicModels, routingPolicies, routingProfiles, routingTasks, refresh, success, fail }: Common & { publicModels: PublicModel[] }) {
   const [editing, setEditing] = useState<ModelRoute | null | undefined>();
   const [policyRoute, setPolicyRoute] = useState<ModelRoute | null>(null);
   const [profileTarget, setProfileTarget] = useState<ModelTarget | null>(null);
@@ -325,7 +328,7 @@ function RoutesPage({ targets, routes, publicModels, routingPolicies, routingPro
       {routes.map(route => { const policy = routingPolicies.find(item => item.alias === route.alias); const enabled = adaptiveEnabled(policy); const flow = [...hopsForRole(route, "primary").map((item, index, list) => ({ item, label: list.length > 1 ? `Primary ${index + 1}` : "Primary" })), ...hopsForRole(route, "fallback").map((item, index) => ({ item, label: `Fallback ${index + 1}` }))]; return <article className="route-card adaptive-route-card" key={route.alias}><div className="route-main"><div className="route-icon"><Route /></div><div><div className="row"><h3>{route.alias}</h3><Badge tone={enabled ? (policy?.status === "shadow" ? "warn" : "good") : "neutral"}>{enabled ? (policy?.status === "shadow" ? "Shadow" : "Adaptive") : "Performance"}</Badge></div><CapabilityList items={route.capabilities} /></div></div><div className="route-flow">{flow.map(({ item, label }, index) => <div key={`${item.id}-${index}`} className="route-target"><span>{label}</span><strong>{item.kind === "alias" ? item.id : (targets.find(target => target.id === item.id)?.name ?? item.model)}</strong></div>)}</div><div className="alias-adaptive"><RoutingModeSwitch alias={route.alias} adaptive={enabled} onChange={adaptive => void setRoutingMode(route, policy, adaptive)} /><button className="secondary compact" onClick={() => setPolicyRoute(route)}><Gauge size={15} />Configure</button></div><button className="icon-button" onClick={() => setEditing(route)}><Settings size={17} /></button><button className="icon-button danger" onClick={() => void remove(route.alias)}><Trash2 size={17} /></button></article>; })}
     </div>
     {!routes.length && <Empty icon={<Route />} title="No custom routes yet" text="Create a named stack when you need a primary pool and optional fallbacks." />}
-    {editing !== undefined && <RouteModal route={editing} targets={targets} publicModels={publicModels} close={() => setEditing(undefined)} done={async () => { setEditing(undefined); await refresh(); success("Custom route saved"); }} fail={fail} />}
+    {editing !== undefined && <RouteModal route={editing} providers={providers} targets={targets} publicModels={publicModels} close={() => setEditing(undefined)} done={async () => { setEditing(undefined); await refresh(); success("Custom route saved"); }} fail={fail} />}
     {policyRoute && <RoutingPolicyModal route={policyRoute} policy={routingPolicies.find(item => item.alias === policyRoute.alias) ?? null} tasks={routingTasks} targets={targets} profiles={routingProfiles} onEditProfile={setProfileTarget} onTasksChanged={refresh} close={() => setPolicyRoute(null)} done={async () => { setPolicyRoute(null); await refresh(); success("Routing policy saved"); }} fail={fail} />}
     {profileTarget && <TargetProfileModal target={profileTarget} profile={routingProfiles.find(item => item.target_id === profileTarget.id) ?? null} tasks={routingTasks} close={() => setProfileTarget(null)} done={async () => { setProfileTarget(null); await refresh(); success("Target routing profile saved"); }} fail={fail} />}
     {showConfig && <RoutingConfigModal close={() => setShowConfig(false)} refresh={refresh} success={success} fail={fail} />}
@@ -446,11 +449,22 @@ function RoutingConfigModal({ close, refresh, success, fail }: { close: () => vo
   return <Modal title="Routing policy JSON" close={close}><div className="form"><textarea className="config-json" aria-label="Routing configuration JSON" value={json} onChange={event => setJson(event.target.value)} />{preview.map(item => <small className="config-warning" key={item}>{item}</small>)}<div className="security-note"><ShieldCheck size={17} /><span>Exports exclude credentials, request history, prompts and responses. Preview validates every reference before changes are applied.</span></div><div className="modal-actions"><button className="secondary" onClick={close}>Cancel</button><button className="secondary" disabled={busy} onClick={() => void run(false)}>Validate preview</button><button className="primary" disabled={busy} onClick={() => void run(true)}>Apply import</button></div></div></Modal>;
 }
 
-function RouteModal({ route, targets, publicModels, close, done, fail }: { route: ModelRoute | null; targets: ModelTarget[]; publicModels: PublicModel[]; close: () => void; done: () => Promise<void>; fail: (e: unknown) => void }) {
+function hopOrigin(target: ModelTarget, providers: Provider[]) {
+  if (target.kind === "cloud") return { origin: providers.find(provider => provider.id === target.provider_id)?.name ?? "Cloud", detail: undefined as string | undefined };
+  return { origin: target.kind === "gguf" ? "Local · GGUF" : "Local · MLX", detail: target.source_repo ?? undefined };
+}
+
+function RouteModal({ route, providers, targets, publicModels, close, done, fail }: { route: ModelRoute | null; providers: Provider[]; targets: ModelTarget[]; publicModels: PublicModel[]; close: () => void; done: () => Promise<void>; fail: (e: unknown) => void }) {
   const hopOptions = useMemo(() => [
-    ...targets.map(target => ({ value: target.id, label: `${target.name} · ${target.kind}`, kind: target.kind as TargetKind, model: target.provider_model, capabilities: target.capabilities })),
-    ...publicModels.filter(model => (model.source === "alias" || model.source === "adaptive") && model.id !== (route?.alias ?? "")).map(model => ({ value: model.id, label: `${model.id} · alias`, kind: "alias" as TargetKind, model: model.id, capabilities: model.capabilities })),
-  ], [targets, publicModels, route?.alias]);
+    ...targets.map(target => {
+      const { origin, detail } = hopOrigin(target, providers);
+      return { value: target.id, label: target.name, origin, detail, search: [target.name, origin, detail, target.provider_model, target.kind].filter(Boolean).join(" "), kind: target.kind as TargetKind, model: target.provider_model, capabilities: target.capabilities };
+    }),
+    ...publicModels.filter(model => (model.source === "alias" || model.source === "adaptive") && model.id !== (route?.alias ?? "")).map(model => {
+      const origin = model.source === "adaptive" ? "Built-in" : "Custom route";
+      return { value: model.id, label: model.id, origin, detail: undefined as string | undefined, search: `${model.id} ${origin} alias`, kind: "alias" as TargetKind, model: model.id, capabilities: model.capabilities };
+    }),
+  ], [targets, publicModels, providers, route?.alias]);
   const [alias, setAlias] = useState(route?.alias ?? "");
   const [primaries, setPrimaries] = useState<string[]>(route ? hopsForRole(route, "primary").map(item => item.id) : [hopOptions[0]?.value].filter(Boolean));
   const [fallbacks, setFallbacks] = useState<string[]>(route ? hopsForRole(route, "fallback").map(item => item.id) : []);
@@ -466,7 +480,8 @@ function RouteModal({ route, targets, publicModels, close, done, fail }: { route
   }, [primaries, fallbacks, hopOptions]);
   const hopRow = (id: string, index: number, role: RouteRole, list: string[], setList: (next: string[]) => void, removable: boolean) => {
     const options = hopOptions.filter(hop => hop.value === id || !used.includes(hop.value));
-    return <div className="picker-row" key={`${role}-${id}-${index}`}><span>{role === "fallback" ? `Fallback ${index + 1}` : (list.length > 1 ? `Primary ${index + 1}` : "Primary")}</span><select value={id} onChange={e => setList(list.map((item, itemIndex) => itemIndex === index ? e.target.value : item))}>{options.map(hop => <option value={hop.value} key={hop.value}>{hop.label}</option>)}</select>{removable && <button type="button" className="icon-button" onClick={() => setList(list.filter((_, itemIndex) => itemIndex !== index))}><X size={15} /></button>}</div>;
+    const label = role === "fallback" ? `Fallback ${index + 1}` : (list.length > 1 ? `Primary ${index + 1}` : "Primary");
+    return <div className="picker-row" key={`${role}-${id}-${index}`}><span>{label}</span><TypeaheadSelect ariaLabel={label} value={id} options={options} onChange={next => setList(list.map((item, itemIndex) => itemIndex === index ? next : item))} />{removable && <button type="button" className="icon-button" onClick={() => setList(list.filter((_, itemIndex) => itemIndex !== index))}><X size={15} /></button>}</div>;
   };
   const submit = async (event: FormEvent) => {
     event.preventDefault();

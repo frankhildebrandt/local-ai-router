@@ -19,6 +19,7 @@ pub mod routing;
 pub mod runtime;
 pub mod secrets;
 pub mod storage;
+pub mod tool_emulation;
 
 use std::{sync::Arc, time::Duration};
 

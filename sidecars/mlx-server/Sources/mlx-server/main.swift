@@ -230,9 +230,6 @@ final class HTTPServer: @unchecked Sendable {
         guard request.method == "POST", supported.contains(request.path), let payload = try? JSONSerialization.jsonObject(with: request.body) as? [String: Any] else {
             sendJSON(connection, status: "404 Not Found", object: errorObject("route_not_found", "Unsupported endpoint")); return
         }
-        if payload["tools"] != nil || payload["response_format"] != nil {
-            sendJSON(connection, status: "400 Bad Request", object: errorObject("unsupported_capability", "This MLX runtime currently supports text generation without tools or structured output")); return
-        }
         let streaming = payload["stream"] as? Bool == true
         do {
             let stream = try await engine.generate(payload: payload)

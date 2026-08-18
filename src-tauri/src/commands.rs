@@ -1720,6 +1720,7 @@ pub async fn save_model_resource_overrides(
     state: State<'_, AppServices>,
     id: String,
     overrides: Option<ResourceOverrides>,
+    force_tool_support: Option<bool>,
 ) -> Result<ModelTarget, String> {
     let mut target = state
         .core
@@ -1732,6 +1733,9 @@ pub async fn save_model_resource_overrides(
         return Err("resource overrides are only available for local models".into());
     }
     target.local.resource_overrides = overrides;
+    if let Some(force_tool_support) = force_tool_support {
+        target.local.force_tool_support = Some(force_tool_support);
+    }
     state
         .core
         .effective_resource_policy(&target)

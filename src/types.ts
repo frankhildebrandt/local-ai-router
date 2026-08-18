@@ -78,6 +78,7 @@ export interface ModelTarget {
   catalog_id?: string | null;
   trust_status?: string | null;
   resource_overrides?: ResourceOverrides | null;
+  force_tool_support?: boolean | null;
 }
 
 export interface ProviderModel {

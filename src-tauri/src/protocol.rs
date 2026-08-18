@@ -1519,6 +1519,50 @@ impl StreamTranslator {
         output
     }
 
+    pub fn encode_canonical(&mut self, response: &CanonicalResponse) -> Vec<u8> {
+        let mut output = Vec::new();
+        let mut tool_index = 0;
+        for block in &response.content {
+            match block {
+                ContentBlock::Text { text } if !text.is_empty() => {
+                    output.extend_from_slice(&self.encode_delta(StreamDelta {
+                        text: Some(text.clone()),
+                        ..Default::default()
+                    }));
+                }
+                ContentBlock::Reasoning { text } if !text.is_empty() => {
+                    output.extend_from_slice(&self.encode_delta(StreamDelta {
+                        reasoning: Some(text.clone()),
+                        ..Default::default()
+                    }));
+                }
+                ContentBlock::ToolUse { id, name, input } => {
+                    let arguments = if let Value::String(raw) = input {
+                        raw.clone()
+                    } else {
+                        input.to_string()
+                    };
+                    output.extend_from_slice(&self.encode_delta(StreamDelta {
+                        tool_id: Some(id.clone()),
+                        tool_name: Some(name.clone()),
+                        tool_arguments: Some(arguments),
+                        tool_index,
+                        ..Default::default()
+                    }));
+                    tool_index += 1;
+                }
+                _ => {}
+            }
+        }
+        output.extend_from_slice(&self.encode_delta(StreamDelta {
+            done: true,
+            input_tokens: response.input_tokens,
+            output_tokens: response.output_tokens,
+            ..Default::default()
+        }));
+        output
+    }
+
     fn encode_delta(&mut self, mut delta: StreamDelta) -> Vec<u8> {
         if delta.input_tokens.is_some() {
             self.input_tokens = delta.input_tokens;
