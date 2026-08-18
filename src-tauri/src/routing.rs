@@ -5,7 +5,7 @@ use regex::RegexBuilder;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    domain::{ModelRoute, TargetKind},
+    domain::{ModelRoute, RouteRole, TargetKind},
     protocol::{CanonicalRequest, ContentBlock},
     storage::Store,
 };
@@ -159,6 +159,11 @@ impl RoutingPolicy {
             }
         }
         Ok(())
+    }
+
+    pub fn retain_route_candidates(&mut self, hop_ids: &[String]) {
+        self.candidate_target_ids
+            .retain(|id| hop_ids.iter().any(|hop| hop == id));
     }
 }
 
@@ -341,12 +346,13 @@ pub async fn evaluate_route(
     if !policy.candidate_target_ids.is_empty() {
         scoped_route
             .targets
-            .retain(|hop| policy.candidate_target_ids.contains(&hop.id));
+            .retain(|hop| hop.role.is_fallback() || policy.candidate_target_ids.contains(&hop.id));
     }
     let expanded =
         crate::public_models::expand_route_targets(store, &scoped_route, &mut Default::default())
             .await?;
-    let mut candidates = Vec::new();
+    let mut primary_candidates = Vec::new();
+    let mut fallback_candidates = Vec::new();
     let mut half_open_target_ids = Vec::new();
     let mut seen = std::collections::HashSet::new();
     for route_target in &expanded {
@@ -366,18 +372,25 @@ pub async fn evaluate_route(
         if stats.half_open_required {
             half_open_target_ids.push(target.id.clone());
         }
-        candidates.push(CandidateInput {
+        let candidate = CandidateInput {
             target_id: target.id,
             kind: target.kind,
+            role: route_target.role,
             priority: route_target.priority,
             enabled: target.enabled && route_target.enabled,
             capabilities: target.capabilities,
             profile,
             stats,
-        });
+        };
+        if candidate.role.is_fallback() {
+            fallback_candidates.push(candidate);
+        } else {
+            primary_candidates.push(candidate);
+        }
     }
-    let recent_by_target: std::collections::HashMap<_, _> = candidates
+    let recent_by_target: std::collections::HashMap<_, _> = primary_candidates
         .iter()
+        .chain(fallback_candidates.iter())
         .map(|candidate| {
             (
                 candidate.target_id.clone(),
@@ -385,7 +398,40 @@ pub async fn evaluate_route(
             )
         })
         .collect();
-    let decision = rank_candidates(policy, &selected.task, &request, candidates);
+    let mut decision = rank_candidates(policy, &selected.task, &request, primary_candidates);
+    fallback_candidates.sort_by_key(|candidate| candidate.priority);
+    let mut fallback_order = Vec::new();
+    for candidate in fallback_candidates {
+        if let Some(reason) = reserve_exclude_reason(policy, &candidate) {
+            decision.excluded.push(ExcludedCandidate {
+                target_id: candidate.target_id,
+                reason: reason.into(),
+            });
+            continue;
+        }
+        fallback_order.push(candidate.target_id);
+    }
+    let blocked: std::collections::HashSet<_> = decision
+        .excluded
+        .iter()
+        .filter(|candidate| candidate.reason == "circuit_open" || candidate.reason == "slow")
+        .map(|candidate| candidate.target_id.clone())
+        .collect();
+    let adaptive_order = decision
+        .ranked
+        .iter()
+        .map(|candidate| candidate.target_id.clone())
+        .chain(fallback_order.iter().cloned())
+        .collect::<Vec<_>>();
+    let primary_fixed = expanded
+        .iter()
+        .filter(|target| !target.role.is_fallback() && !blocked.contains(&target.id))
+        .map(|target| target.id.clone())
+        .collect::<Vec<_>>();
+    let fixed_order = primary_fixed
+        .into_iter()
+        .chain(fallback_order)
+        .collect::<Vec<_>>();
     let peer_latency_ms = crate::domain::median_u64(
         &decision
             .ranked
@@ -398,22 +444,6 @@ pub async fn evaluate_route(
             })
             .collect::<Vec<_>>(),
     );
-    let blocked: std::collections::HashSet<_> = decision
-        .excluded
-        .iter()
-        .filter(|candidate| candidate.reason == "circuit_open" || candidate.reason == "slow")
-        .map(|candidate| candidate.target_id.clone())
-        .collect();
-    let adaptive_order = decision
-        .ranked
-        .iter()
-        .map(|candidate| candidate.target_id.clone())
-        .collect::<Vec<_>>();
-    let fixed_order = expanded
-        .into_iter()
-        .filter(|target| !blocked.contains(&target.id))
-        .map(|target| target.id)
-        .collect::<Vec<_>>();
     let (mode, ordered_target_ids, shadow_target_id) = match (policy.mode, policy.status) {
         (RoutingMode::Adaptive, PolicyStatus::Active) => ("adaptive", adaptive_order, None),
         (RoutingMode::Adaptive, PolicyStatus::Shadow) => {
@@ -552,6 +582,7 @@ impl Default for RoutingStats {
 pub struct CandidateInput {
     pub target_id: String,
     pub kind: TargetKind,
+    pub role: RouteRole,
     pub priority: i64,
     pub enabled: bool,
     pub capabilities: Vec<String>,
@@ -607,29 +638,7 @@ pub fn rank_candidates(
     let mut pending = Vec::new();
     let mut excluded = Vec::new();
     for candidate in candidates {
-        let exclude = if !candidate.enabled {
-            Some("disabled")
-        } else if candidate.stats.circuit_open {
-            Some("circuit_open")
-        } else if matches!(policy.privacy, PrivacyMode::LocalOnly)
-            && matches!(candidate.kind, TargetKind::Cloud)
-        {
-            Some("privacy_local_only")
-        } else if request
-            .estimated_input_tokens
-            .saturating_add(request.max_output_tokens)
-            > candidate.profile.context_window
-        {
-            Some("context_window")
-        } else if request
-            .required_capabilities
-            .iter()
-            .any(|required| !supports_capability(&candidate, required))
-        {
-            Some("capability")
-        } else {
-            None
-        };
+        let exclude = hard_exclude_reason(policy, request, &candidate);
         if let Some(reason) = exclude {
             excluded.push(ExcludedCandidate {
                 target_id: candidate.target_id,
@@ -747,6 +756,53 @@ pub fn rank_candidates(
         task: task.into(),
         ranked: ranked.into_iter().map(|(_, candidate)| candidate).collect(),
         excluded,
+    }
+}
+
+fn hard_exclude_reason(
+    policy: &RoutingPolicy,
+    request: &RoutingRequest,
+    candidate: &CandidateInput,
+) -> Option<&'static str> {
+    if !candidate.enabled {
+        Some("disabled")
+    } else if candidate.stats.circuit_open {
+        Some("circuit_open")
+    } else if matches!(policy.privacy, PrivacyMode::LocalOnly)
+        && matches!(candidate.kind, TargetKind::Cloud)
+    {
+        Some("privacy_local_only")
+    } else if request
+        .estimated_input_tokens
+        .saturating_add(request.max_output_tokens)
+        > candidate.profile.context_window
+    {
+        Some("context_window")
+    } else if request
+        .required_capabilities
+        .iter()
+        .any(|required| !supports_capability(candidate, required))
+    {
+        Some("capability")
+    } else {
+        None
+    }
+}
+
+fn reserve_exclude_reason(
+    policy: &RoutingPolicy,
+    candidate: &CandidateInput,
+) -> Option<&'static str> {
+    if !candidate.enabled {
+        Some("disabled")
+    } else if candidate.stats.circuit_open {
+        Some("circuit_open")
+    } else if matches!(policy.privacy, PrivacyMode::LocalOnly)
+        && matches!(candidate.kind, TargetKind::Cloud)
+    {
+        Some("privacy_local_only")
+    } else {
+        None
     }
 }
 
@@ -881,6 +937,23 @@ mod tests {
     use super::*;
 
     #[test]
+    fn retain_route_candidates_drops_ids_that_are_not_alias_hops() {
+        let mut policy = RoutingPolicy::new("assistant");
+        policy.candidate_target_ids = vec![
+            "cloud".into(),
+            "dae9cea9-c842-4a88-9d23-e0562d2d7646".into(),
+            "other".into(),
+        ];
+
+        policy.retain_route_candidates(&["cloud".into(), "other".into()]);
+
+        assert_eq!(
+            policy.candidate_target_ids,
+            vec!["cloud".to_string(), "other".to_string()]
+        );
+    }
+
+    #[test]
     fn explicit_known_task_wins_over_rules_and_default() {
         let mut policy = RoutingPolicy::new("assistant");
         policy.rules.push(TaskRule {
@@ -941,6 +1014,7 @@ mod tests {
                 CandidateInput {
                     target_id: "unknown".into(),
                     kind: TargetKind::Cloud,
+                    role: RouteRole::Primary,
                     priority: 10,
                     enabled: true,
                     capabilities: vec!["chat".into()],
@@ -950,6 +1024,7 @@ mod tests {
                 CandidateInput {
                     target_id: "coding".into(),
                     kind: TargetKind::Cloud,
+                    role: RouteRole::Primary,
                     priority: 20,
                     enabled: true,
                     capabilities: vec!["chat".into()],
@@ -1040,6 +1115,7 @@ mod tests {
             CandidateInput {
                 target_id: id.into(),
                 kind,
+                role: RouteRole::Primary,
                 priority,
                 enabled: true,
                 capabilities: vec!["chat".into()],
@@ -1114,6 +1190,7 @@ mod tests {
             CandidateInput {
                 target_id: id.into(),
                 kind: TargetKind::Cloud,
+                role: RouteRole::Primary,
                 priority: 10,
                 enabled: true,
                 capabilities: vec!["chat".into()],
@@ -1145,5 +1222,195 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["fast-a", "fast-b"]
         );
+    }
+
+    fn sample_target(id: &str, capabilities: &[&str]) -> crate::storage::ModelTarget {
+        crate::storage::ModelTarget {
+            id: id.into(),
+            provider_id: None,
+            name: id.into(),
+            kind: TargetKind::Gguf,
+            provider_model: id.into(),
+            local_path: None,
+            runtime_url: None,
+            wire_protocol: crate::providers::WireProtocol::OpenAiChat,
+            capabilities: capabilities.iter().map(|item| (*item).to_owned()).collect(),
+            enabled: true,
+            state: "ready".into(),
+            size_bytes: None,
+            local: crate::storage::LocalModelMeta::default(),
+        }
+    }
+
+    fn hop(id: &str, priority: i64, role: RouteRole) -> crate::domain::RouteTarget {
+        crate::domain::RouteTarget {
+            id: id.into(),
+            kind: TargetKind::Gguf,
+            model: id.into(),
+            priority,
+            enabled: true,
+            role,
+        }
+    }
+
+    async fn pool_fixture() -> (crate::storage::Store, ModelRoute) {
+        let store = crate::storage::Store::memory().await.unwrap();
+        for (id, caps) in [
+            ("chat-a", &["chat"][..]),
+            ("chat-b", &["chat"][..]),
+            ("vision", &["chat", "vision"][..]),
+        ] {
+            store.upsert_target(&sample_target(id, caps)).await.unwrap();
+        }
+        let mut low = TargetRoutingProfile::neutral("chat-a", TargetKind::Gguf);
+        low.task_quality.insert("coding".into(), 40.0);
+        store.upsert_target_routing_profile(&low).await.unwrap();
+        let mut high = TargetRoutingProfile::neutral("chat-b", TargetKind::Gguf);
+        high.task_quality.insert("coding".into(), 90.0);
+        store.upsert_target_routing_profile(&high).await.unwrap();
+        let mut vision = TargetRoutingProfile::neutral("vision", TargetKind::Gguf);
+        vision.task_quality.insert("coding".into(), 100.0);
+        store.upsert_target_routing_profile(&vision).await.unwrap();
+        let route = ModelRoute {
+            alias: "assistant".into(),
+            enabled: true,
+            capabilities: vec!["chat".into(), "vision".into()],
+            targets: vec![
+                hop("chat-a", 10, RouteRole::Primary),
+                hop("chat-b", 20, RouteRole::Primary),
+                hop("vision", 10, RouteRole::Fallback),
+            ],
+        };
+        store.upsert_route(&route).await.unwrap();
+        (store, route)
+    }
+
+    #[tokio::test]
+    async fn adaptive_ranks_primaries_and_keeps_fallback_in_reserve() {
+        let (store, route) = pool_fixture().await;
+        let mut policy = RoutingPolicy::new("assistant");
+        policy.mode = RoutingMode::Adaptive;
+        policy.status = PolicyStatus::Active;
+        policy.privacy = PrivacyMode::CloudAllowed;
+        policy.candidate_target_ids = vec!["chat-a".into(), "chat-b".into()];
+
+        let evaluation = evaluate_route(
+            &store,
+            &route,
+            RouteEvaluationInput {
+                policy: Some(&policy),
+                explicit_task: Some("coding"),
+                endpoint: "/v1/chat/completions",
+                canonical: None,
+                required_capabilities: vec!["chat".into()],
+                streaming: false,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            evaluation.ordered_target_ids,
+            vec!["chat-b", "chat-a", "vision"]
+        );
+        assert_eq!(
+            evaluation
+                .decision
+                .ranked
+                .iter()
+                .map(|item| item.target_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["chat-b", "chat-a"]
+        );
+    }
+
+    #[tokio::test]
+    async fn performance_keeps_primary_order_then_fallbacks() {
+        let (store, route) = pool_fixture().await;
+        let evaluation = evaluate_route(
+            &store,
+            &route,
+            RouteEvaluationInput {
+                policy: None,
+                explicit_task: None,
+                endpoint: "/v1/chat/completions",
+                canonical: None,
+                required_capabilities: vec!["chat".into()],
+                streaming: false,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(evaluation.mode, "fixed");
+        assert_eq!(
+            evaluation.ordered_target_ids,
+            vec!["chat-a", "chat-b", "vision"]
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_primary_capability_uses_matching_fallback() {
+        let (store, route) = pool_fixture().await;
+        let evaluation = evaluate_route(
+            &store,
+            &route,
+            RouteEvaluationInput {
+                policy: None,
+                explicit_task: None,
+                endpoint: "/v1/chat/completions",
+                canonical: None,
+                required_capabilities: vec!["chat".into(), "vision".into()],
+                streaming: false,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            evaluation.ordered_target_ids,
+            vec!["chat-a", "chat-b", "vision"]
+        );
+        assert!(evaluation
+            .decision
+            .excluded
+            .iter()
+            .any(|item| item.target_id == "chat-a" && item.reason == "capability"));
+        assert!(evaluation
+            .decision
+            .excluded
+            .iter()
+            .any(|item| item.target_id == "chat-b" && item.reason == "capability"));
+    }
+
+    #[tokio::test]
+    async fn adaptive_drops_incapable_primaries_and_keeps_feature_fallback() {
+        let (store, route) = pool_fixture().await;
+        let mut policy = RoutingPolicy::new("assistant");
+        policy.mode = RoutingMode::Adaptive;
+        policy.status = PolicyStatus::Active;
+        policy.privacy = PrivacyMode::CloudAllowed;
+        policy.candidate_target_ids = vec!["chat-a".into(), "chat-b".into()];
+        let evaluation = evaluate_route(
+            &store,
+            &route,
+            RouteEvaluationInput {
+                policy: Some(&policy),
+                explicit_task: Some("coding"),
+                endpoint: "/v1/chat/completions",
+                canonical: None,
+                required_capabilities: vec!["chat".into(), "vision".into()],
+                streaming: false,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(evaluation.ordered_target_ids, vec!["vision"]);
+        assert!(evaluation
+            .decision
+            .excluded
+            .iter()
+            .any(|item| item.target_id == "chat-a" && item.reason == "capability"));
     }
 }

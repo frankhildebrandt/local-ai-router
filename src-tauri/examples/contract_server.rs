@@ -60,6 +60,7 @@ async fn main() -> anyhow::Result<()> {
                 model: target.provider_model.clone(),
                 priority: 10,
                 enabled: true,
+                ..Default::default()
             }],
         })
         .await?;

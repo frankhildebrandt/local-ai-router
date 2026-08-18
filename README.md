@@ -10,7 +10,7 @@ A private, multi-protocol model gateway for Apple Silicon Macs. Local AI Router 
 - API keys and experimental OpenAI Subscription OAuth tokens stored in macOS Keychain
 - Provider model discovery and manually entered model IDs, with features and list prices from the provider API or known-model defaults
 - Configured local and cloud models are published automatically as public model IDs
-- Custom aliases remain optional named fallback stacks, with per-alias adaptive ranking off by default
+- Custom aliases remain optional named stacks. Primaries form the routing pool; fallbacks are reserve. Each alias can use Performance (listed primary order) or Adaptive ranking; Adaptive stays off by default
 - Built-in `adaptive-routing` ranks every enabled model by task quality, price and inferred task
 - `/v1/chat/completions`, `/v1/responses`, Anthropic `/v1/messages`, and Gemini `/v1beta/models/*` with non-streaming, SSE, vision, audio/video input and tool translation
 - Local `/v1/images/generations` and `/v1/audio/speech` for installed MLX image and TTS models
@@ -105,7 +105,7 @@ response = client.models.generate_content(model="adaptive-routing", contents="He
 
 ### Adaptive routing
 
-`adaptive-routing` is always on and ranks every enabled model by task quality, predicted cost and the inferred task. Custom routes can still enable their own adaptive ranking; that extra stays off by default and only ranks the models in that route. Adaptive policies filter candidates by capabilities, context, privacy and configured cost limits, then deterministically rank them. Draft policies on custom routes do not affect traffic; Shadow policies record the model they would select while the fixed route continues serving.
+`adaptive-routing` is always on and ranks every enabled model by task quality, predicted cost and the inferred task. Custom routes default to **Performance** routing: the **primary pool** in listed order, plus skipping slow, rate-limited or failing models. Switching a custom route to **Adaptive** ranks only those primaries. **Fallbacks** are reserve hops: they run after the primary pool is exhausted by errors, circuit/slow skips, or a missing feature such as vision. Adaptive policies filter primaries by capabilities, context, privacy and configured cost limits, then deterministically rank them. Draft policies on custom routes do not affect traffic; Shadow policies (Expert) record the model they would select while the Performance primary order continues serving. Existing aliases whose extra hops should stay in the Adaptive pool need those hops set as Primaries in the editor.
 
 Before the first response chunk, the gateway can fall back to the next candidate on connect errors, timeouts, 404, 429 and 5xx. 400, 401 and 403 stay final, and there is no mid-stream failover. Three consecutive 404s on a target open a two-minute circuit. A 429 without a reset deadline cools that target for 30 seconds; `Retry-After` and provider reset headers (`x-ratelimit-reset-requests`, `x-ratelimit-reset`, `anthropic-ratelimit-requests-reset`) are honored when present. A model whose recent TTFT (or latency) is at least 8 seconds and three times the peer median is skipped for 45 seconds; remaining candidates also get a tighter first-byte timeout.
 

@@ -1796,7 +1796,7 @@ mod tests {
     use super::*;
     use crate::{
         core::AppCore,
-        domain::{ModelRoute, RouteTarget, TargetKind},
+        domain::{ModelRoute, RouteRole, RouteTarget, TargetKind},
         providers::AuthMode,
         secrets::{MemorySecrets, SecretStore, LOCAL_API_KEY},
         storage::{ModelTarget, Provider, Store},
@@ -2150,6 +2150,7 @@ mod tests {
                         model: "real".into(),
                         priority: 10,
                         enabled: true,
+                        ..Default::default()
                     }],
                 })
                 .await
@@ -2212,6 +2213,7 @@ mod tests {
                     model: "real".into(),
                     priority: 10,
                     enabled: true,
+                    ..Default::default()
                 }],
             })
             .await
@@ -2296,6 +2298,7 @@ mod tests {
                     model: "real".into(),
                     priority: 10,
                     enabled: true,
+                    ..Default::default()
                 }],
             })
             .await
@@ -2369,6 +2372,7 @@ mod tests {
                         model: "primary".into(),
                         priority: 10,
                         enabled: true,
+                        ..Default::default()
                     },
                     RouteTarget {
                         id: "second".into(),
@@ -2376,6 +2380,7 @@ mod tests {
                         model: "fallback".into(),
                         priority: 20,
                         enabled: true,
+                        ..Default::default()
                     },
                 ],
             })
@@ -2440,6 +2445,7 @@ mod tests {
                         model: "primary".into(),
                         priority: 10,
                         enabled: true,
+                        ..Default::default()
                     },
                     RouteTarget {
                         id: "second".into(),
@@ -2447,6 +2453,7 @@ mod tests {
                         model: "fallback".into(),
                         priority: 20,
                         enabled: true,
+                        ..Default::default()
                     },
                 ],
             })
@@ -2506,6 +2513,7 @@ mod tests {
                     model: "backup".into(),
                     priority: 10,
                     enabled: true,
+                    ..Default::default()
                 }],
             })
             .await
@@ -2522,6 +2530,7 @@ mod tests {
                         model: "primary".into(),
                         priority: 10,
                         enabled: true,
+                        ..Default::default()
                     },
                     RouteTarget {
                         id: "safer".into(),
@@ -2529,6 +2538,7 @@ mod tests {
                         model: "safer".into(),
                         priority: 20,
                         enabled: true,
+                        ..Default::default()
                     },
                 ],
             })
@@ -2621,6 +2631,7 @@ mod tests {
                         model: "slow".into(),
                         priority: 10,
                         enabled: true,
+                        ..Default::default()
                     },
                     RouteTarget {
                         id: "fast".into(),
@@ -2628,6 +2639,7 @@ mod tests {
                         model: "fast".into(),
                         priority: 20,
                         enabled: true,
+                        ..Default::default()
                     },
                     RouteTarget {
                         id: "other".into(),
@@ -2635,6 +2647,7 @@ mod tests {
                         model: "other".into(),
                         priority: 30,
                         enabled: true,
+                        ..Default::default()
                     },
                 ],
             })
@@ -2715,6 +2728,7 @@ mod tests {
                     model: "primary".into(),
                     priority: 10,
                     enabled: true,
+                    ..Default::default()
                 }],
             })
             .await
@@ -2802,6 +2816,7 @@ mod tests {
                         model: "low".into(),
                         priority: 10,
                         enabled: true,
+                        ..Default::default()
                     },
                     RouteTarget {
                         id: "high".into(),
@@ -2809,6 +2824,7 @@ mod tests {
                         model: "high".into(),
                         priority: 20,
                         enabled: true,
+                        ..Default::default()
                     },
                 ],
             })
@@ -2884,6 +2900,7 @@ mod tests {
                     model: "provider-model".into(),
                     priority: 10,
                     enabled: true,
+                    ..Default::default()
                 }],
             })
             .await
@@ -2985,6 +3002,7 @@ mod tests {
                     model: "kokoro".into(),
                     priority: 10,
                     enabled: true,
+                    ..Default::default()
                 }],
             })
             .await
@@ -3047,6 +3065,7 @@ mod tests {
                     model: "flux".into(),
                     priority: 10,
                     enabled: true,
+                    ..Default::default()
                 }],
             })
             .await
@@ -3123,6 +3142,7 @@ mod tests {
                         model: "qwen".into(),
                         priority: 10,
                         enabled: true,
+                        ..Default::default()
                     },
                     RouteTarget {
                         id: "audio".into(),
@@ -3130,6 +3150,7 @@ mod tests {
                         model: "vlm".into(),
                         priority: 20,
                         enabled: true,
+                        ..Default::default()
                     },
                 ],
             })
@@ -3195,6 +3216,7 @@ mod tests {
                     model: "qwen".into(),
                     priority: 10,
                     enabled: true,
+                    ..Default::default()
                 }],
             })
             .await
@@ -3216,6 +3238,232 @@ mod tests {
         let bytes = response.into_body().collect().await.unwrap().to_bytes();
         let body = String::from_utf8_lossy(&bytes);
         assert!(body.contains("unsupported_capability"));
+    }
+
+    #[tokio::test]
+    async fn vision_request_uses_capability_fallback_instead_of_rejecting() {
+        let chat = upstream(StatusCode::OK, json!({"id":"chat","choices":[{"message":{"role":"assistant","content":"text-only"},"finish_reason":"stop"}]})).await;
+        let vision = upstream(StatusCode::OK, json!({"id":"vision","choices":[{"message":{"role":"assistant","content":"saw-it"},"finish_reason":"stop"}]})).await;
+        let store = Store::memory().await.unwrap();
+        let mut chat_target = sample_target("chat", "chat-model", Some(chat));
+        chat_target.kind = TargetKind::Mlx;
+        chat_target.capabilities = vec!["chat".into()];
+        store.upsert_target(&chat_target).await.unwrap();
+        let mut vision_target = sample_target("vision", "vision-model", Some(vision));
+        vision_target.kind = TargetKind::Mlx;
+        vision_target.capabilities = vec!["chat".into(), "vision".into()];
+        store.upsert_target(&vision_target).await.unwrap();
+        store
+            .upsert_route(&ModelRoute {
+                alias: "assistant".into(),
+                enabled: true,
+                capabilities: vec!["chat".into(), "vision".into()],
+                targets: vec![
+                    RouteTarget {
+                        id: "chat".into(),
+                        kind: TargetKind::Mlx,
+                        model: "chat-model".into(),
+                        priority: 10,
+                        enabled: true,
+                        role: RouteRole::Primary,
+                    },
+                    RouteTarget {
+                        id: "vision".into(),
+                        kind: TargetKind::Mlx,
+                        model: "vision-model".into(),
+                        priority: 10,
+                        enabled: true,
+                        role: RouteRole::Fallback,
+                    },
+                ],
+            })
+            .await
+            .unwrap();
+        let secrets: Arc<dyn SecretStore> = Arc::new(MemorySecrets::default());
+        secrets.set(LOCAL_API_KEY, "test-token").unwrap();
+        let core = AppCore::new(store, secrets).unwrap();
+        core.migrate_legacy_local_api_key().await.unwrap();
+        core.local_activity()
+            .set_token("chat", "runtime-token".into());
+        core.local_activity()
+            .set_token("vision", "runtime-token".into());
+        let response = router(Arc::new(core))
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("authorization", "Bearer test-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"model":"assistant","messages":[{"role":"user","content":[{"type":"text","text":"what is this"},{"type":"image_url","image_url":{"url":"data:image/png;base64,AAAA"}}]}]}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get("x-local-ai-target").unwrap(),
+            "vision"
+        );
+        let body: Value =
+            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert_eq!(body["choices"][0]["message"]["content"], "saw-it");
+    }
+
+    #[tokio::test]
+    async fn adaptive_ranks_primaries_and_does_not_select_a_capable_fallback() {
+        let low = upstream(StatusCode::OK, json!({ "id": "low", "choices": [{"message":{"role":"assistant","content":"low"},"finish_reason":"stop"}] })).await;
+        let high = upstream(StatusCode::OK, json!({ "id": "high", "choices": [{"message":{"role":"assistant","content":"high"},"finish_reason":"stop"}] })).await;
+        let reserve = upstream(StatusCode::OK, json!({ "id": "reserve", "choices": [{"message":{"role":"assistant","content":"reserve"},"finish_reason":"stop"}] })).await;
+        let store = Store::memory().await.unwrap();
+        for (id, url, quality) in [
+            ("low", low, 20.0),
+            ("high", high, 95.0),
+            ("reserve", reserve, 100.0),
+        ] {
+            store
+                .upsert_target(&sample_target(id, id, Some(url)))
+                .await
+                .unwrap();
+            let mut profile = crate::routing::TargetRoutingProfile::neutral(id, TargetKind::Gguf);
+            profile.task_quality.insert("coding".into(), quality);
+            store.upsert_target_routing_profile(&profile).await.unwrap();
+        }
+        store
+            .upsert_route(&ModelRoute {
+                alias: "assistant".into(),
+                enabled: true,
+                capabilities: vec!["chat".into()],
+                targets: vec![
+                    RouteTarget {
+                        id: "low".into(),
+                        kind: TargetKind::Gguf,
+                        model: "low".into(),
+                        priority: 10,
+                        enabled: true,
+                        role: RouteRole::Primary,
+                    },
+                    RouteTarget {
+                        id: "high".into(),
+                        kind: TargetKind::Gguf,
+                        model: "high".into(),
+                        priority: 20,
+                        enabled: true,
+                        role: RouteRole::Primary,
+                    },
+                    RouteTarget {
+                        id: "reserve".into(),
+                        kind: TargetKind::Gguf,
+                        model: "reserve".into(),
+                        priority: 10,
+                        enabled: true,
+                        role: RouteRole::Fallback,
+                    },
+                ],
+            })
+            .await
+            .unwrap();
+        let mut policy = crate::routing::RoutingPolicy::new("assistant");
+        policy.mode = crate::routing::RoutingMode::Adaptive;
+        policy.status = crate::routing::PolicyStatus::Active;
+        policy.candidate_target_ids = vec!["low".into(), "high".into()];
+        policy.privacy = crate::routing::PrivacyMode::CloudAllowed;
+        store.upsert_routing_policy(&policy).await.unwrap();
+        let secrets: Arc<dyn SecretStore> = Arc::new(MemorySecrets::default());
+        secrets.set(LOCAL_API_KEY, "test-token").unwrap();
+        let core = AppCore::new(store, secrets).unwrap();
+        core.migrate_legacy_local_api_key().await.unwrap();
+        for id in ["low", "high", "reserve"] {
+            core.local_activity().set_token(id, "runtime-token".into());
+        }
+        let response = router(Arc::new(core))
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("authorization", "Bearer test-token")
+                    .header("content-type", "application/json")
+                    .header("x-local-ai-task", "coding")
+                    .body(Body::from(
+                        r#"{"model":"assistant","messages":[{"role":"user","content":"write code"}]}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers().get("x-local-ai-target").unwrap(), "high");
+    }
+
+    #[tokio::test]
+    async fn performance_uses_fallback_after_primary_not_found() {
+        let first = upstream(
+            StatusCode::NOT_FOUND,
+            json!({ "error": { "code": "model_not_found" } }),
+        )
+        .await;
+        let second = upstream(
+            StatusCode::OK,
+            json!({ "id": "ok", "choices": [{"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}] }),
+        )
+        .await;
+        let store = Store::memory().await.unwrap();
+        store
+            .upsert_target(&sample_target("first", "primary", Some(first)))
+            .await
+            .unwrap();
+        store
+            .upsert_target(&sample_target("second", "fallback", Some(second)))
+            .await
+            .unwrap();
+        store
+            .upsert_route(&ModelRoute {
+                alias: "assistant".into(),
+                enabled: true,
+                capabilities: vec!["chat".into()],
+                targets: vec![
+                    RouteTarget {
+                        id: "first".into(),
+                        kind: TargetKind::Gguf,
+                        model: "primary".into(),
+                        priority: 10,
+                        enabled: true,
+                        role: RouteRole::Primary,
+                    },
+                    RouteTarget {
+                        id: "second".into(),
+                        kind: TargetKind::Gguf,
+                        model: "fallback".into(),
+                        priority: 10,
+                        enabled: true,
+                        role: RouteRole::Fallback,
+                    },
+                ],
+            })
+            .await
+            .unwrap();
+        let app = app_from_store(store.clone()).await;
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("authorization", "Bearer test-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"model":"assistant","messages":[{"role":"user","content":"hi"}]}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get("x-local-ai-target").unwrap(),
+            "second"
+        );
     }
 
     #[test]

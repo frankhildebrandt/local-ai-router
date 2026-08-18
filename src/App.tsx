@@ -9,7 +9,7 @@ import {
   Trash2, X,
 } from "lucide-react";
 import { command, errorMessage, isTauri, listenDesktopNavigate, listenGatewayTraffic } from "./api";
-import type { DashboardData, InFlightRequest, LocalApiKey, LogFacets, LogQuery, LogResult, ModelMetadata, ModelRoute, ModelTarget, Provider, ProviderModel, ProviderPreset, PublicModel, RequestLog, ResourcePolicy, ResourceProfile, RoutingAttempt, RoutingConfigExport, RoutingEvaluation, RoutingPolicy, RoutingTaskDefinition, TargetKind, TargetRoutingProfile, UsageData, WireProtocol } from "./types";
+import type { DashboardData, InFlightRequest, LocalApiKey, LogFacets, LogQuery, LogResult, ModelMetadata, ModelRoute, ModelTarget, Provider, ProviderModel, ProviderPreset, PublicModel, RequestLog, ResourcePolicy, ResourceProfile, RouteRole, RouteTarget, RoutingAttempt, RoutingConfigExport, RoutingEvaluation, RoutingPolicy, RoutingTaskDefinition, TargetKind, TargetRoutingProfile, UsageData, WireProtocol } from "./types";
 import { ApiKeysPage } from "./ApiKeysPage";
 import { LocalPage } from "./LocalPage";
 
@@ -282,21 +282,21 @@ function RoutesPage({ targets, routes, publicModels, routingPolicies, routingPro
   const [profileTarget, setProfileTarget] = useState<ModelTarget | null>(null);
   const [showConfig, setShowConfig] = useState(false);
   const remove = async (alias: string) => { try { await command("delete_route", { alias }); await refresh(); success("Alias deleted"); } catch (e) { fail(e); } };
-  const enableAdaptive = async (route: ModelRoute, policy: RoutingPolicy | undefined, enabled: boolean) => {
+  const setRoutingMode = async (route: ModelRoute, policy: RoutingPolicy | undefined, adaptive: boolean) => {
     try {
-      await command("save_routing_policy", { policy: withAdaptiveEnabled(route, policy, enabled) });
+      await command("save_routing_policy", { policy: withAdaptiveEnabled(route, policy, adaptive) });
       await refresh();
-      success(enabled ? "Adaptive routing enabled for this alias" : "Adaptive routing disabled for this alias");
+      success(adaptive ? "Adaptive routing enabled for this alias" : "Performance routing enabled for this alias");
     } catch (error) { fail(error); }
   };
-  return <><PageHead eyebrow="Routing" title="Custom routes" description="Optional named stacks with ordered fallbacks. Configured models are already public. Use adaptive-routing to pick by quality, price, and task." action={<div className="button-row"><button className="secondary" onClick={() => setShowConfig(true)}><FileDown size={16} />Import / export</button><button className="primary" onClick={() => setEditing(null)} disabled={!targets.length}><Plus size={17} />Create route</button></div>} />
+  return <><PageHead eyebrow="Routing" title="Custom routes" description="Optional named stacks with a primary pool and reserve fallbacks. Performance keeps primary order; Adaptive ranks the primaries by quality, price, and task." action={<div className="button-row"><button className="secondary" onClick={() => setShowConfig(true)}><FileDown size={16} />Import / export</button><button className="primary" onClick={() => setEditing(null)} disabled={!targets.length}><Plus size={17} />Create route</button></div>} />
     <div className="route-list">
       <article className="route-card builtin-route-card">
         <div className="route-main"><div className="route-icon"><Sparkles /></div><div><div className="row"><h3>adaptive-routing</h3><Badge tone="good">Built-in</Badge></div><p>Always-on ranking across every enabled model by task quality, price, and the inferred task.</p></div></div>
       </article>
-      {routes.map(route => { const policy = routingPolicies.find(item => item.alias === route.alias); const enabled = adaptiveEnabled(policy); return <article className="route-card adaptive-route-card" key={route.alias}><div className="route-main"><div className="route-icon"><Route /></div><div><div className="row"><h3>{route.alias}</h3>{enabled && <Badge tone={policy?.status === "active" ? "good" : "warn"}>{policy?.status === "active" ? "Adaptive" : "Shadow"}</Badge>}</div><CapabilityList items={route.capabilities} /></div></div><div className="route-flow">{[...route.targets].sort((a,b) => a.priority-b.priority).map((item, index) => <div key={`${item.id}-${index}`} className="route-target"><span>{index ? `Fallback ${index}` : "Primary"}</span><strong>{item.kind === "alias" ? item.id : (targets.find(target => target.id === item.id)?.name ?? item.model)}</strong></div>)}</div><div className="alias-adaptive"><span>Adaptive</span><Toggle label={`Adaptive routing for ${route.alias}`} checked={enabled} onChange={() => void enableAdaptive(route, policy, !enabled)} /><button className="secondary compact" onClick={() => setPolicyRoute(route)}><Gauge size={15} />Configure</button></div><button className="icon-button" onClick={() => setEditing(route)}><Settings size={17} /></button><button className="icon-button danger" onClick={() => void remove(route.alias)}><Trash2 size={17} /></button></article>; })}
+      {routes.map(route => { const policy = routingPolicies.find(item => item.alias === route.alias); const enabled = adaptiveEnabled(policy); const flow = [...hopsForRole(route, "primary").map((item, index, list) => ({ item, label: list.length > 1 ? `Primary ${index + 1}` : "Primary" })), ...hopsForRole(route, "fallback").map((item, index) => ({ item, label: `Fallback ${index + 1}` }))]; return <article className="route-card adaptive-route-card" key={route.alias}><div className="route-main"><div className="route-icon"><Route /></div><div><div className="row"><h3>{route.alias}</h3><Badge tone={enabled ? (policy?.status === "shadow" ? "warn" : "good") : "neutral"}>{enabled ? (policy?.status === "shadow" ? "Shadow" : "Adaptive") : "Performance"}</Badge></div><CapabilityList items={route.capabilities} /></div></div><div className="route-flow">{flow.map(({ item, label }, index) => <div key={`${item.id}-${index}`} className="route-target"><span>{label}</span><strong>{item.kind === "alias" ? item.id : (targets.find(target => target.id === item.id)?.name ?? item.model)}</strong></div>)}</div><div className="alias-adaptive"><RoutingModeSwitch alias={route.alias} adaptive={enabled} onChange={adaptive => void setRoutingMode(route, policy, adaptive)} /><button className="secondary compact" onClick={() => setPolicyRoute(route)}><Gauge size={15} />Configure</button></div><button className="icon-button" onClick={() => setEditing(route)}><Settings size={17} /></button><button className="icon-button danger" onClick={() => void remove(route.alias)}><Trash2 size={17} /></button></article>; })}
     </div>
-    {!routes.length && <Empty icon={<Route />} title="No custom routes yet" text="Create a named stack only when you need a custom fallback order." />}
+    {!routes.length && <Empty icon={<Route />} title="No custom routes yet" text="Create a named stack when you need a primary pool and optional fallbacks." />}
     {editing !== undefined && <RouteModal route={editing} targets={targets} publicModels={publicModels} close={() => setEditing(undefined)} done={async () => { setEditing(undefined); await refresh(); success("Custom route saved"); }} fail={fail} />}
     {policyRoute && <RoutingPolicyModal route={policyRoute} policy={routingPolicies.find(item => item.alias === policyRoute.alias) ?? null} tasks={routingTasks} targets={targets} profiles={routingProfiles} onEditProfile={setProfileTarget} onTasksChanged={refresh} close={() => setPolicyRoute(null)} done={async () => { setPolicyRoute(null); await refresh(); success("Routing policy saved"); }} fail={fail} />}
     {profileTarget && <TargetProfileModal target={profileTarget} profile={routingProfiles.find(item => item.target_id === profileTarget.id) ?? null} tasks={routingTasks} close={() => setProfileTarget(null)} done={async () => { setProfileTarget(null); await refresh(); success("Target routing profile saved"); }} fail={fail} />}
@@ -317,8 +317,26 @@ const defaultAdaptiveRules: RoutingPolicy["rules"] = [
   { id: "builtin-creative", task: "creative", priority: 90, endpoint_contains: null, has_tools: null, modalities_any: [], reasoning: null, min_input_tokens: null, max_input_tokens: null, text_pattern: "\\b(story|poem|creative|geschichte|gedicht|brainstorm)\\b" },
 ];
 
+function hopRole(target: Pick<RouteTarget, "role">): RouteRole {
+  return target.role === "fallback" ? "fallback" : "primary";
+}
+
+function hopsForRole(route: ModelRoute, role: RouteRole) {
+  return [...route.targets].filter(target => hopRole(target) === role).sort((a, b) => a.priority - b.priority);
+}
+
+function primaryIds(route: ModelRoute) {
+  return hopsForRole(route, "primary").map(target => target.id);
+}
+
+function scopedCandidates(route: ModelRoute, ids: string[]) {
+  const hops = new Set(primaryIds(route));
+  const kept = ids.filter(id => hops.has(id));
+  return kept.length ? kept : primaryIds(route);
+}
+
 function defaultRoutingPolicy(route: ModelRoute): RoutingPolicy {
-  return { version: 1, alias: route.alias, mode: "fixed", status: "draft", privacy: "local_preferred", default_task: "general", weights: defaultWeights, max_estimated_cost_usd: null, preferred_latency_ms: 2000, preferred_cost_usd: .01, candidate_target_ids: route.targets.map(target => target.id), rules: defaultAdaptiveRules };
+  return { version: 1, alias: route.alias, mode: "fixed", status: "draft", privacy: "local_preferred", default_task: "general", weights: defaultWeights, max_estimated_cost_usd: null, preferred_latency_ms: 2000, preferred_cost_usd: .01, candidate_target_ids: primaryIds(route), rules: defaultAdaptiveRules };
 }
 
 function adaptiveEnabled(policy?: RoutingPolicy | null) {
@@ -327,10 +345,10 @@ function adaptiveEnabled(policy?: RoutingPolicy | null) {
 
 function withAdaptiveEnabled(route: ModelRoute, policy: RoutingPolicy | null | undefined, enabled: boolean): RoutingPolicy {
   const next = { ...(policy ?? defaultRoutingPolicy(route)) };
+  next.candidate_target_ids = scopedCandidates(route, next.candidate_target_ids);
   if (enabled) {
     next.mode = "adaptive";
-    next.status = next.status === "shadow" ? "shadow" : "active";
-    if (!next.candidate_target_ids.length) next.candidate_target_ids = route.targets.map(target => target.id);
+    next.status = "active";
   } else {
     next.mode = "fixed";
     next.status = "draft";
@@ -338,22 +356,41 @@ function withAdaptiveEnabled(route: ModelRoute, policy: RoutingPolicy | null | u
   return next;
 }
 
+function policyForSave(route: ModelRoute, policy: RoutingPolicy, expert: boolean): RoutingPolicy {
+  return { ...policy, candidate_target_ids: expert ? scopedCandidates(route, policy.candidate_target_ids) : primaryIds(route) };
+}
+
+function policyWithScopedCandidates(route: ModelRoute, policy: RoutingPolicy): RoutingPolicy {
+  return { ...policy, candidate_target_ids: scopedCandidates(route, policy.candidate_target_ids) };
+}
+
+function RoutingModeSwitch({ alias, adaptive, onChange }: { alias?: string; adaptive: boolean; onChange: (adaptive: boolean) => void }) {
+  const performanceLabel = alias ? `Performance routing for ${alias}` : "Performance routing";
+  const adaptiveLabel = alias ? `Adaptive routing for ${alias}` : "Adaptive routing";
+  return <div className="segmented small" role="group" aria-label={alias ? `Routing mode for ${alias}` : "Routing mode"}>
+    <button type="button" className={!adaptive ? "selected" : ""} aria-pressed={!adaptive} aria-label={performanceLabel} onClick={() => onChange(false)}>Performance</button>
+    <button type="button" className={adaptive ? "selected" : ""} aria-pressed={adaptive} aria-label={adaptiveLabel} onClick={() => onChange(true)}>Adaptive</button>
+  </div>;
+}
+
 function RoutingPolicyModal({ route, policy, tasks, targets, profiles, onEditProfile, onTasksChanged, close, done, fail }: { route: ModelRoute; policy: RoutingPolicy | null; tasks: RoutingTaskDefinition[]; targets: ModelTarget[]; profiles: TargetRoutingProfile[]; onEditProfile: (target: ModelTarget) => void; onTasksChanged: () => Promise<void>; close: () => void; done: () => Promise<void>; fail: (error: unknown) => void }) {
-  const initial: RoutingPolicy = policy ?? defaultRoutingPolicy(route);
-  const [value, setValue] = useState<RoutingPolicy>(structuredClone(initial)); const [busy, setBusy] = useState(false); const [sample, setSample] = useState(""); const [hint, setHint] = useState(""); const [simEndpoint, setSimEndpoint] = useState("/v1/chat/completions"); const [simTools, setSimTools] = useState(false); const [simReasoning, setSimReasoning] = useState(false); const [simModalities, setSimModalities] = useState(""); const [simMaxOutput, setSimMaxOutput] = useState(4096); const [preview, setPreview] = useState<RoutingEvaluation | null>(null);
+  const initial: RoutingPolicy = policyWithScopedCandidates(route, policy ?? defaultRoutingPolicy(route));
+  const [value, setValue] = useState<RoutingPolicy>(structuredClone(initial)); const [expert, setExpert] = useState(false); const [busy, setBusy] = useState(false); const [sample, setSample] = useState(""); const [hint, setHint] = useState(""); const [simEndpoint, setSimEndpoint] = useState("/v1/chat/completions"); const [simTools, setSimTools] = useState(false); const [simReasoning, setSimReasoning] = useState(false); const [simModalities, setSimModalities] = useState(""); const [simMaxOutput, setSimMaxOutput] = useState(4096); const [preview, setPreview] = useState<RoutingEvaluation | null>(null);
   const [taskId, setTaskId] = useState(""); const [taskLabel, setTaskLabel] = useState("");
   const aliasTargets = route.targets.map(item => targets.find(target => target.id === item.id)).filter((target): target is ModelTarget => !!target);
-  const savePolicy = async (event: FormEvent) => { event.preventDefault(); setBusy(true); try { await command("save_routing_policy", { policy: value }); await done(); } catch (error) { fail(error); } finally { setBusy(false); } };
-  const simulate = async () => { try { setPreview(await command<RoutingEvaluation>("simulate_routing", { input: { alias: route.alias, policy: value, task: hint || null, endpoint: simEndpoint, text: sample || null, hasTools: simTools, reasoning: simReasoning, modalities: simModalities.split(",").map(item => item.trim()).filter(Boolean), maxOutputTokens: simMaxOutput } })); } catch (error) { fail(error); } };
+  const savePolicy = async (event: FormEvent) => { event.preventDefault(); setBusy(true); try { await command("save_routing_policy", { policy: policyForSave(route, value, expert) }); await done(); } catch (error) { fail(error); } finally { setBusy(false); } };
+  const simulate = async () => { try { setPreview(await command<RoutingEvaluation>("simulate_routing", { input: { alias: route.alias, policy: policyForSave(route, value, expert), task: hint || null, endpoint: simEndpoint, text: sample || null, hasTools: simTools, reasoning: simReasoning, modalities: simModalities.split(",").map(item => item.trim()).filter(Boolean), maxOutputTokens: simMaxOutput } })); } catch (error) { fail(error); } };
   const addRule = () => setValue({ ...value, rules: [...value.rules, { id: crypto.randomUUID(), task: value.default_task, priority: (value.rules.length + 1) * 10, endpoint_contains: null, has_tools: null, modalities_any: [], reasoning: null, min_input_tokens: null, max_input_tokens: null, text_pattern: null }] });
   const updateRule = (id: string, patch: Partial<RoutingPolicy["rules"][number]>) => setValue({ ...value, rules: value.rules.map(item => item.id === id ? { ...item, ...patch } : item) });
   const addTask = async () => { try { await command("save_routing_task", { task: { id: taskId, label: taskLabel, builtin: false } }); setTaskId(""); setTaskLabel(""); await onTasksChanged(); } catch (error) { fail(error); } };
   const deleteTask = async (id: string) => { try { await command("delete_routing_task", { id }); await onTasksChanged(); } catch (error) { fail(error); } };
-  return <Modal title={`Adaptive routing · ${route.alias}`} wide close={close}><form className="form wide-form" onSubmit={savePolicy}>
-    <div className="security-note"><Gauge size={17} /><span>Off by default for this alias. Enabling ranks this alias's models; disabling keeps the ordered fallback list.</span></div>
-    <div className="three-fields"><div className="field"><span>Enable for this alias</span><Toggle label="Enable adaptive routing" checked={adaptiveEnabled(value)} onChange={() => setValue(withAdaptiveEnabled(route, value, !adaptiveEnabled(value)))} /></div><Field label="Serving"><select aria-label="Adaptive serving" value={value.status === "shadow" ? "shadow" : "active"} disabled={!adaptiveEnabled(value)} onChange={event => setValue({ ...value, mode: "adaptive", status: event.target.value as RoutingPolicy["status"] })}><option value="active">Active · ranked models serve</option><option value="shadow">Shadow · fallbacks serve, adaptive logs</option></select></Field><Field label="Privacy"><select value={value.privacy} onChange={event => setValue({ ...value, privacy: event.target.value as RoutingPolicy["privacy"] })}><option value="local_only">Local only</option><option value="local_preferred">Local preferred</option><option value="cloud_allowed">Cloud allowed</option></select></Field></div>
-    <Field label="Default task"><select value={value.default_task} onChange={event => setValue({ ...value, default_task: event.target.value })}>{tasks.map(task => <option value={task.id} key={task.id}>{task.label}</option>)}</select></Field>
-    <div><span className="field-label">Candidate targets</span><div className="candidate-matrix">{route.targets.map(routeTarget => { const target = targets.find(item => item.id === routeTarget.id); const checked = value.candidate_target_ids.includes(routeTarget.id); return <label key={routeTarget.id}><input type="checkbox" checked={checked} onChange={() => setValue({ ...value, candidate_target_ids: checked ? value.candidate_target_ids.filter(id => id !== routeTarget.id) : [...value.candidate_target_ids, routeTarget.id] })} /><span>{target?.name ?? routeTarget.model}</span></label>; })}</div></div>
+  return <Modal title={`Routing · ${route.alias}`} wide action={<div className="segmented small" role="group" aria-label="Editor mode"><button type="button" className={!expert ? "selected" : ""} aria-pressed={!expert} onClick={() => setExpert(false)}>Easy</button><button type="button" className={expert ? "selected" : ""} aria-pressed={expert} onClick={() => setExpert(true)}>Expert</button></div>} close={close}><form className="form wide-form" onSubmit={savePolicy}>
+    <RoutingModeSwitch adaptive={adaptiveEnabled(value)} onChange={enabled => setValue(withAdaptiveEnabled(route, value, enabled))} />
+    <div className="security-note"><Gauge size={17} /><span>{adaptiveEnabled(value) ? "Adaptive ranks this alias's primary models by quality, price, and the inferred task. Fallbacks stay in reserve." : "Performance keeps the primary pool in listed order and skips slow, rate-limited, or failing models. Fallbacks run only after that."}</span></div>
+    <Field label="Privacy"><select aria-label="Privacy" value={value.privacy} onChange={event => setValue({ ...value, privacy: event.target.value as RoutingPolicy["privacy"] })}><option value="local_only">Local only</option><option value="local_preferred">Local preferred</option><option value="cloud_allowed">Cloud allowed</option></select></Field>
+    {expert && <>
+    <div className="three-fields"><Field label="Serving"><select aria-label="Adaptive serving" value={value.status === "shadow" ? "shadow" : "active"} disabled={!adaptiveEnabled(value)} onChange={event => setValue({ ...value, mode: "adaptive", status: event.target.value as RoutingPolicy["status"] })}><option value="active">Active · ranked models serve</option><option value="shadow">Shadow · fallbacks serve, adaptive logs</option></select></Field><Field label="Default task"><select aria-label="Default task" value={value.default_task} onChange={event => setValue({ ...value, default_task: event.target.value })}>{tasks.map(task => <option value={task.id} key={task.id}>{task.label}</option>)}</select></Field></div>
+    <div><span className="field-label">Candidate primaries</span><div className="candidate-matrix">{hopsForRole(route, "primary").map(routeTarget => { const target = targets.find(item => item.id === routeTarget.id); const checked = value.candidate_target_ids.includes(routeTarget.id); return <label key={routeTarget.id}><input type="checkbox" checked={checked} onChange={() => setValue({ ...value, candidate_target_ids: checked ? value.candidate_target_ids.filter(id => id !== routeTarget.id) : [...value.candidate_target_ids, routeTarget.id] })} /><span>{target?.name ?? routeTarget.model}</span></label>; })}</div></div>
     <div className="routing-profiles"><div className="panel-title"><div><h3>Target profiles for this alias</h3><p>Context, pricing and task quality used when this alias ranks its models.</p></div></div><div className="profile-grid">{aliasTargets.map(target => { const profile = profiles.find(item => item.target_id === target.id); return <button type="button" className="profile-tile" key={target.id} onClick={() => onEditProfile(target)}><strong>{target.name}</strong><span>{profile ? `${profile.context_window.toLocaleString()} context · ${Object.keys(profile.task_quality).length} scores` : "Neutral defaults · configure"}</span>{target.kind === "cloud" && (!profile || profile.input_price_per_million == null || profile.output_price_per_million == null) && <Badge tone="warn">Price unknown</Badge>}</button>; })}</div></div>
     <div className="custom-tasks"><div><h3>Custom tasks</h3><p>Built-ins: {tasks.filter(task => task.builtin).map(task => task.id).join(", ")}</p><div className="custom-task-list">{tasks.filter(task => !task.builtin).map(task => <span key={task.id}>{task.label}<button type="button" className="icon-button" onClick={() => void deleteTask(task.id)}><X size={12} /></button></span>)}</div></div><div className="inline-form"><input value={taskId} onChange={event => setTaskId(event.target.value)} placeholder="task-id" /><input value={taskLabel} onChange={event => setTaskLabel(event.target.value)} placeholder="Display label" /><button type="button" className="secondary" disabled={!taskId || !taskLabel} onClick={() => void addTask()}><Plus size={15} />Add</button></div></div>
     <div><span className="field-label">Score weights</span><div className="weight-grid">{Object.entries(value.weights).map(([key, amount]) => <label key={key}><span>{key}</span><input aria-label={`${key} weight`} type="number" min="0" max="1" step="any" value={amount} onChange={event => { const next = parseDecimal(event.target.value); if (next != null) setValue({ ...value, weights: { ...value.weights, [key]: next } }); }} /></label>)}</div></div>
@@ -361,7 +398,9 @@ function RoutingPolicyModal({ route, policy, tasks, targets, profiles, onEditPro
     <div><span className="field-label">Simulator request metadata</span><div className="simulator-meta"><input aria-label="Simulator endpoint" value={simEndpoint} onChange={event => setSimEndpoint(event.target.value)} /><label><input type="checkbox" checked={simTools} onChange={event => setSimTools(event.target.checked)} />Tools</label><label><input type="checkbox" checked={simReasoning} onChange={event => setSimReasoning(event.target.checked)} />Reasoning</label><input aria-label="Simulator modalities" placeholder="vision,audio" value={simModalities} onChange={event => setSimModalities(event.target.value)} /><input aria-label="Simulator max output" type="number" min="1" value={simMaxOutput} onChange={event => setSimMaxOutput(Number(event.target.value))} /></div></div>
     <div><div className="panel-title"><div><h3>Ordered task rules</h3><p>All populated conditions must match. First match wins.</p></div><button type="button" className="text-button" onClick={addRule}><Plus size={14} />Rule</button></div>{value.rules.map((rule, index) => <div className="rule-card" key={rule.id}><div className="rule-row"><input type="number" aria-label={`Rule ${index + 1} priority`} value={rule.priority} onChange={event => updateRule(rule.id, { priority: Number(event.target.value) })} /><select value={rule.task} onChange={event => updateRule(rule.id, { task: event.target.value })}>{tasks.map(task => <option value={task.id} key={task.id}>{task.label}</option>)}</select><input placeholder="Text regex (optional)" value={rule.text_pattern ?? ""} onChange={event => updateRule(rule.id, { text_pattern: event.target.value || null })} /><button type="button" className="icon-button" onClick={() => setValue({ ...value, rules: value.rules.filter(item => item.id !== rule.id) })}><X size={14} /></button></div><div className="rule-conditions"><input placeholder="Endpoint contains" value={rule.endpoint_contains ?? ""} onChange={event => updateRule(rule.id, { endpoint_contains: event.target.value || null })} /><select value={rule.has_tools == null ? "" : String(rule.has_tools)} onChange={event => updateRule(rule.id, { has_tools: event.target.value === "" ? null : event.target.value === "true" })}><option value="">Any tools state</option><option value="true">Has tools</option><option value="false">No tools</option></select><select value={rule.reasoning == null ? "" : String(rule.reasoning)} onChange={event => updateRule(rule.id, { reasoning: event.target.value === "" ? null : event.target.value === "true" })}><option value="">Any reasoning state</option><option value="true">Reasoning requested</option><option value="false">No reasoning</option></select><input placeholder="Modalities: vision,audio" value={rule.modalities_any.join(",")} onChange={event => updateRule(rule.id, { modalities_any: event.target.value.split(",").map(item => item.trim()).filter(Boolean) })} /><input type="number" min="0" placeholder="Min tokens" value={rule.min_input_tokens ?? ""} onChange={event => updateRule(rule.id, { min_input_tokens: event.target.value ? Number(event.target.value) : null })} /><input type="number" min="0" placeholder="Max tokens" value={rule.max_input_tokens ?? ""} onChange={event => updateRule(rule.id, { max_input_tokens: event.target.value ? Number(event.target.value) : null })} /></div></div>)}</div>
     <section className="routing-simulator"><div><h3>Decision preview</h3><p>Example content stays in memory and is never logged.</p></div><div className="simulator-inputs"><select aria-label="Task hint" value={hint} onChange={event => setHint(event.target.value)}><option value="">No explicit task hint</option>{tasks.map(task => <option value={task.id} key={task.id}>{task.label}</option>)}</select><textarea aria-label="Routing sample" value={sample} onChange={event => setSample(event.target.value)} placeholder="Optional example prompt" /><button type="button" className="secondary" onClick={() => void simulate()}><Eye size={15} />Preview</button></div>{preview && <div className="decision-preview"><strong>{preview.mode} · {preview.task} via {preview.task_source}</strong>{preview.decision.ranked.map((candidate, index) => <span key={candidate.target_id}>{index + 1}. {targets.find(target => target.id === candidate.target_id)?.name ?? candidate.target_id} · {(candidate.score.total * 100).toFixed(1)} · {candidate.cost_verified ? `$${candidate.estimated_cost_usd?.toFixed(5)}` : "price unknown"}</span>)}{preview.decision.excluded.map(candidate => <span className="excluded" key={candidate.target_id}>{candidate.target_id}: {candidate.reason}</span>)}</div>}</section>
-    <div className="security-note"><ShieldCheck size={17} /><span>Capabilities, privacy, context and known cost limits filter candidates before scoring. Fixed fallback order remains available in Draft and Shadow.</span></div><ModalActions close={close} busy={busy} label="Save policy" />
+    <div className="security-note"><ShieldCheck size={17} /><span>Capabilities, privacy, context and known cost limits filter primaries before scoring. Fallbacks stay available for errors, outages, and missing features.</span></div>
+    </>}
+    <ModalActions close={close} busy={busy} label="Save policy" />
   </form></Modal>;
 }
 
@@ -384,10 +423,42 @@ function RouteModal({ route, targets, publicModels, close, done, fail }: { route
     ...targets.map(target => ({ value: target.id, label: `${target.name} · ${target.kind}`, kind: target.kind as TargetKind, model: target.provider_model, capabilities: target.capabilities })),
     ...publicModels.filter(model => (model.source === "alias" || model.source === "adaptive") && model.id !== (route?.alias ?? "")).map(model => ({ value: model.id, label: `${model.id} · alias`, kind: "alias" as TargetKind, model: model.id, capabilities: model.capabilities })),
   ], [targets, publicModels, route?.alias]);
-  const [alias, setAlias] = useState(route?.alias ?? ""); const [selected, setSelected] = useState<string[]>(route?.targets.sort((a,b) => a.priority-b.priority).map(item => item.id) ?? [hopOptions[0]?.value].filter(Boolean)); const [busy, setBusy] = useState(false);
-  const availableCapabilities = useMemo(() => selected.map(id => hopOptions.find(hop => hop.value === id)?.capabilities ?? []).reduce((common, capabilities, index) => index ? common.filter(item => capabilities.includes(item)) : capabilities, [] as string[]), [selected, hopOptions]);
-  const submit = async (event: FormEvent) => { event.preventDefault(); setBusy(true); try { await command("save_route", { route: { alias, enabled: true, capabilities: availableCapabilities, targets: selected.map((id, index) => { const hop = hopOptions.find(item => item.value === id); return { id, kind: hop?.kind ?? "cloud", model: hop?.model ?? id, priority: (index + 1) * 10, enabled: true }; }) } }); await done(); } catch (e) { fail(e); } finally { setBusy(false); } };
-  return <Modal title={route ? "Edit custom route" : "Create custom route"} close={close}><form className="form" onSubmit={submit}><Field label="Public model name"><input value={alias} onChange={e => setAlias(e.target.value.replace(/\s+/g, "-"))} placeholder="my-assistant" required disabled={!!route} /></Field><Field label="Targets in fallback order"><div className="target-picker">{selected.map((id, index) => <div className="picker-row" key={`${id}-${index}`}><span>{index ? `Fallback ${index}` : "Primary"}</span><select value={id} onChange={e => setSelected(selected.map((item, itemIndex) => itemIndex === index ? e.target.value : item))}>{hopOptions.map(hop => <option value={hop.value} key={hop.value}>{hop.label}</option>)}</select>{selected.length > 1 && <button type="button" className="icon-button" onClick={() => setSelected(selected.filter((_, itemIndex) => itemIndex !== index))}><X size={15} /></button>}</div>)}<button type="button" className="text-button" disabled={!hopOptions.length} onClick={() => setSelected([...selected, hopOptions[0].value])}><Plus size={15} />Add fallback</button></div></Field><div><span className="field-label">Shared capabilities</span><CapabilityList items={availableCapabilities} /></div><div className="security-note"><ListRestart size={17} /><span>Fallbacks run for network errors, timeouts, 404, 429 and 5xx before the first response chunk—never after streaming has started. Slow models can be skipped for 45 seconds.</span></div><ModalActions close={close} busy={busy} label="Save route" /></form></Modal>;
+  const [alias, setAlias] = useState(route?.alias ?? "");
+  const [primaries, setPrimaries] = useState<string[]>(route ? hopsForRole(route, "primary").map(item => item.id) : [hopOptions[0]?.value].filter(Boolean));
+  const [fallbacks, setFallbacks] = useState<string[]>(route ? hopsForRole(route, "fallback").map(item => item.id) : []);
+  const [busy, setBusy] = useState(false);
+  const used = [...primaries, ...fallbacks];
+  const nextHop = hopOptions.find(hop => !used.includes(hop.value))?.value;
+  const availableCapabilities = useMemo(() => {
+    const seen = new Set<string>();
+    for (const id of [...primaries, ...fallbacks]) {
+      for (const capability of hopOptions.find(hop => hop.value === id)?.capabilities ?? []) seen.add(capability);
+    }
+    return [...seen];
+  }, [primaries, fallbacks, hopOptions]);
+  const hopRow = (id: string, index: number, role: RouteRole, list: string[], setList: (next: string[]) => void, removable: boolean) => {
+    const options = hopOptions.filter(hop => hop.value === id || !used.includes(hop.value));
+    return <div className="picker-row" key={`${role}-${id}-${index}`}><span>{role === "fallback" ? `Fallback ${index + 1}` : (list.length > 1 ? `Primary ${index + 1}` : "Primary")}</span><select value={id} onChange={e => setList(list.map((item, itemIndex) => itemIndex === index ? e.target.value : item))}>{options.map(hop => <option value={hop.value} key={hop.value}>{hop.label}</option>)}</select>{removable && <button type="button" className="icon-button" onClick={() => setList(list.filter((_, itemIndex) => itemIndex !== index))}><X size={15} /></button>}</div>;
+  };
+  const submit = async (event: FormEvent) => {
+    event.preventDefault();
+    setBusy(true);
+    try {
+      const targetsForSave = [
+        ...primaries.map((id, index) => {
+          const hop = hopOptions.find(item => item.value === id);
+          return { id, kind: hop?.kind ?? "cloud", model: hop?.model ?? id, priority: (index + 1) * 10, enabled: true, role: "primary" as const };
+        }),
+        ...fallbacks.map((id, index) => {
+          const hop = hopOptions.find(item => item.value === id);
+          return { id, kind: hop?.kind ?? "cloud", model: hop?.model ?? id, priority: (index + 1) * 10, enabled: true, role: "fallback" as const };
+        }),
+      ];
+      await command("save_route", { route: { alias, enabled: true, capabilities: availableCapabilities, targets: targetsForSave } });
+      await done();
+    } catch (e) { fail(e); } finally { setBusy(false); }
+  };
+  return <Modal title={route ? "Edit custom route" : "Create custom route"} close={close}><form className="form" onSubmit={submit}><Field label="Public model name"><input value={alias} onChange={e => setAlias(e.target.value.replace(/\s+/g, "-"))} placeholder="my-assistant" required disabled={!!route} /></Field><div><span className="field-label">Primary pool</span><div className="target-picker">{primaries.map((id, index) => hopRow(id, index, "primary", primaries, setPrimaries, primaries.length > 1))}<button type="button" className="text-button" disabled={!nextHop} onClick={() => nextHop && setPrimaries([...primaries, nextHop])}><Plus size={15} />Add primary</button></div></div><div><span className="field-label">Fallbacks</span><div className="target-picker">{fallbacks.map((id, index) => hopRow(id, index, "fallback", fallbacks, setFallbacks, true))}<button type="button" className="text-button" disabled={!nextHop} onClick={() => nextHop && setFallbacks([...fallbacks, nextHop])}><Plus size={15} />Add fallback</button></div></div><div><span className="field-label">Advertised capabilities</span><CapabilityList items={availableCapabilities} /></div><div className="security-note"><ListRestart size={17} /><span>Fallbacks run only on errors, unreachability, or a missing feature such as vision—never after streaming has started. Slow, 404 and 429 skips still apply inside the primary pool.</span></div><ModalActions close={close} busy={busy} label="Save route" /></form></Modal>;
 }
 
 function LogsPage({ localKeys, refresh, success, fail }: Common) {
@@ -489,7 +560,7 @@ function Field({ label, children }: { label: string; children: ReactNode }) { re
 function Setting({ title, description, children }: { title: string; description: string; children: ReactNode }) { return <section className="setting"><div><h3>{title}</h3><p>{description}</p></div><div>{children}</div></section>; }
 function Empty({ icon, title, text, action }: { icon: ReactNode; title: string; text: string; action?: ReactNode }) { return <div className="empty"><div>{icon}</div><h3>{title}</h3><p>{text}</p>{action}</div>; }
 function Loading() { return <div className="loading"><LoaderCircle className="spin" /><span>Loading private gateway…</span></div>; }
-function Modal({ title, close, children, wide }: { title: string; close: () => void; children: ReactNode; wide?: boolean }) { return <div className="modal-backdrop" onMouseDown={close}><div className={wide ? "modal wide" : "modal"} onMouseDown={e => e.stopPropagation()}><div className="modal-head"><h2>{title}</h2><button className="icon-button" onClick={close}><X size={18} /></button></div>{children}</div></div>; }
+function Modal({ title, close, children, wide, action }: { title: string; close: () => void; children: ReactNode; wide?: boolean; action?: ReactNode }) { return <div className="modal-backdrop" onMouseDown={close}><div className={wide ? "modal wide" : "modal"} onMouseDown={e => e.stopPropagation()}><div className="modal-head"><h2>{title}</h2><div className="modal-head-actions">{action}<button className="icon-button" onClick={close}><X size={18} /></button></div></div>{children}</div></div>; }
 function ModalActions({ close, busy, label }: { close: () => void; busy: boolean; label: string }) { return <div className="modal-actions"><button type="button" className="secondary" onClick={close}>Cancel</button><button className="primary" disabled={busy}>{busy && <LoaderCircle className="spin" size={16} />}{label}</button></div>; }
 function CopyButton({ value, label }: { value: string; label?: string }) { const [copied, setCopied] = useState(false); return <button className={label ? "secondary" : "icon-button"} title="Copy" onClick={() => { void navigator.clipboard.writeText(value); setCopied(true); setTimeout(() => setCopied(false), 1200); }}>{copied ? <Check size={16} /> : <Copy size={16} />}{label}</button>; }
 function DeleteTarget({ id, refresh, success, fail }: Pick<Common, "refresh" | "success" | "fail"> & { id: string }) { return <button className="icon-button danger" onClick={async () => { if (!confirm("Delete this model target?")) return; try { await command("delete_target", { id }); await refresh(); success("Model target deleted"); } catch (e) { fail(e); } }}><Trash2 size={16} /></button>; }

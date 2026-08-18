@@ -98,12 +98,15 @@ export interface ModelMetadata {
   source: "provider_api" | "catalog" | "fallback";
 }
 
+export type RouteRole = "primary" | "fallback";
+
 export interface RouteTarget {
   id: string;
   kind: TargetKind;
   model: string;
   priority: number;
   enabled: boolean;
+  role?: RouteRole;
 }
 
 export interface ModelRoute {

@@ -8,7 +8,7 @@ use uuid::Uuid;
 
 use crate::{
     core::{AppCore, InFlightRequest},
-    domain::{ModelRoute, TargetKind},
+    domain::{ModelRoute, RouteRole, TargetKind},
     library,
     providers::{
         provider_preset, provider_presets, validate_cloud_base_url, AuthMode, ProviderPreset,
@@ -961,7 +961,14 @@ pub async fn save_route(
             "adaptive-routing is a built-in model and cannot be used as a custom alias".into(),
         );
     }
-    let mut shared: Option<Vec<String>> = None;
+    if !route
+        .targets
+        .iter()
+        .any(|target| target.enabled && target.role == RouteRole::Primary)
+    {
+        return Err("route must have at least one enabled primary".into());
+    }
+    let mut advertised = Vec::new();
     for route_target in route.targets.iter().filter(|target| target.enabled) {
         if route_target.id == route.alias {
             return Err("a route cannot fall back to itself".into());
@@ -998,16 +1005,16 @@ pub async fn save_route(
             }
             capabilities
         };
-        shared = Some(match shared {
-            Some(current) => current
-                .into_iter()
-                .filter(|item| capabilities.contains(item))
-                .collect(),
-            None => capabilities,
-        });
+        for capability in capabilities {
+            if !advertised.contains(&capability) {
+                advertised.push(capability);
+            }
+        }
     }
-    route.capabilities = shared.ok_or("route must have at least one enabled target")?;
+    advertised.sort();
+    route.capabilities = advertised;
     state.core.store.upsert_route(&route).await.map_err(err)?;
+    prune_route_policy(&state.core.store, &route).await?;
     Ok(route)
 }
 
@@ -1038,16 +1045,7 @@ pub async fn save_routing_policy(
     let mut tasks = builtin_tasks();
     tasks.extend(state.core.store.custom_routing_tasks().await.map_err(err)?);
     let known = tasks.into_iter().map(|task| task.id).collect::<Vec<_>>();
-    policy.validate(&known)?;
-    if let Some(target_id) = policy
-        .candidate_target_ids
-        .iter()
-        .find(|id| !route.targets.iter().any(|target| target.id == id.as_str()))
-    {
-        return Err(format!(
-            "candidate target is not part of alias: {target_id}"
-        ));
-    }
+    let policy = prepare_routing_policy(policy, &route, &known)?;
     state
         .core
         .store
@@ -1055,6 +1053,30 @@ pub async fn save_routing_policy(
         .await
         .map_err(err)?;
     Ok(policy)
+}
+
+fn prepare_routing_policy(
+    mut policy: RoutingPolicy,
+    route: &ModelRoute,
+    known_tasks: &[String],
+) -> Result<RoutingPolicy, String> {
+    let hop_ids = route.primary_ids();
+    policy.retain_route_candidates(&hop_ids);
+    policy.validate(known_tasks)?;
+    Ok(policy)
+}
+
+async fn prune_route_policy(store: &Store, route: &ModelRoute) -> Result<(), String> {
+    let Some(mut policy) = store.routing_policy(&route.alias).await.map_err(err)? else {
+        return Ok(());
+    };
+    let hop_ids = route.primary_ids();
+    policy.retain_route_candidates(&hop_ids);
+    if policy.candidate_target_ids.is_empty() {
+        policy.candidate_target_ids = hop_ids;
+    }
+    store.upsert_routing_policy(&policy).await.map_err(err)?;
+    Ok(())
 }
 
 #[tauri::command]
@@ -1704,9 +1726,33 @@ fn csv_cell(mut value: String) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{csv_cell, logs_csv};
-    use crate::storage::{LogQuery, RequestLog, Store};
+    use super::{csv_cell, logs_csv, prepare_routing_policy, prune_route_policy};
+    use crate::{
+        domain::{ModelRoute, RouteRole, RouteTarget, TargetKind},
+        routing::{builtin_tasks, PolicyStatus, RoutingMode, RoutingPolicy},
+        storage::{LogQuery, RequestLog, Store},
+    };
     use chrono::Utc;
+
+    fn sample_route() -> ModelRoute {
+        ModelRoute {
+            alias: "assistant".into(),
+            enabled: true,
+            capabilities: vec!["chat".into()],
+            targets: vec![RouteTarget {
+                id: "cloud".into(),
+                kind: TargetKind::Cloud,
+                model: "coding".into(),
+                priority: 10,
+                enabled: true,
+                ..Default::default()
+            }],
+        }
+    }
+
+    fn known_tasks() -> Vec<String> {
+        builtin_tasks().into_iter().map(|task| task.id).collect()
+    }
 
     #[test]
     fn csv_export_neutralizes_spreadsheet_formulas() {
@@ -1769,6 +1815,83 @@ mod tests {
         .unwrap();
         assert_eq!(csv.lines().count(), 502);
         assert!(!csv.contains("excluded"));
+    }
+
+    #[test]
+    fn save_routing_policy_drops_fallback_candidate_ids() {
+        let mut route = sample_route();
+        route.targets.push(RouteTarget {
+            id: "reserve".into(),
+            kind: TargetKind::Cloud,
+            model: "vision".into(),
+            priority: 20,
+            enabled: true,
+            role: RouteRole::Fallback,
+        });
+        let mut policy = RoutingPolicy::new("assistant");
+        policy.mode = RoutingMode::Adaptive;
+        policy.status = PolicyStatus::Active;
+        policy.candidate_target_ids = vec!["cloud".into(), "reserve".into()];
+
+        let saved = prepare_routing_policy(policy, &route, &known_tasks()).unwrap();
+
+        assert_eq!(saved.candidate_target_ids, vec!["cloud".to_string()]);
+    }
+
+    #[test]
+    fn save_routing_policy_drops_candidates_that_are_not_alias_hops() {
+        let mut policy = RoutingPolicy::new("assistant");
+        policy.mode = RoutingMode::Adaptive;
+        policy.status = PolicyStatus::Active;
+        policy.candidate_target_ids = vec![
+            "cloud".into(),
+            "dae9cea9-c842-4a88-9d23-e0562d2d7646".into(),
+        ];
+
+        let saved = prepare_routing_policy(policy, &sample_route(), &known_tasks()).unwrap();
+
+        assert_eq!(saved.candidate_target_ids, vec!["cloud".to_string()]);
+    }
+
+    #[test]
+    fn adaptive_policy_without_remaining_hops_is_rejected() {
+        let mut policy = RoutingPolicy::new("assistant");
+        policy.mode = RoutingMode::Adaptive;
+        policy.status = PolicyStatus::Active;
+        policy.candidate_target_ids = vec!["dae9cea9-c842-4a88-9d23-e0562d2d7646".into()];
+
+        let error = prepare_routing_policy(policy, &sample_route(), &known_tasks()).unwrap_err();
+
+        assert!(error.contains("at least one candidate target"));
+    }
+
+    #[tokio::test]
+    async fn save_route_prunes_policy_candidates_to_remaining_hops() {
+        let store = Store::memory().await.unwrap();
+        let mut route = sample_route();
+        route.targets.push(RouteTarget {
+            id: "dae9cea9-c842-4a88-9d23-e0562d2d7646".into(),
+            kind: TargetKind::Cloud,
+            model: "stale".into(),
+            priority: 20,
+            enabled: true,
+            ..Default::default()
+        });
+        store.upsert_route(&route).await.unwrap();
+        let mut policy = RoutingPolicy::new("assistant");
+        policy.mode = RoutingMode::Adaptive;
+        policy.status = PolicyStatus::Active;
+        policy.candidate_target_ids = vec![
+            "cloud".into(),
+            "dae9cea9-c842-4a88-9d23-e0562d2d7646".into(),
+        ];
+        store.upsert_routing_policy(&policy).await.unwrap();
+
+        route.targets.pop();
+        prune_route_policy(&store, &route).await.unwrap();
+
+        let stored = store.routing_policy("assistant").await.unwrap().unwrap();
+        assert_eq!(stored.candidate_target_ids, vec!["cloud".to_string()]);
     }
 }
 

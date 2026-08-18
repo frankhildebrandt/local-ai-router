@@ -8,6 +8,20 @@ pub const NOT_FOUND_COOLDOWN_SECS: i64 = 120;
 pub const RATE_LIMIT_DEFAULT_SECS: i64 = 30;
 pub const UPSTREAM_TIMEOUT_MS: u64 = 120_000;
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum RouteRole {
+    #[default]
+    Primary,
+    Fallback,
+}
+
+impl RouteRole {
+    pub fn is_fallback(self) -> bool {
+        matches!(self, Self::Fallback)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum TargetKind {
@@ -35,6 +49,21 @@ pub struct RouteTarget {
     pub model: String,
     pub priority: i64,
     pub enabled: bool,
+    #[serde(default)]
+    pub role: RouteRole,
+}
+
+impl Default for RouteTarget {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            kind: TargetKind::Cloud,
+            model: String::new(),
+            priority: 10,
+            enabled: true,
+            role: RouteRole::Primary,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -51,6 +80,37 @@ impl ModelRoute {
             .targets
             .iter()
             .filter(|target| target.enabled)
+            .collect();
+        targets.sort_by_key(|target| (target.role.is_fallback(), target.priority));
+        targets
+    }
+
+    pub fn primaries(&self) -> Vec<&RouteTarget> {
+        self.role_targets(RouteRole::Primary)
+    }
+
+    pub fn fallbacks(&self) -> Vec<&RouteTarget> {
+        self.role_targets(RouteRole::Fallback)
+    }
+
+    pub fn primary_ids(&self) -> Vec<String> {
+        let mut targets: Vec<_> = self
+            .targets
+            .iter()
+            .filter(|target| target.role == RouteRole::Primary)
+            .collect();
+        targets.sort_by_key(|target| target.priority);
+        targets
+            .into_iter()
+            .map(|target| target.id.clone())
+            .collect()
+    }
+
+    fn role_targets(&self, role: RouteRole) -> Vec<&RouteTarget> {
+        let mut targets: Vec<_> = self
+            .targets
+            .iter()
+            .filter(|target| target.enabled && target.role == role)
             .collect();
         targets.sort_by_key(|target| target.priority);
         targets
@@ -101,6 +161,7 @@ mod tests {
             model: id.into(),
             priority,
             enabled,
+            ..Default::default()
         }
     }
 
@@ -123,6 +184,31 @@ mod tests {
             .map(|target| target.id.as_str())
             .collect();
         assert_eq!(ids, vec!["primary", "fallback"]);
+    }
+
+    #[test]
+    fn primaries_sort_ahead_of_fallbacks_regardless_of_priority() {
+        let mut fallback = target("vision", 5, true);
+        fallback.role = RouteRole::Fallback;
+        let route = ModelRoute {
+            alias: "daily".into(),
+            enabled: true,
+            capabilities: vec!["chat".into(), "vision".into()],
+            targets: vec![
+                fallback,
+                target("chat-a", 20, true),
+                target("chat-b", 30, true),
+            ],
+        };
+
+        let ids: Vec<_> = route
+            .ordered_targets()
+            .iter()
+            .map(|target| target.id.as_str())
+            .collect();
+        assert_eq!(ids, vec!["chat-a", "chat-b", "vision"]);
+        assert_eq!(route.primaries().len(), 2);
+        assert_eq!(route.fallbacks()[0].id, "vision");
     }
 
     #[test]

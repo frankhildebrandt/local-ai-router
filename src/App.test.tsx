@@ -214,7 +214,7 @@ describe("Local AI Router shell", () => {
     expect(screen.getByText("GGUF · llama.cpp")).toBeInTheDocument();
   });
 
-  it("enables adaptive routing per alias and keeps it off by default", async () => {
+  it("enables adaptive routing per alias and keeps performance by default", async () => {
     render(<App />);
     await screen.findByText("Your models, one local endpoint.");
     fireEvent.click(screen.getByRole("button", { name: "Custom routes" }));
@@ -225,22 +225,125 @@ describe("Local AI Router shell", () => {
     expect(screen.getByRole("option", { name: "Coding model · cloud" })).toBeInTheDocument();
     expect(screen.getByRole("option", { name: "adaptive-routing · alias" })).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
-    const aliasSwitch = screen.getByRole("switch", { name: "Adaptive routing for assistant" });
-    expect(aliasSwitch).toHaveAttribute("aria-checked", "false");
-    fireEvent.click(aliasSwitch);
-    await waitFor(() => expect(command).toHaveBeenCalledWith("save_routing_policy", expect.objectContaining({ policy: expect.objectContaining({ alias: "assistant", mode: "adaptive", status: "active" }) })));
+    expect(screen.getByRole("button", { name: "Performance routing for assistant" })).toHaveAttribute("aria-pressed", "true");
+    expect(screen.getByRole("button", { name: "Adaptive routing for assistant" })).toHaveAttribute("aria-pressed", "false");
+    expect(screen.getByText("Performance", { selector: ".badge" })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Adaptive routing for assistant" }));
+    await waitFor(() => expect(command).toHaveBeenCalledWith("save_routing_policy", expect.objectContaining({ policy: expect.objectContaining({ alias: "assistant", mode: "adaptive", status: "active", candidate_target_ids: ["cloud"] }) })));
     fireEvent.click(screen.getByRole("button", { name: "Configure" }));
-    const heading = await screen.findByText("Adaptive routing · assistant");
+    const heading = await screen.findByText("Routing · assistant");
     expect(heading.closest(".modal")).toHaveClass("wide");
-    expect(screen.getByRole("switch", { name: "Enable adaptive routing" })).toHaveAttribute("aria-checked", "false");
-    fireEvent.click(screen.getByRole("switch", { name: "Enable adaptive routing" }));
+    expect(screen.getByRole("button", { name: "Easy" })).toHaveAttribute("aria-pressed", "true");
+    expect(screen.queryByLabelText("quality weight")).not.toBeInTheDocument();
+    expect(screen.queryByLabelText("Task hint")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Expert" }));
+    expect(screen.getByLabelText("quality weight")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: /^Adaptive routing$/ }));
     expect(screen.getByLabelText("Adaptive serving")).toHaveValue("active");
     fireEvent.change(screen.getByLabelText("Task hint"), { target: { value: "coding" } });
     fireEvent.change(screen.getByLabelText("Routing sample"), { target: { value: "write a Rust function" } });
     fireEvent.click(screen.getByRole("button", { name: "Preview" }));
     expect(await screen.findByText(/adaptive · coding via header/)).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Save policy" }));
-    await waitFor(() => expect(command).toHaveBeenCalledWith("save_routing_policy", expect.objectContaining({ policy: expect.objectContaining({ alias: "assistant", mode: "adaptive", status: "active" }) })));
+    await waitFor(() => expect(command).toHaveBeenCalledWith("save_routing_policy", expect.objectContaining({ policy: expect.objectContaining({ alias: "assistant", mode: "adaptive", status: "active", candidate_target_ids: ["cloud"] }) })));
+  });
+
+  it("drops stale candidate ids when enabling adaptive routing", async () => {
+    const previous = command.getMockImplementation();
+    command.mockImplementation((name: string, args?: unknown) => {
+      if (name === "list_routing_policies") {
+        return Promise.resolve([{
+          version: 1, alias: "assistant", mode: "fixed", status: "draft", privacy: "local_preferred", default_task: "general",
+          weights: { quality: .55, cost: .15, latency: .15, reliability: .10, locality: .05 },
+          max_estimated_cost_usd: null, preferred_latency_ms: 2000, preferred_cost_usd: .01, rules: [],
+          candidate_target_ids: ["cloud", "dae9cea9-c842-4a88-9d23-e0562d2d7646"],
+        }]);
+      }
+      return previous?.(name, args);
+    });
+    render(<App />);
+    await screen.findByText("Your models, one local endpoint.");
+    fireEvent.click(screen.getByRole("button", { name: "Custom routes" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Adaptive routing for assistant" }));
+    await waitFor(() => expect(command).toHaveBeenCalledWith("save_routing_policy", expect.objectContaining({
+      policy: expect.objectContaining({ alias: "assistant", mode: "adaptive", status: "active", candidate_target_ids: ["cloud"] }),
+    })));
+  });
+
+  it("saves a primary pool with optional fallbacks", async () => {
+    const previous = command.getMockImplementation();
+    command.mockImplementation((name: string, args?: unknown) => {
+      if (name === "list_targets") {
+        return Promise.resolve([
+          { id: "cloud", provider_id: null, name: "Coding model", kind: "cloud", wire_protocol: "open_ai_chat", provider_model: "coding", local_path: null, runtime_url: null, capabilities: ["chat", "streaming"], enabled: true, state: "ready", size_bytes: null },
+          { id: "vision", provider_id: null, name: "Vision model", kind: "cloud", wire_protocol: "open_ai_chat", provider_model: "gpt-4o", local_path: null, runtime_url: null, capabilities: ["chat", "streaming", "vision"], enabled: true, state: "ready", size_bytes: null },
+        ]);
+      }
+      if (name === "list_routes") {
+        return Promise.resolve([{
+          alias: "assistant", enabled: true, capabilities: ["chat", "streaming", "vision"],
+          targets: [
+            { id: "cloud", kind: "cloud", model: "coding", priority: 10, enabled: true, role: "primary" },
+            { id: "vision", kind: "cloud", model: "gpt-4o", priority: 20, enabled: true, role: "primary" },
+            { id: "adaptive-routing", kind: "alias", model: "adaptive-routing", priority: 10, enabled: true, role: "fallback" },
+          ],
+        }]);
+      }
+      return previous?.(name, args);
+    });
+    render(<App />);
+    await screen.findByText("Your models, one local endpoint.");
+    fireEvent.click(screen.getByRole("button", { name: "Custom routes" }));
+    expect(await screen.findByText("Primary 1")).toBeInTheDocument();
+    expect(screen.getByText("Primary 2")).toBeInTheDocument();
+    expect(screen.getByText("Fallback 1")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Configure" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Expert" }));
+    expect(screen.getByText("Candidate primaries")).toBeInTheDocument();
+    const candidates = screen.getByText("Candidate primaries").parentElement;
+    expect(candidates).toHaveTextContent("Coding model");
+    expect(candidates).toHaveTextContent("Vision model");
+    expect(candidates).not.toHaveTextContent("adaptive-routing");
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    fireEvent.click(screen.getByRole("button", { name: "Create route" }));
+    expect(await screen.findByText("Create custom route")).toBeInTheDocument();
+    fireEvent.change(screen.getByPlaceholderText("my-assistant"), { target: { value: "daily" } });
+    fireEvent.click(screen.getByRole("button", { name: "Add primary" }));
+    fireEvent.click(screen.getByRole("button", { name: "Add fallback" }));
+    fireEvent.click(screen.getByRole("button", { name: "Save route" }));
+    await waitFor(() => expect(command).toHaveBeenCalledWith("save_route", expect.objectContaining({
+      route: expect.objectContaining({
+        alias: "daily",
+        targets: [
+          expect.objectContaining({ id: "cloud", role: "primary", priority: 10 }),
+          expect.objectContaining({ id: "vision", role: "primary", priority: 20 }),
+          expect.objectContaining({ id: "adaptive-routing", role: "fallback", priority: 10 }),
+        ],
+      }),
+    })));
+  });
+
+  it("saves performance routing from the alias card", async () => {
+    const previous = command.getMockImplementation();
+    command.mockImplementation((name: string, args?: unknown) => {
+      if (name === "list_routing_policies") {
+        return Promise.resolve([{
+          version: 1, alias: "assistant", mode: "adaptive", status: "active", privacy: "local_preferred", default_task: "general",
+          weights: { quality: .55, cost: .15, latency: .15, reliability: .10, locality: .05 },
+          max_estimated_cost_usd: null, preferred_latency_ms: 2000, preferred_cost_usd: .01, rules: [],
+          candidate_target_ids: ["cloud"],
+        }]);
+      }
+      return previous?.(name, args);
+    });
+    render(<App />);
+    await screen.findByText("Your models, one local endpoint.");
+    fireEvent.click(screen.getByRole("button", { name: "Custom routes" }));
+    expect(await screen.findByRole("button", { name: "Adaptive routing for assistant" })).toHaveAttribute("aria-pressed", "true");
+    fireEvent.click(screen.getByRole("button", { name: "Performance routing for assistant" }));
+    await waitFor(() => expect(command).toHaveBeenCalledWith("save_routing_policy", expect.objectContaining({
+      policy: expect.objectContaining({ alias: "assistant", mode: "fixed", status: "draft" }),
+    })));
   });
 
   it("accepts comma decimals in cost and price fields", async () => {
@@ -248,6 +351,7 @@ describe("Local AI Router shell", () => {
     await screen.findByText("Your models, one local endpoint.");
     fireEvent.click(screen.getByRole("button", { name: "Custom routes" }));
     fireEvent.click(screen.getByRole("button", { name: "Configure" }));
+    fireEvent.click(screen.getByRole("button", { name: "Expert" }));
     fireEvent.change(screen.getByLabelText("Preferred cost USD"), { target: { value: "0,0125" } });
     fireEvent.click(await screen.findByRole("button", { name: /Coding model/ }));
     fireEvent.change(screen.getByLabelText("Input USD / 1M"), { target: { value: "0,15" } });

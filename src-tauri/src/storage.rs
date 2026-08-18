@@ -7,7 +7,7 @@ use sqlx::{sqlite::SqliteConnectOptions, QueryBuilder, Row, Sqlite, SqlitePool};
 
 use crate::{
     domain::{
-        ModelRoute, RouteTarget, TargetKind, NOT_FOUND_COOLDOWN_SECS, NOT_FOUND_TRIP,
+        ModelRoute, RouteRole, RouteTarget, TargetKind, NOT_FOUND_COOLDOWN_SECS, NOT_FOUND_TRIP,
         SLOW_WINDOW_SECS,
     },
     providers::{AuthMode, WireProtocol},
@@ -245,7 +245,7 @@ impl Store {
             "CREATE TABLE IF NOT EXISTS providers (id TEXT PRIMARY KEY, name TEXT NOT NULL, kind TEXT NOT NULL DEFAULT 'cloud', base_url TEXT NOT NULL, enabled INTEGER NOT NULL DEFAULT 1, preset_id TEXT NOT NULL DEFAULT 'openai', auth_mode TEXT NOT NULL DEFAULT 'api_key')",
             "CREATE TABLE IF NOT EXISTS model_targets (id TEXT PRIMARY KEY, provider_id TEXT, name TEXT NOT NULL, kind TEXT NOT NULL, provider_model TEXT NOT NULL, local_path TEXT, runtime_url TEXT, capabilities TEXT NOT NULL, enabled INTEGER NOT NULL DEFAULT 1, state TEXT NOT NULL DEFAULT 'ready', size_bytes INTEGER, wire_protocol TEXT NOT NULL DEFAULT 'open_ai_chat', FOREIGN KEY(provider_id) REFERENCES providers(id) ON DELETE CASCADE)",
             "CREATE TABLE IF NOT EXISTS routes (alias TEXT PRIMARY KEY, enabled INTEGER NOT NULL DEFAULT 1, capabilities TEXT NOT NULL)",
-            "CREATE TABLE IF NOT EXISTS route_targets (alias TEXT NOT NULL, target_id TEXT NOT NULL, priority INTEGER NOT NULL, kind TEXT NOT NULL DEFAULT 'cloud', model TEXT NOT NULL DEFAULT '', enabled INTEGER NOT NULL DEFAULT 1, PRIMARY KEY(alias, target_id), FOREIGN KEY(alias) REFERENCES routes(alias) ON DELETE CASCADE)",
+            "CREATE TABLE IF NOT EXISTS route_targets (alias TEXT NOT NULL, target_id TEXT NOT NULL, priority INTEGER NOT NULL, kind TEXT NOT NULL DEFAULT 'cloud', model TEXT NOT NULL DEFAULT '', enabled INTEGER NOT NULL DEFAULT 1, role TEXT NOT NULL DEFAULT 'primary', PRIMARY KEY(alias, target_id), FOREIGN KEY(alias) REFERENCES routes(alias) ON DELETE CASCADE)",
             "CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
             "CREATE TABLE IF NOT EXISTS provider_models (provider_id TEXT NOT NULL, model_id TEXT NOT NULL, synced_at TEXT NOT NULL, wire_protocol TEXT NOT NULL DEFAULT 'open_ai_chat', capabilities TEXT NOT NULL DEFAULT '[\"chat\",\"streaming\"]', metadata TEXT NOT NULL DEFAULT '{}', PRIMARY KEY(provider_id, model_id), FOREIGN KEY(provider_id) REFERENCES providers(id) ON DELETE CASCADE)",
             "CREATE TABLE IF NOT EXISTS local_api_keys (id TEXT PRIMARY KEY, name TEXT NOT NULL, token_hash BLOB NOT NULL, created_at TEXT NOT NULL, last_used_at TEXT, revoked_at TEXT)",
@@ -292,6 +292,26 @@ impl Store {
             sqlx::query("PRAGMA foreign_keys=ON")
                 .execute(&mut *connection)
                 .await?;
+        }
+        let route_target_columns = sqlx::query("PRAGMA table_info(route_targets)")
+            .fetch_all(&self.pool)
+            .await?;
+        if !route_target_columns
+            .iter()
+            .any(|column| column.get::<String, _>("name") == "role")
+        {
+            sqlx::query(
+                "ALTER TABLE route_targets ADD COLUMN role TEXT NOT NULL DEFAULT 'primary'",
+            )
+            .execute(&self.pool)
+            .await?;
+            sqlx::query(
+                "UPDATE route_targets SET role='fallback' WHERE priority > (
+                    SELECT MIN(priority) FROM route_targets AS ranked WHERE ranked.alias = route_targets.alias
+                )",
+            )
+            .execute(&self.pool)
+            .await?;
         }
         let attempt_columns = sqlx::query("PRAGMA table_info(routing_attempts)")
             .fetch_all(&self.pool)
@@ -696,7 +716,7 @@ impl Store {
         let mut routes = Vec::new();
         for row in rows {
             let alias: String = row.get("alias");
-            let target_rows = sqlx::query("SELECT target_id,kind,model,enabled,priority FROM route_targets WHERE alias=? ORDER BY priority")
+            let target_rows = sqlx::query("SELECT target_id,kind,model,enabled,priority,role FROM route_targets WHERE alias=? ORDER BY priority")
                 .bind(&alias).fetch_all(&self.pool).await?;
             let targets = target_rows
                 .into_iter()
@@ -707,6 +727,7 @@ impl Store {
                         model: target.get("model"),
                         priority: target.get("priority"),
                         enabled: target.get::<i64, _>("enabled") != 0,
+                        role: decode_role(target.get::<String, _>("role").as_str())?,
                     })
                 })
                 .collect::<anyhow::Result<Vec<_>>>()?;
@@ -737,13 +758,14 @@ impl Store {
             .execute(&mut *tx)
             .await?;
         for target in &route.targets {
-            sqlx::query("INSERT INTO route_targets(alias,target_id,priority,kind,model,enabled) VALUES(?,?,?,?,?,?)")
+            sqlx::query("INSERT INTO route_targets(alias,target_id,priority,kind,model,enabled,role) VALUES(?,?,?,?,?,?,?)")
                 .bind(&route.alias)
                 .bind(&target.id)
                 .bind(target.priority)
                 .bind(encode_kind(&target.kind))
                 .bind(&target.model)
                 .bind(target.enabled as i64)
+                .bind(encode_role(target.role))
                 .execute(&mut *tx)
                 .await?;
         }
@@ -1696,6 +1718,20 @@ pub fn decode_kind(value: &str) -> anyhow::Result<TargetKind> {
     }
 }
 
+fn encode_role(role: RouteRole) -> &'static str {
+    match role {
+        RouteRole::Primary => "primary",
+        RouteRole::Fallback => "fallback",
+    }
+}
+
+fn decode_role(value: &str) -> anyhow::Result<RouteRole> {
+    match value {
+        "fallback" => Ok(RouteRole::Fallback),
+        _ => Ok(RouteRole::Primary),
+    }
+}
+
 fn encode_auth_mode(value: AuthMode) -> &'static str {
     match value {
         AuthMode::ApiKey => "api_key",
@@ -1905,6 +1941,7 @@ mod tests {
                         model: "gpt-two".into(),
                         priority: 20,
                         enabled: true,
+                        role: RouteRole::Fallback,
                     },
                     RouteTarget {
                         id: "one".into(),
@@ -1912,6 +1949,7 @@ mod tests {
                         model: "gpt-one".into(),
                         priority: 10,
                         enabled: true,
+                        ..Default::default()
                     },
                 ],
             })
@@ -1921,6 +1959,57 @@ mod tests {
         let route = store.route("assistant").await.unwrap().unwrap();
         assert_eq!(route.capabilities, vec!["chat"]);
         assert_eq!(route.ordered_targets()[0].id, "one");
+        assert_eq!(
+            route
+                .targets
+                .iter()
+                .find(|target| target.id == "one")
+                .unwrap()
+                .role,
+            RouteRole::Primary
+        );
+        assert_eq!(
+            route
+                .targets
+                .iter()
+                .find(|target| target.id == "two")
+                .unwrap()
+                .role,
+            RouteRole::Fallback
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_extra_hops_become_fallbacks_when_role_is_added() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("legacy-roles.sqlite3");
+        let options = SqliteConnectOptions::from_str(&format!("sqlite://{}", path.display()))
+            .unwrap()
+            .create_if_missing(true)
+            .foreign_keys(true);
+        let pool = SqlitePool::connect_with(options).await.unwrap();
+        for statement in [
+            "CREATE TABLE providers (id TEXT PRIMARY KEY,name TEXT NOT NULL,kind TEXT NOT NULL,base_url TEXT NOT NULL,enabled INTEGER NOT NULL)",
+            "CREATE TABLE model_targets (id TEXT PRIMARY KEY,provider_id TEXT,name TEXT NOT NULL,kind TEXT NOT NULL,provider_model TEXT NOT NULL,local_path TEXT,runtime_url TEXT,capabilities TEXT NOT NULL,enabled INTEGER NOT NULL,state TEXT NOT NULL,size_bytes INTEGER)",
+            "CREATE TABLE routes (alias TEXT PRIMARY KEY,enabled INTEGER NOT NULL,capabilities TEXT NOT NULL)",
+            "CREATE TABLE route_targets (alias TEXT NOT NULL,target_id TEXT NOT NULL,priority INTEGER NOT NULL,PRIMARY KEY(alias,target_id))",
+            "CREATE TABLE settings (key TEXT PRIMARY KEY,value TEXT NOT NULL)",
+            "INSERT INTO model_targets VALUES ('chat',NULL,'Chat','gguf','chat',NULL,NULL,'[\"chat\"]',1,'ready',NULL)",
+            "INSERT INTO model_targets VALUES ('vision',NULL,'Vision','gguf','vision',NULL,NULL,'[\"chat\",\"vision\"]',1,'ready',NULL)",
+            "INSERT INTO routes VALUES ('assistant',1,'[\"chat\"]')",
+            "INSERT INTO route_targets VALUES ('assistant','chat',10)",
+            "INSERT INTO route_targets VALUES ('assistant','vision',20)",
+        ] {
+            sqlx::query(statement).execute(&pool).await.unwrap();
+        }
+        pool.close().await;
+
+        let store = Store::open(&path).await.unwrap();
+        let route = store.route("assistant").await.unwrap().unwrap();
+        assert_eq!(route.targets[0].id, "chat");
+        assert_eq!(route.targets[0].role, RouteRole::Primary);
+        assert_eq!(route.targets[1].id, "vision");
+        assert_eq!(route.targets[1].role, RouteRole::Fallback);
     }
 
     #[tokio::test]
@@ -2291,6 +2380,7 @@ mod tests {
                     model: "adaptive".into(),
                     priority: 10,
                     enabled: true,
+                    ..Default::default()
                 }],
             })
             .await
@@ -2433,6 +2523,7 @@ mod tests {
                         model: "cloud".into(),
                         priority: 10,
                         enabled: true,
+                        ..Default::default()
                     },
                     RouteTarget {
                         id: "adaptive-routing".into(),
@@ -2440,6 +2531,7 @@ mod tests {
                         model: "adaptive-routing".into(),
                         priority: 20,
                         enabled: true,
+                        ..Default::default()
                     },
                 ],
             })

@@ -4,7 +4,7 @@ use serde::Serialize;
 
 use crate::{
     catalog::unique_alias,
-    domain::{ModelRoute, RouteTarget},
+    domain::{ModelRoute, RouteRole, RouteTarget},
     hub::slug,
     routing::{
         default_task_rules, PolicyStatus, PrivacyMode, RoutingMode, RoutingPolicy, RoutingWeights,
@@ -171,6 +171,7 @@ fn singleton_route(public_id: String, target: &ModelTarget) -> ModelRoute {
             model: target.provider_model.clone(),
             priority: 10,
             enabled: true,
+            ..Default::default()
         }],
     }
 }
@@ -190,6 +191,7 @@ fn adaptive_route(assigned: &[(String, &ModelTarget)]) -> ModelRoute {
             model: target.provider_model.clone(),
             priority: ((index + 1) * 10) as i64,
             enabled: true,
+            ..Default::default()
         });
     }
     capabilities.sort();
@@ -280,6 +282,7 @@ pub async fn expand_route_targets(
             };
             let nested = Box::pin(expand_route_targets(store, &resolved.route, visited)).await?;
             for mut target in nested {
+                target.role = hop.role;
                 target.priority = priority;
                 expanded.push(target);
                 priority += 10;
@@ -363,6 +366,7 @@ mod tests {
                 model: target_id.into(),
                 priority: 10,
                 enabled: true,
+                ..Default::default()
             }],
         }
     }
@@ -437,6 +441,7 @@ mod tests {
                         model: "two-model".into(),
                         priority: 10,
                         enabled: true,
+                        ..Default::default()
                     },
                     RouteTarget {
                         id: "outer".into(),
@@ -444,6 +449,7 @@ mod tests {
                         model: "outer".into(),
                         priority: 20,
                         enabled: true,
+                        ..Default::default()
                     },
                 ],
             })
@@ -461,6 +467,7 @@ mod tests {
                         model: "one-model".into(),
                         priority: 10,
                         enabled: true,
+                        ..Default::default()
                     },
                     RouteTarget {
                         id: "inner".into(),
@@ -468,6 +475,7 @@ mod tests {
                         model: "inner".into(),
                         priority: 20,
                         enabled: true,
+                        ..Default::default()
                     },
                 ],
             })
@@ -481,5 +489,64 @@ mod tests {
             .map(|target| target.id)
             .collect();
         assert_eq!(ids, vec!["one", "two"]);
+    }
+
+    #[tokio::test]
+    async fn nested_alias_hops_inherit_the_parent_hop_role() {
+        let store = crate::storage::Store::memory().await.unwrap();
+        store
+            .upsert_target(&target("one", "One", "one-model", true))
+            .await
+            .unwrap();
+        store
+            .upsert_route(&ModelRoute {
+                alias: "inner".into(),
+                enabled: true,
+                capabilities: vec!["chat".into()],
+                targets: vec![RouteTarget {
+                    id: "one".into(),
+                    kind: TargetKind::Cloud,
+                    model: "one-model".into(),
+                    priority: 10,
+                    enabled: true,
+                    role: RouteRole::Primary,
+                }],
+            })
+            .await
+            .unwrap();
+        store
+            .upsert_route(&ModelRoute {
+                alias: "outer".into(),
+                enabled: true,
+                capabilities: vec!["chat".into()],
+                targets: vec![
+                    RouteTarget {
+                        id: "one".into(),
+                        kind: TargetKind::Cloud,
+                        model: "one-model".into(),
+                        priority: 10,
+                        enabled: true,
+                        role: RouteRole::Primary,
+                    },
+                    RouteTarget {
+                        id: "inner".into(),
+                        kind: TargetKind::Alias,
+                        model: "inner".into(),
+                        priority: 20,
+                        enabled: true,
+                        role: RouteRole::Fallback,
+                    },
+                ],
+            })
+            .await
+            .unwrap();
+        let outer = store.route("outer").await.unwrap().unwrap();
+        let expanded = expand_route_targets(&store, &outer, &mut HashSet::new())
+            .await
+            .unwrap();
+        assert_eq!(expanded[0].id, "one");
+        assert_eq!(expanded[0].role, RouteRole::Primary);
+        assert_eq!(expanded[1].id, "one");
+        assert_eq!(expanded[1].role, RouteRole::Fallback);
     }
 }
