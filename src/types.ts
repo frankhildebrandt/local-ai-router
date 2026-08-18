@@ -1,4 +1,4 @@
-export type TargetKind = "cloud" | "gguf" | "mlx";
+export type TargetKind = "cloud" | "gguf" | "mlx" | "alias";
 export type AuthMode = "api_key" | "open_ai_subscription";
 export type WireProtocol = "open_ai_chat" | "open_ai_responses" | "anthropic_messages" | "gemini_generate_content";
 export type AccessTier = "paid" | "subscription" | "free_tier" | "starter_credits" | "experimental";
@@ -185,6 +185,7 @@ export interface RoutingEvaluation {
   shadow_target_id: string | null;
   half_open_target_ids: string[];
   estimated_input_tokens: number;
+  peer_latency_ms?: number | null;
 }
 
 export interface RoutingAttempt {
@@ -269,6 +270,16 @@ export interface UsageData extends UsageSummary {
   by_key: Array<UsageSummary & { api_key_id: string | null; api_key_name: string }>;
 }
 
+export interface ModelUsage extends UsageSummary {
+  alias: string | null;
+  target: string | null;
+}
+
+export interface KeyUsageData extends LocalApiKey, UsageSummary {
+  buckets: Array<{ start: string; request_count: number; input_tokens: number; output_tokens: number }>;
+  by_model: ModelUsage[];
+}
+
 export interface DashboardData {
   running: boolean;
   base_url: string;
@@ -276,7 +287,18 @@ export interface DashboardData {
   target_count: number;
   route_count: number;
   recent_requests: number;
+  inflight: InFlightRequest[];
   runtimes: Array<{ target_id: string; port: number; size_bytes: number; queued: number; active: number; resident_bytes: number; memory_warning: boolean; profile: ResourceProfile; compute_duty_percent: number; pending_restart: boolean }>;
+}
+
+export interface InFlightRequest {
+  id: string;
+  started_at: string;
+  endpoint: string;
+  alias: string;
+  target_id: string | null;
+  target_name: string | null;
+  phase: "trying" | "streaming" | string;
 }
 
 export type CatalogCategory = "chat_vision" | "image" | "speech";

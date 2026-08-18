@@ -7,7 +7,7 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::{
-    core::AppCore,
+    core::{AppCore, InFlightRequest},
     domain::{ModelRoute, TargetKind},
     library,
     providers::{
@@ -24,8 +24,8 @@ use crate::{
         local_api_key_account, provider_account, CIVITAI_ACCOUNT, HF_ACCOUNT, LOCAL_API_KEY,
     },
     storage::{
-        LocalApiKey, LogFacets, LogQuery, LogResult, ModelTarget, Provider, ProviderModel, Store,
-        UsageData,
+        KeyUsageData, LocalApiKey, LogFacets, LogQuery, LogResult, ModelTarget, Provider,
+        ProviderModel, Store, UsageData,
     },
 };
 
@@ -47,6 +47,7 @@ pub struct Dashboard {
     pub route_count: usize,
     pub recent_requests: usize,
     pub runtimes: Vec<RuntimeStatus>,
+    pub inflight: Vec<InFlightRequest>,
 }
 
 #[derive(Debug, Serialize)]
@@ -147,6 +148,7 @@ pub async fn dashboard(state: State<'_, AppServices>) -> Result<Dashboard, Strin
         route_count: routes.len(),
         recent_requests,
         runtimes: state.runtimes.statuses(),
+        inflight: state.core.traffic.snapshot(),
     })
 }
 
@@ -961,20 +963,41 @@ pub async fn save_route(
     }
     let mut shared: Option<Vec<String>> = None;
     for route_target in route.targets.iter().filter(|target| target.enabled) {
-        let target = state
-            .core
-            .store
-            .target(&route_target.id)
-            .await
-            .map_err(err)?
-            .ok_or("route target not found")?;
-        let mut capabilities = target.capabilities.clone();
-        if target.wire_protocol == WireProtocol::AnthropicMessages {
-            capabilities.retain(|item| item != "structured_output");
+        if route_target.id == route.alias {
+            return Err("a route cannot fall back to itself".into());
         }
-        if target.wire_protocol == WireProtocol::GeminiGenerateContent {
-            capabilities.retain(|item| item != "reasoning");
-        }
+        let capabilities = if route_target.kind.is_alias()
+            || state
+                .core
+                .store
+                .target(&route_target.id)
+                .await
+                .map_err(err)?
+                .is_none()
+        {
+            crate::public_models::resolve_public_model(&state.core.store, &route_target.id)
+                .await
+                .map_err(err)?
+                .ok_or("route fallback alias not found")?
+                .route
+                .capabilities
+        } else {
+            let target = state
+                .core
+                .store
+                .target(&route_target.id)
+                .await
+                .map_err(err)?
+                .ok_or("route target not found")?;
+            let mut capabilities = target.capabilities.clone();
+            if target.wire_protocol == WireProtocol::AnthropicMessages {
+                capabilities.retain(|item| item != "structured_output");
+            }
+            if target.wire_protocol == WireProtocol::GeminiGenerateContent {
+                capabilities.retain(|item| item != "reasoning");
+            }
+            capabilities
+        };
         shared = Some(match shared {
             Some(current) => current
                 .into_iter()
@@ -1418,6 +1441,20 @@ pub async fn list_logs(
 #[tauri::command]
 pub async fn get_usage(state: State<'_, AppServices>, period: String) -> Result<UsageData, String> {
     state.core.store.usage(&period).await.map_err(err)
+}
+
+#[tauri::command]
+pub async fn get_key_usage(
+    state: State<'_, AppServices>,
+    id: String,
+    period: String,
+) -> Result<KeyUsageData, String> {
+    state
+        .core
+        .store
+        .usage_for_key(&id, &period)
+        .await
+        .map_err(err)
 }
 
 #[tauri::command]

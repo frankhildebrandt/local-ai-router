@@ -91,12 +91,14 @@ fn app_menu<R: Runtime>(app: &App<R>) -> tauri::Result<Menu<R>> {
     let settings = MenuItem::with_id(app, "settings", "Settings…", true, Some("CmdOrCtrl+,"))?;
     let overview = MenuItem::with_id(app, "nav-overview", "Overview", true, None::<&str>)?;
     let chat = MenuItem::with_id(app, "nav-chat", "Chat", true, None::<&str>)?;
+    let keys = MenuItem::with_id(app, "nav-keys", "API keys", true, None::<&str>)?;
     let usage = MenuItem::with_id(app, "nav-usage", "Usage", true, None::<&str>)?;
     let providers = MenuItem::with_id(app, "nav-providers", "Providers", true, None::<&str>)?;
     let cloud = MenuItem::with_id(app, "nav-cloud", "Cloud models", true, None::<&str>)?;
     let local = MenuItem::with_id(app, "nav-local", "Local models", true, None::<&str>)?;
     let routes = MenuItem::with_id(app, "nav-routes", "Custom routes", true, None::<&str>)?;
     let logs = MenuItem::with_id(app, "nav-logs", "Request logs", true, None::<&str>)?;
+    let routing = MenuItem::with_id(app, "nav-routing", "Routing", true, None::<&str>)?;
     let view_settings = MenuItem::with_id(app, "nav-settings", "Settings", true, None::<&str>)?;
     let github = MenuItem::with_id(
         app,
@@ -150,12 +152,14 @@ fn app_menu<R: Runtime>(app: &App<R>) -> tauri::Result<Menu<R>> {
                 &[
                     &overview,
                     &chat,
+                    &keys,
                     &usage,
                     &providers,
                     &cloud,
                     &local,
                     &routes,
                     &logs,
+                    &routing,
                     &view_settings,
                 ],
             )?,

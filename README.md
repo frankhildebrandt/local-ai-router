@@ -22,7 +22,7 @@ A private, multi-protocol model gateway for Apple Silicon Macs. Local AI Router 
 - Stealth, Balanced, Performance and Custom resource profiles with automatic loading, idle unloading, prompt concurrency and per-model overrides
 - Native MLX chat, image and speech sidecars plus Metal-enabled llama.cpp
 
-The gateway listens only on `http://127.0.0.1:11435`. Every request requires a local token managed under Settings. Supply it as `Authorization: Bearer`, `x-api-key`, or `x-goog-api-key`; query-string keys are deliberately rejected because URLs are commonly logged.
+The gateway listens only on `http://127.0.0.1:11435`. Every request requires a local token managed under **API keys**. Supply it as `Authorization: Bearer`, `x-api-key`, or `x-goog-api-key`; query-string keys are deliberately rejected because URLs are commonly logged.
 
 ## Install
 
@@ -66,7 +66,7 @@ from openai import OpenAI
 
 client = OpenAI(
     base_url="http://127.0.0.1:11435/v1",
-    api_key="lar_...",  # copy from Settings
+    api_key="lar_...",  # copy from API keys
 )
 
 response = client.chat.completions.create(
@@ -106,6 +106,10 @@ response = client.models.generate_content(model="adaptive-routing", contents="He
 ### Adaptive routing
 
 `adaptive-routing` is always on and ranks every enabled model by task quality, predicted cost and the inferred task. Custom routes can still enable their own adaptive ranking; that extra stays off by default and only ranks the models in that route. Adaptive policies filter candidates by capabilities, context, privacy and configured cost limits, then deterministically rank them. Draft policies on custom routes do not affect traffic; Shadow policies record the model they would select while the fixed route continues serving.
+
+Before the first response chunk, the gateway can fall back to the next candidate on connect errors, timeouts, 404, 429 and 5xx. 400, 401 and 403 stay final, and there is no mid-stream failover. Three consecutive 404s on a target open a two-minute circuit. A 429 without a reset deadline cools that target for 30 seconds; `Retry-After` and provider reset headers (`x-ratelimit-reset-requests`, `x-ratelimit-reset`, `anthropic-ratelimit-requests-reset`) are honored when present. A model whose recent TTFT (or latency) is at least 8 seconds and three times the peer median is skipped for 45 seconds; remaining candidates also get a tighter first-byte timeout.
+
+Custom-route hops can name another public model (`adaptive-routing` or a custom alias). Cycles are skipped. Request metadata stays on Request logs; ranking and fallback decisions are on the Routing page. Overview shows in-flight requests with the current model via live desktop events.
 
 Clients can bypass automatic task rules with a local-only header:
 

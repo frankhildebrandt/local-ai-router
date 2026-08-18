@@ -13,7 +13,7 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{broadcast, OwnedSemaphorePermit, Semaphore};
 
 use crate::{
     oauth::OAuthManager,
@@ -30,7 +30,124 @@ pub struct AppCore {
     pub secrets: Arc<dyn SecretStore>,
     pub client: Client,
     pub oauth: OAuthManager,
+    pub traffic: TrafficHub,
     local_gates: Arc<parking_lot::Mutex<HashMap<String, Arc<InferenceGate>>>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct InFlightRequest {
+    pub id: String,
+    pub started_at: chrono::DateTime<chrono::Utc>,
+    pub endpoint: String,
+    pub alias: String,
+    pub target_id: Option<String>,
+    pub target_name: Option<String>,
+    pub phase: String,
+}
+
+#[derive(Clone)]
+pub struct TrafficHub {
+    inflight: Arc<parking_lot::Mutex<HashMap<String, InFlightRequest>>>,
+    tx: broadcast::Sender<Vec<InFlightRequest>>,
+}
+
+impl Default for TrafficHub {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl TrafficHub {
+    pub fn new() -> Self {
+        let (tx, _) = broadcast::channel(64);
+        Self {
+            inflight: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            tx,
+        }
+    }
+
+    pub fn subscribe(&self) -> broadcast::Receiver<Vec<InFlightRequest>> {
+        self.tx.subscribe()
+    }
+
+    pub fn snapshot(&self) -> Vec<InFlightRequest> {
+        let mut items: Vec<_> = self.inflight.lock().values().cloned().collect();
+        items.sort_by(|left, right| left.started_at.cmp(&right.started_at));
+        items
+    }
+
+    pub fn start(&self, request: InFlightRequest) {
+        self.inflight.lock().insert(request.id.clone(), request);
+        self.publish();
+    }
+
+    pub fn update(
+        &self,
+        id: &str,
+        target_id: impl Into<String>,
+        target_name: impl Into<String>,
+        phase: &str,
+    ) {
+        let mut inflight = self.inflight.lock();
+        if let Some(request) = inflight.get_mut(id) {
+            request.target_id = Some(target_id.into());
+            request.target_name = Some(target_name.into());
+            request.phase = phase.into();
+        }
+        drop(inflight);
+        self.publish();
+    }
+
+    pub fn finish(&self, id: &str) {
+        self.inflight.lock().remove(id);
+        self.publish();
+    }
+
+    fn publish(&self) {
+        let _ = self.tx.send(self.snapshot());
+    }
+}
+
+pub struct InFlightGuard {
+    hub: TrafficHub,
+    id: String,
+    handed_off: bool,
+}
+
+impl InFlightGuard {
+    pub fn new(hub: TrafficHub, request: InFlightRequest) -> Self {
+        let id = request.id.clone();
+        hub.start(request);
+        Self {
+            hub,
+            id,
+            handed_off: false,
+        }
+    }
+
+    pub fn update(&self, target_id: &str, target_name: &str, phase: &str) {
+        self.hub.update(&self.id, target_id, target_name, phase);
+    }
+
+    pub fn hand_off(&mut self) {
+        self.handed_off = true;
+    }
+
+    pub fn hub(&self) -> TrafficHub {
+        self.hub.clone()
+    }
+
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        if !self.handed_off {
+            self.hub.finish(&self.id);
+        }
+    }
 }
 
 struct InferenceGate {
@@ -192,6 +309,7 @@ impl AppCore {
             secrets,
             client,
             oauth,
+            traffic: TrafficHub::new(),
             local_gates: Arc::new(parking_lot::Mutex::new(HashMap::new())),
         })
     }
@@ -391,6 +509,9 @@ impl AppCore {
                     None,
                 ))
             }
+            crate::domain::TargetKind::Alias => {
+                anyhow::bail!("alias hops must be expanded before they are served")
+            }
         }
     }
 
@@ -564,6 +685,31 @@ mod tests {
             size_bytes: None,
             local: crate::storage::LocalModelMeta::default(),
         }
+    }
+
+    #[test]
+    fn inflight_registry_publishes_updates_and_clears_on_finish() {
+        let hub = TrafficHub::new();
+        let mut events = hub.subscribe();
+        let guard = InFlightGuard::new(
+            hub.clone(),
+            InFlightRequest {
+                id: "req".into(),
+                started_at: chrono::Utc::now(),
+                endpoint: "/v1/chat/completions".into(),
+                alias: "assistant".into(),
+                target_id: None,
+                target_name: None,
+                phase: "trying".into(),
+            },
+        );
+        assert_eq!(hub.snapshot()[0].alias, "assistant");
+        assert_eq!(events.try_recv().unwrap()[0].phase, "trying");
+        guard.update("primary", "Primary", "streaming");
+        assert_eq!(hub.snapshot()[0].target_id.as_deref(), Some("primary"));
+        assert_eq!(hub.snapshot()[0].phase, "streaming");
+        drop(guard);
+        assert!(hub.snapshot().is_empty());
     }
 
     #[tokio::test]

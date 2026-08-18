@@ -17,8 +17,11 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 
 use crate::{
-    core::AppCore,
-    domain::is_transient_status,
+    core::{AppCore, InFlightGuard, InFlightRequest},
+    domain::{
+        first_byte_timeout_ms, is_fallback_status, is_transient_status, RATE_LIMIT_DEFAULT_SECS,
+        SLOW_WINDOW_SECS,
+    },
     protocol::{
         decode_request, decode_response, encode_request, encode_response, validate_cross_protocol,
         PublicProtocol, StreamTranslator,
@@ -397,12 +400,20 @@ async fn proxy(
             )
         }
     };
-    let targets = evaluation
-        .ordered_target_ids
-        .iter()
-        .filter_map(|id| route.targets.iter().find(|target| target.id == *id))
-        .collect::<Vec<_>>();
-    if targets.is_empty() {
+    let mut inflight = InFlightGuard::new(
+        core.traffic.clone(),
+        InFlightRequest {
+            id: request_id.clone(),
+            started_at: Utc::now(),
+            endpoint: uri.path().into(),
+            alias: alias.clone(),
+            target_id: None,
+            target_name: None,
+            phase: "trying".into(),
+        },
+    );
+    let target_ids = evaluation.ordered_target_ids.clone();
+    if target_ids.is_empty() {
         if evaluation.mode == "adaptive" {
             record_routing_attempt(
                 &core,
@@ -435,28 +446,29 @@ async fn proxy(
             },
         );
     }
-    let total_targets = targets.len() as i64;
+    let total_targets = target_ids.len() as i64;
 
     let mut attempts = 0i64;
     let mut last_error: Option<Response<Body>> = None;
     let mut last_translation_error: Option<String> = None;
     let mut last_capability_error: Option<&str> = None;
-    for route_target in targets {
+    for target_id in &target_ids {
         attempts += 1;
         if evaluation.mode == "adaptive"
-            && evaluation.half_open_target_ids.contains(&route_target.id)
+            && evaluation.half_open_target_ids.contains(target_id)
             && !core
                 .store
-                .claim_half_open(&route_target.id, &evaluation.task)
+                .claim_half_open(target_id, &evaluation.task)
                 .await
                 .unwrap_or(false)
         {
             continue;
         }
         let attempt_started = Instant::now();
-        let Ok(Some(mut target)) = core.store.target(&route_target.id).await else {
+        let Ok(Some(mut target)) = core.store.target(target_id).await else {
             continue;
         };
+        inflight.update(&target.id, &target.name, "trying");
         if !target_supports_capability(&target, capability) {
             last_capability_error =
                 Some("No target in this alias supports the requested capability");
@@ -737,10 +749,15 @@ async fn proxy(
                 .header("HTTP-Referer", "https://local-ai-router.app")
                 .header("X-Title", "Local AI Router");
         }
-        match tokio::time::timeout(Duration::from_secs(120), request.send()).await {
+        let has_fallback = attempts < total_targets;
+        let attempt_timeout = Duration::from_millis(first_byte_timeout_ms(
+            evaluation.peer_latency_ms,
+            has_fallback,
+        ));
+        match tokio::time::timeout(attempt_timeout, request.send()).await {
             Ok(Ok(upstream)) => {
                 let status = upstream.status();
-                let retry_after_until = retry_after_deadline(upstream.headers());
+                let retry_after_until = rate_limit_until(upstream.headers(), status.as_u16());
                 if status.is_redirection() {
                     log_request(
                         &core,
@@ -765,7 +782,7 @@ async fn proxy(
                         "The upstream attempted an unexpected redirect",
                     );
                 }
-                if is_transient_status(status.as_u16()) && attempts < total_targets {
+                if is_fallback_status(status.as_u16()) && has_fallback {
                     record_routing_attempt(
                         &core,
                         &evaluation,
@@ -773,7 +790,7 @@ async fn proxy(
                         &target.id,
                         RoutingAttemptOutcome {
                             status: status.as_u16(),
-                            transient_failure: true,
+                            transient_failure: is_transient_status(status.as_u16()),
                             retry_after_until,
                             latency: attempt_started.elapsed(),
                             ttft: None,
@@ -795,57 +812,60 @@ async fn proxy(
                         upstream.headers().get(header::CONTENT_TYPE).cloned()
                     };
                     let mut upstream_stream = upstream.bytes_stream();
-                    let first_chunk = match tokio::time::timeout(
-                        Duration::from_secs(120),
-                        upstream_stream.next(),
-                    )
-                    .await
-                    {
-                        Ok(Some(Ok(chunk))) => chunk,
-                        Ok(Some(Err(_))) | Ok(None) | Err(_) if attempts < total_targets => {
-                            record_routing_attempt(
-                                &core,
-                                &evaluation,
-                                &request_id,
-                                &target.id,
-                                RoutingAttemptOutcome {
-                                    status: 502,
-                                    transient_failure: true,
-                                    retry_after_until: None,
-                                    latency: attempt_started.elapsed(),
-                                    ttft: None,
-                                    streaming: true,
-                                },
-                            )
-                            .await;
-                            continue;
-                        }
-                        Ok(Some(Err(_))) | Ok(None) | Err(_) => {
-                            record_routing_attempt(
-                                &core,
-                                &evaluation,
-                                &request_id,
-                                &target.id,
-                                RoutingAttemptOutcome {
-                                    status: 502,
-                                    transient_failure: true,
-                                    retry_after_until: None,
-                                    latency: attempt_started.elapsed(),
-                                    ttft: None,
-                                    streaming: true,
-                                },
-                            )
-                            .await;
-                            last_error = Some(request_error(
-                                public_protocol,
-                                StatusCode::BAD_GATEWAY,
-                                "upstream_stream_error",
-                                "The upstream stream ended before producing data",
-                            ));
-                            continue;
-                        }
-                    };
+                    let first_chunk =
+                        match tokio::time::timeout(attempt_timeout, upstream_stream.next()).await {
+                            Ok(Some(Ok(chunk))) => chunk,
+                            Ok(Some(Err(_))) | Ok(None) | Err(_) if has_fallback => {
+                                record_routing_attempt(
+                                    &core,
+                                    &evaluation,
+                                    &request_id,
+                                    &target.id,
+                                    RoutingAttemptOutcome {
+                                        status: 504,
+                                        transient_failure: true,
+                                        retry_after_until: Some(
+                                            Utc::now()
+                                                + chrono::Duration::seconds(SLOW_WINDOW_SECS),
+                                        ),
+                                        latency: attempt_started.elapsed(),
+                                        ttft: None,
+                                        streaming: true,
+                                    },
+                                )
+                                .await;
+                                continue;
+                            }
+                            Ok(Some(Err(_))) | Ok(None) | Err(_) => {
+                                record_routing_attempt(
+                                    &core,
+                                    &evaluation,
+                                    &request_id,
+                                    &target.id,
+                                    RoutingAttemptOutcome {
+                                        status: 502,
+                                        transient_failure: true,
+                                        retry_after_until: None,
+                                        latency: attempt_started.elapsed(),
+                                        ttft: None,
+                                        streaming: true,
+                                    },
+                                )
+                                .await;
+                                last_error = Some(request_error(
+                                    public_protocol,
+                                    StatusCode::BAD_GATEWAY,
+                                    "upstream_stream_error",
+                                    "The upstream stream ended before producing data",
+                                ));
+                                continue;
+                            }
+                        };
                     attempt_ttft = Some(attempt_started.elapsed());
+                    inflight.update(&target.id, &target.name, "streaming");
+                    let stream_traffic = inflight.hub();
+                    let stream_traffic_id = inflight.id().to_owned();
+                    inflight.hand_off();
                     let stream_core = core.clone();
                     let stream_request_id = request_id.clone();
                     let stream_model = alias.clone();
@@ -918,6 +938,7 @@ async fn proxy(
                             ).await;
                         }
                         drop(_permit);
+                        stream_traffic.finish(&stream_traffic_id);
                         if let Some(runtimes) = stream_runtimes.as_ref() {
                             runtimes.reap_over_budget().await;
                             sync_runtime_states(&stream_core, runtimes).await;
@@ -926,23 +947,21 @@ async fn proxy(
                     response_from_body(status, content_type, Body::from_stream(stream), &request_id)
                 } else {
                     let content_type = upstream.headers().get(header::CONTENT_TYPE).cloned();
-                    let bytes = match tokio::time::timeout(
-                        Duration::from_secs(120),
-                        upstream.bytes(),
-                    )
-                    .await
+                    let bytes = match tokio::time::timeout(attempt_timeout, upstream.bytes()).await
                     {
                         Ok(Ok(bytes)) => bytes,
-                        Ok(Err(_)) | Err(_) if attempts < total_targets => {
+                        Ok(Err(_)) | Err(_) if has_fallback => {
                             record_routing_attempt(
                                 &core,
                                 &evaluation,
                                 &request_id,
                                 &target.id,
                                 RoutingAttemptOutcome {
-                                    status: 502,
+                                    status: 504,
                                     transient_failure: true,
-                                    retry_after_until: None,
+                                    retry_after_until: Some(
+                                        Utc::now() + chrono::Duration::seconds(SLOW_WINDOW_SECS),
+                                    ),
                                     latency: attempt_started.elapsed(),
                                     ttft: None,
                                     streaming: false,
@@ -1190,7 +1209,8 @@ async fn proxy(
                     RoutingAttemptOutcome {
                         status: 504,
                         transient_failure: true,
-                        retry_after_until: None,
+                        retry_after_until: has_fallback
+                            .then(|| Utc::now() + chrono::Duration::seconds(SLOW_WINDOW_SECS)),
                         latency: attempt_started.elapsed(),
                         ttft: None,
                         streaming: is_stream,
@@ -1298,8 +1318,68 @@ async fn record_routing_attempt(
 
 fn retry_after_deadline(headers: &HeaderMap) -> Option<chrono::DateTime<Utc>> {
     let value = headers.get(header::RETRY_AFTER)?.to_str().ok()?.trim();
+    parse_reset_deadline(value)
+}
+
+fn rate_limit_until(headers: &HeaderMap, status: u16) -> Option<chrono::DateTime<Utc>> {
+    let from_retry_after = retry_after_deadline(headers);
+    let remaining_zero = rate_limit_remaining_is_zero(headers);
+    let from_reset = [
+        "x-ratelimit-reset-requests",
+        "x-ratelimit-reset",
+        "anthropic-ratelimit-requests-reset",
+    ]
+    .into_iter()
+    .find_map(|name| {
+        headers
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+            .and_then(parse_reset_deadline)
+    });
+    if status == 429 {
+        return Some(
+            from_retry_after
+                .or(from_reset)
+                .unwrap_or_else(|| Utc::now() + chrono::Duration::seconds(RATE_LIMIT_DEFAULT_SECS)),
+        );
+    }
+    if remaining_zero {
+        return from_reset.or(from_retry_after);
+    }
+    from_retry_after
+}
+
+fn rate_limit_remaining_is_zero(headers: &HeaderMap) -> bool {
+    [
+        "x-ratelimit-remaining-requests",
+        "x-ratelimit-remaining",
+        "anthropic-ratelimit-requests-remaining",
+    ]
+    .into_iter()
+    .filter_map(|name| headers.get(name).and_then(|value| value.to_str().ok()))
+    .any(|value| {
+        value
+            .trim()
+            .parse::<f64>()
+            .is_ok_and(|remaining| remaining <= 0.0)
+    })
+}
+
+fn parse_reset_deadline(value: &str) -> Option<chrono::DateTime<Utc>> {
+    let value = value.trim();
     if let Ok(seconds) = value.parse::<i64>() {
+        if seconds >= 1_000_000_000 {
+            return chrono::DateTime::from_timestamp(seconds, 0)
+                .map(|value| value.min(Utc::now() + chrono::Duration::minutes(5)));
+        }
         return Some(Utc::now() + chrono::Duration::seconds(seconds.clamp(0, 300)));
+    }
+    if let Ok(parsed) = chrono::DateTime::parse_from_rfc3339(value) {
+        return Some(
+            parsed
+                .with_timezone(&Utc)
+                .min(Utc::now() + chrono::Duration::minutes(5)),
+        );
     }
     chrono::DateTime::parse_from_rfc2822(value)
         .ok()
@@ -2325,6 +2405,358 @@ mod tests {
         assert!(!serde_json::to_string(&logs)
             .unwrap()
             .contains("private marker"));
+    }
+
+    #[tokio::test]
+    async fn not_found_falls_back_to_the_next_target() {
+        let first = upstream(
+            StatusCode::NOT_FOUND,
+            json!({ "error": { "code": "model_not_found" } }),
+        )
+        .await;
+        let second = upstream(
+            StatusCode::OK,
+            json!({ "id": "ok", "choices": [{"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}] }),
+        )
+        .await;
+        let store = Store::memory().await.unwrap();
+        store
+            .upsert_target(&sample_target("first", "primary", Some(first)))
+            .await
+            .unwrap();
+        store
+            .upsert_target(&sample_target("second", "fallback", Some(second)))
+            .await
+            .unwrap();
+        store
+            .upsert_route(&ModelRoute {
+                alias: "assistant".into(),
+                enabled: true,
+                capabilities: vec!["chat".into()],
+                targets: vec![
+                    RouteTarget {
+                        id: "first".into(),
+                        kind: TargetKind::Gguf,
+                        model: "primary".into(),
+                        priority: 10,
+                        enabled: true,
+                    },
+                    RouteTarget {
+                        id: "second".into(),
+                        kind: TargetKind::Gguf,
+                        model: "fallback".into(),
+                        priority: 20,
+                        enabled: true,
+                    },
+                ],
+            })
+            .await
+            .unwrap();
+        let app = app_from_store(store.clone()).await;
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("authorization", "Bearer test-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"model":"assistant","messages":[{"role":"user","content":"hi"}]}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            store.logs(10).await.unwrap()[0].target.as_deref(),
+            Some("second")
+        );
+    }
+
+    #[tokio::test]
+    async fn alias_fallback_expands_to_another_route() {
+        let missing = upstream(
+            StatusCode::NOT_FOUND,
+            json!({ "error": { "code": "missing" } }),
+        )
+        .await;
+        let backup = upstream(
+            StatusCode::OK,
+            json!({ "id": "ok", "choices": [{"message":{"role":"assistant","content":"alias"},"finish_reason":"stop"}] }),
+        )
+        .await;
+        let store = Store::memory().await.unwrap();
+        store
+            .upsert_target(&sample_target("primary", "primary", Some(missing)))
+            .await
+            .unwrap();
+        store
+            .upsert_target(&sample_target("backup-target", "backup", Some(backup)))
+            .await
+            .unwrap();
+        store
+            .upsert_route(&ModelRoute {
+                alias: "safer".into(),
+                enabled: true,
+                capabilities: vec!["chat".into()],
+                targets: vec![RouteTarget {
+                    id: "backup-target".into(),
+                    kind: TargetKind::Gguf,
+                    model: "backup".into(),
+                    priority: 10,
+                    enabled: true,
+                }],
+            })
+            .await
+            .unwrap();
+        store
+            .upsert_route(&ModelRoute {
+                alias: "cheap".into(),
+                enabled: true,
+                capabilities: vec!["chat".into()],
+                targets: vec![
+                    RouteTarget {
+                        id: "primary".into(),
+                        kind: TargetKind::Gguf,
+                        model: "primary".into(),
+                        priority: 10,
+                        enabled: true,
+                    },
+                    RouteTarget {
+                        id: "safer".into(),
+                        kind: TargetKind::Alias,
+                        model: "safer".into(),
+                        priority: 20,
+                        enabled: true,
+                    },
+                ],
+            })
+            .await
+            .unwrap();
+        let app = app_from_store(store.clone()).await;
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("authorization", "Bearer test-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"model":"cheap","messages":[{"role":"user","content":"hi"}]}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            store.logs(10).await.unwrap()[0].target.as_deref(),
+            Some("backup-target")
+        );
+    }
+
+    #[tokio::test]
+    async fn slow_first_byte_falls_back_before_the_global_timeout() {
+        let slow = hanging_upstream(Duration::from_secs(20)).await;
+        let fast = upstream(
+            StatusCode::OK,
+            json!({ "id": "ok", "choices": [{"message":{"role":"assistant","content":"fast"},"finish_reason":"stop"}] }),
+        )
+        .await;
+        let other = upstream(
+            StatusCode::OK,
+            json!({ "id": "ok", "choices": [{"message":{"role":"assistant","content":"other"},"finish_reason":"stop"}] }),
+        )
+        .await;
+        let store = Store::memory().await.unwrap();
+        store
+            .upsert_target(&sample_target("slow", "slow", Some(slow)))
+            .await
+            .unwrap();
+        store
+            .upsert_target(&sample_target("fast", "fast", Some(fast)))
+            .await
+            .unwrap();
+        store
+            .upsert_target(&sample_target("other", "other", Some(other)))
+            .await
+            .unwrap();
+        for (id, latency) in [("fast", 1_000), ("other", 1_000)] {
+            store
+                .insert_routing_attempt(&crate::routing::RoutingAttemptRecord {
+                    id: format!("hist-{id}"),
+                    request_id: "seed".into(),
+                    created_at: Utc::now(),
+                    alias: "assistant".into(),
+                    task: "general".into(),
+                    task_source: "default".into(),
+                    target_id: id.into(),
+                    routing_mode: "fixed".into(),
+                    status: 200,
+                    transient_failure: false,
+                    retry_after_until: None,
+                    latency_ms: latency,
+                    ttft_ms: Some(latency),
+                    streaming: false,
+                    input_tokens: Some(1),
+                    output_tokens: None,
+                    estimated_cost_usd: None,
+                    cost_verified: false,
+                    score: None,
+                    reason: "default".into(),
+                })
+                .await
+                .unwrap();
+        }
+        store
+            .upsert_route(&ModelRoute {
+                alias: "assistant".into(),
+                enabled: true,
+                capabilities: vec!["chat".into()],
+                targets: vec![
+                    RouteTarget {
+                        id: "slow".into(),
+                        kind: TargetKind::Gguf,
+                        model: "slow".into(),
+                        priority: 10,
+                        enabled: true,
+                    },
+                    RouteTarget {
+                        id: "fast".into(),
+                        kind: TargetKind::Gguf,
+                        model: "fast".into(),
+                        priority: 20,
+                        enabled: true,
+                    },
+                    RouteTarget {
+                        id: "other".into(),
+                        kind: TargetKind::Gguf,
+                        model: "other".into(),
+                        priority: 30,
+                        enabled: true,
+                    },
+                ],
+            })
+            .await
+            .unwrap();
+        let app = app_from_store(store.clone()).await;
+        let started = Instant::now();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("authorization", "Bearer test-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"model":"assistant","messages":[{"role":"user","content":"hi"}]}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(started.elapsed() < Duration::from_secs(15));
+        assert_eq!(
+            store.logs(10).await.unwrap()[0].target.as_deref(),
+            Some("fast")
+        );
+    }
+
+    #[test]
+    fn rate_limit_without_retry_after_defaults_to_thirty_seconds() {
+        let until = rate_limit_until(&HeaderMap::new(), 429).unwrap();
+        let delta = (until - Utc::now()).num_seconds();
+        assert!((29..=31).contains(&delta));
+    }
+
+    #[test]
+    fn rate_limit_reset_header_is_honored() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-ratelimit-reset-requests", HeaderValue::from_static("12"));
+        let until = rate_limit_until(&headers, 429).unwrap();
+        let delta = (until - Utc::now()).num_seconds();
+        assert!((11..=13).contains(&delta));
+    }
+
+    async fn hanging_upstream(delay: Duration) -> String {
+        let app = Router::new().fallback(move || async move {
+            tokio::time::sleep(delay).await;
+            (
+                StatusCode::OK,
+                Json(json!({"id":"slow","choices":[{"message":{"role":"assistant","content":"slow"},"finish_reason":"stop"}]})),
+            )
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{address}/v1")
+    }
+
+    #[tokio::test]
+    async fn inflight_appears_during_proxy_and_clears_after_response() {
+        let hang = hanging_upstream(Duration::from_millis(300)).await;
+        let store = Store::memory().await.unwrap();
+        store
+            .upsert_target(&sample_target("primary", "primary", Some(hang)))
+            .await
+            .unwrap();
+        store
+            .upsert_route(&ModelRoute {
+                alias: "assistant".into(),
+                enabled: true,
+                capabilities: vec!["chat".into()],
+                targets: vec![RouteTarget {
+                    id: "primary".into(),
+                    kind: TargetKind::Gguf,
+                    model: "primary".into(),
+                    priority: 10,
+                    enabled: true,
+                }],
+            })
+            .await
+            .unwrap();
+        let secrets: Arc<dyn SecretStore> = Arc::new(MemorySecrets::default());
+        secrets.set(LOCAL_API_KEY, "test-token").unwrap();
+        let core = AppCore::new(store.clone(), secrets).unwrap();
+        core.migrate_legacy_local_api_key().await.unwrap();
+        core.local_activity()
+            .set_token("primary", "runtime-token".into());
+        let core = Arc::new(core);
+        let app = router(core.clone());
+        let pending = tokio::spawn(async move {
+            app.oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("authorization", "Bearer test-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"model":"assistant","messages":[{"role":"user","content":"hi"}]}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+        });
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let inflight = core.traffic.snapshot();
+            if let Some(request) = inflight.first() {
+                assert_eq!(request.alias, "assistant");
+                assert_eq!(request.endpoint, "/v1/chat/completions");
+                break;
+            }
+            if Instant::now() > deadline {
+                panic!("in-flight request never appeared");
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let response = pending.await.unwrap().unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(core.traffic.snapshot().is_empty());
     }
 
     #[tokio::test]

@@ -3,11 +3,11 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import App from "./App";
 
 const command = vi.fn();
-vi.mock("./api", () => ({ command: (...args: unknown[]) => command(...args), listenInstallJobs: async () => () => undefined, listenDesktopNavigate: async () => () => undefined, errorMessage: (error: unknown) => String(error), isTauri: () => true }));
+vi.mock("./api", () => ({ command: (...args: unknown[]) => command(...args), listenInstallJobs: async () => () => undefined, listenDesktopNavigate: async () => () => undefined, listenGatewayTraffic: async () => () => undefined, errorMessage: (error: unknown) => String(error), isTauri: () => true }));
 
 beforeEach(() => {
   command.mockImplementation((name: string, args?: unknown) => {
-    if (name === "dashboard") return Promise.resolve({ running: true, base_url: "http://127.0.0.1:11435/v1", provider_count: 0, target_count: 0, route_count: 0, recent_requests: 1, runtimes: [] });
+    if (name === "dashboard") return Promise.resolve({ running: true, base_url: "http://127.0.0.1:11435/v1", provider_count: 0, target_count: 0, route_count: 0, recent_requests: 1, inflight: [], runtimes: [] });
     if (name === "list_providers") return Promise.resolve([]);
     if (name === "list_targets") return Promise.resolve([{ id: "cloud", provider_id: null, name: "Coding model", kind: "cloud", wire_protocol: "open_ai_chat", provider_model: "coding", local_path: null, runtime_url: null, capabilities: ["chat", "streaming"], enabled: true, state: "ready", size_bytes: null }]);
     if (name === "list_routes") return Promise.resolve([{ alias: "assistant", enabled: true, capabilities: ["chat", "streaming"], targets: [{ id: "cloud", kind: "cloud", model: "coding", priority: 10, enabled: true }] }]);
@@ -33,8 +33,14 @@ beforeEach(() => {
     if (name === "get_resource_policy") return Promise.resolve({ version: 1, profile: "stealth", memory_budget_percent: 50, memory_budget_mib: null, auto_load: true, idle_unload_minutes: 5, compute_duty_percent: 25, cpu_threads: 4, max_parallel_prompts: 1, process_priority: -1, gguf_gpu_layers: -1, disk_kv_enabled: true, disk_kv_max_bytes: 10 * 1024 ** 3 });
     if (name === "get_resource_profile_preset") return Promise.resolve({ version: 1, profile: "balanced", memory_budget_percent: 70, memory_budget_mib: null, auto_load: true, idle_unload_minutes: 15, compute_duty_percent: 60, cpu_threads: 8, max_parallel_prompts: 2, process_priority: 0, gguf_gpu_layers: -1, disk_kv_enabled: false, disk_kv_max_bytes: 10 * 1024 ** 3 });
     if (name === "get_log_facets") return Promise.resolve({ aliases: ["assistant"], targets: ["cloud"], endpoints: ["/v1/chat/completions"] });
-    if (name === "get_usage") return Promise.resolve({ request_count: 1, success_count: 1, average_latency_ms: 12, input_tokens: 3, output_tokens: 5, unknown_usage_count: 0, buckets: [{ start: "2026-08-17T10:00:00Z", request_count: 1, input_tokens: 3, output_tokens: 5 }], by_key: [{ api_key_id: "default", api_key_name: "Default", request_count: 1, success_count: 1, average_latency_ms: 12, input_tokens: 3, output_tokens: 5, unknown_usage_count: 0 }] });
+    if (name === "get_usage") return Promise.resolve({ request_count: 17, success_count: 16, average_latency_ms: 12, input_tokens: 128, output_tokens: 256, unknown_usage_count: 0, buckets: [{ start: "2026-08-17T10:00:00Z", request_count: 17, input_tokens: 128, output_tokens: 256 }], by_key: [{ api_key_id: "default", api_key_name: "Default", request_count: 17, success_count: 16, average_latency_ms: 12, input_tokens: 128, output_tokens: 256, unknown_usage_count: 0 }] });
     if (name === "create_local_api_key") return Promise.resolve({ id: "new-key", name: "Automation", created_at: "2026-08-17T11:00:00Z", last_used_at: null, revoked_at: null, token: "lar_new" });
+    if (name === "get_key_usage") return Promise.resolve({
+      id: "default", name: "Default", created_at: "2026-08-17T10:00:00Z", last_used_at: null, revoked_at: null,
+      request_count: 17, success_count: 16, average_latency_ms: 12, input_tokens: 128, output_tokens: 256, unknown_usage_count: 0,
+      buckets: [{ start: "2026-08-17T10:00:00Z", request_count: 17, input_tokens: 128, output_tokens: 256 }],
+      by_model: [{ alias: "assistant", target: "coding", request_count: 17, success_count: 16, average_latency_ms: 12, input_tokens: 32, output_tokens: 64, unknown_usage_count: 0 }],
+    });
     if (name === "client_chat") return Promise.resolve({ model: "assistant", content: "Hello from the router" });
     if (name === "list_local_catalog") return Promise.resolve({
       platform: { apple_silicon: true, macos_15_plus: true, compatible: true, reason: null },
@@ -82,6 +88,8 @@ describe("Local AI Router shell", () => {
     render(<App />);
     expect(await screen.findByText("Your models, one local endpoint.")).toBeTruthy();
     expect(screen.getAllByText("http://127.0.0.1:11435/v1").length).toBeGreaterThan(0);
+    expect(screen.getByRole("heading", { name: "Active requests" })).toBeInTheDocument();
+    expect(screen.getByText("No running requests")).toBeInTheDocument();
     expect(command).toHaveBeenCalledWith("list_logs", { query: { legacy_only: false, limit: 100 } });
   });
 
@@ -108,10 +116,14 @@ describe("Local AI Router shell", () => {
     await waitFor(() => expect(command).toHaveBeenCalledWith("get_usage", { period: "24h" }));
 
     fireEvent.click(screen.getByRole("button", { name: "Settings" }));
-    expect(await screen.findByText("Local API keys")).toBeInTheDocument();
-    expect(screen.getByLabelText("Inference profile")).toHaveValue("stealth");
+    expect(await screen.findByLabelText("Inference profile")).toHaveValue("stealth");
+    expect(screen.queryByRole("heading", { name: "Local API keys" })).not.toBeInTheDocument();
+    expect(screen.queryByPlaceholderText("New key name")).not.toBeInTheDocument();
     fireEvent.change(screen.getByLabelText("Inference profile"), { target: { value: "balanced" } });
     await waitFor(() => expect(command).toHaveBeenCalledWith("save_resource_policy", expect.objectContaining({ policy: expect.objectContaining({ profile: "balanced", compute_duty_percent: 60, max_parallel_prompts: 2 }) })));
+
+    fireEvent.click(screen.getByRole("button", { name: "API keys" }));
+    expect(await screen.findByRole("heading", { name: "API keys" })).toBeInTheDocument();
     expect(screen.getByText("Default")).toBeInTheDocument();
     fireEvent.change(screen.getByPlaceholderText("New key name"), { target: { value: "Automation" } });
     fireEvent.click(screen.getByRole("button", { name: "Create key" }));
@@ -121,8 +133,39 @@ describe("Local AI Router shell", () => {
     expect(await screen.findByLabelText("API key")).toBeInTheDocument();
     expect(screen.getByLabelText("Status")).toBeInTheDocument();
     expect(await screen.findByText("1 matching request")).toBeInTheDocument();
+    expect(screen.queryByRole("heading", { name: "Adaptive routing" })).not.toBeInTheDocument();
     fireEvent.change(screen.getByLabelText("Status"), { target: { value: "5xx" } });
     await waitFor(() => expect(command).toHaveBeenCalledWith("list_logs", expect.objectContaining({ query: expect.objectContaining({ status_class: "5xx" }) })));
+
+    fireEvent.click(screen.getByRole("button", { name: "Routing" }));
+    expect(await screen.findByRole("heading", { name: "Routing" })).toBeInTheDocument();
+    expect(screen.getByText("No routing attempts")).toBeInTheDocument();
+    await waitFor(() => expect(command).toHaveBeenCalledWith("list_routing_attempts", { requestId: null, limit: 200 }));
+  });
+
+  it("shows request and token usage on each local API key", async () => {
+    render(<App />);
+    await screen.findByText("Your models, one local endpoint.");
+    fireEvent.click(screen.getByRole("button", { name: "API keys" }));
+    expect(await screen.findByRole("heading", { name: "API keys" })).toBeInTheDocument();
+    await waitFor(() => expect(command).toHaveBeenCalledWith("get_usage", { period: "7d" }));
+    const row = screen.getByRole("button", { name: /Default/ });
+    expect(row).toHaveTextContent("17");
+    expect(row).toHaveTextContent("128");
+    expect(row).toHaveTextContent("256");
+  });
+
+  it("opens key details with per-model token usage", async () => {
+    render(<App />);
+    await screen.findByText("Your models, one local endpoint.");
+    fireEvent.click(screen.getByRole("button", { name: "API keys" }));
+    fireEvent.click(await screen.findByRole("button", { name: /Default/ }));
+    await waitFor(() => expect(command).toHaveBeenCalledWith("get_key_usage", { id: "default", period: "7d" }));
+    expect(await screen.findByRole("heading", { name: "Default" })).toBeInTheDocument();
+    expect(screen.getByText("assistant")).toBeInTheDocument();
+    expect(screen.getByText("coding")).toBeInTheDocument();
+    expect(screen.getByText("32")).toBeInTheDocument();
+    expect(screen.getByText("64")).toBeInTheDocument();
   });
 
   it("shows curated catalog categories, RAM badges, locked models, and import paths", async () => {
@@ -177,6 +220,11 @@ describe("Local AI Router shell", () => {
     fireEvent.click(screen.getByRole("button", { name: "Custom routes" }));
     expect(await screen.findByRole("heading", { name: "Custom routes" })).toBeInTheDocument();
     expect(screen.getByRole("heading", { name: "adaptive-routing" })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Create route" }));
+    expect(await screen.findByText("Create custom route")).toBeInTheDocument();
+    expect(screen.getByRole("option", { name: "Coding model · cloud" })).toBeInTheDocument();
+    expect(screen.getByRole("option", { name: "adaptive-routing · alias" })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
     const aliasSwitch = screen.getByRole("switch", { name: "Adaptive routing for assistant" });
     expect(aliasSwitch).toHaveAttribute("aria-checked", "false");
     fireEvent.click(aliasSwitch);

@@ -262,6 +262,38 @@ pub async fn resolve_public_model(
     }))
 }
 
+pub async fn expand_route_targets(
+    store: &Store,
+    route: &ModelRoute,
+    visited: &mut HashSet<String>,
+) -> anyhow::Result<Vec<RouteTarget>> {
+    if !visited.insert(route.alias.clone()) {
+        return Ok(Vec::new());
+    }
+    let mut expanded = Vec::new();
+    let mut priority = 10_i64;
+    for hop in route.ordered_targets() {
+        let concrete = store.target(&hop.id).await?;
+        if hop.kind.is_alias() || concrete.is_none() {
+            let Some(resolved) = resolve_public_model(store, &hop.id).await? else {
+                continue;
+            };
+            let nested = Box::pin(expand_route_targets(store, &resolved.route, visited)).await?;
+            for mut target in nested {
+                target.priority = priority;
+                expanded.push(target);
+                priority += 10;
+            }
+            continue;
+        }
+        let mut target = hop.clone();
+        target.priority = priority;
+        expanded.push(target);
+        priority += 10;
+    }
+    Ok(expanded)
+}
+
 async fn expand_adaptive_alias_capabilities(
     store: &Store,
     route: &mut ModelRoute,
@@ -276,7 +308,7 @@ async fn expand_adaptive_alias_capabilities(
         return Ok(());
     }
     let mut capabilities = Vec::new();
-    for route_target in route.ordered_targets() {
+    for route_target in expand_route_targets(store, route, &mut HashSet::new()).await? {
         if !route_target.enabled {
             continue;
         }
@@ -380,5 +412,74 @@ mod tests {
         assert!(policy.weights.quality > policy.weights.cost);
         assert!(policy.weights.cost > policy.weights.latency);
         assert_eq!(policy.candidate_target_ids, vec!["a", "b"]);
+    }
+
+    #[tokio::test]
+    async fn alias_hops_expand_and_cycles_stop() {
+        let store = crate::storage::Store::memory().await.unwrap();
+        store
+            .upsert_target(&target("one", "One", "one-model", true))
+            .await
+            .unwrap();
+        store
+            .upsert_target(&target("two", "Two", "two-model", true))
+            .await
+            .unwrap();
+        store
+            .upsert_route(&ModelRoute {
+                alias: "inner".into(),
+                enabled: true,
+                capabilities: vec!["chat".into()],
+                targets: vec![
+                    RouteTarget {
+                        id: "two".into(),
+                        kind: TargetKind::Cloud,
+                        model: "two-model".into(),
+                        priority: 10,
+                        enabled: true,
+                    },
+                    RouteTarget {
+                        id: "outer".into(),
+                        kind: TargetKind::Alias,
+                        model: "outer".into(),
+                        priority: 20,
+                        enabled: true,
+                    },
+                ],
+            })
+            .await
+            .unwrap();
+        store
+            .upsert_route(&ModelRoute {
+                alias: "outer".into(),
+                enabled: true,
+                capabilities: vec!["chat".into()],
+                targets: vec![
+                    RouteTarget {
+                        id: "one".into(),
+                        kind: TargetKind::Cloud,
+                        model: "one-model".into(),
+                        priority: 10,
+                        enabled: true,
+                    },
+                    RouteTarget {
+                        id: "inner".into(),
+                        kind: TargetKind::Alias,
+                        model: "inner".into(),
+                        priority: 20,
+                        enabled: true,
+                    },
+                ],
+            })
+            .await
+            .unwrap();
+        let outer = store.route("outer").await.unwrap().unwrap();
+        let ids: Vec<_> = expand_route_targets(&store, &outer, &mut HashSet::new())
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|target| target.id)
+            .collect();
+        assert_eq!(ids, vec!["one", "two"]);
     }
 }

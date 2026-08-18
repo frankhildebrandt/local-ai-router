@@ -6,7 +6,10 @@ use serde::{Deserialize, Serialize};
 use sqlx::{sqlite::SqliteConnectOptions, QueryBuilder, Row, Sqlite, SqlitePool};
 
 use crate::{
-    domain::{ModelRoute, RouteTarget, TargetKind},
+    domain::{
+        ModelRoute, RouteTarget, TargetKind, NOT_FOUND_COOLDOWN_SECS, NOT_FOUND_TRIP,
+        SLOW_WINDOW_SECS,
+    },
     providers::{AuthMode, WireProtocol},
     resource::{ResourceOverrides, ResourcePolicy, ResourceProfile},
     routing::{
@@ -181,11 +184,29 @@ pub struct KeyUsage {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelUsage {
+    pub alias: Option<String>,
+    pub target: Option<String>,
+    #[serde(flatten)]
+    pub summary: UsageSummary,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UsageData {
     #[serde(flatten)]
     pub summary: UsageSummary,
     pub buckets: Vec<UsageBucket>,
     pub by_key: Vec<KeyUsage>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KeyUsageData {
+    #[serde(flatten)]
+    pub key: LocalApiKey,
+    #[serde(flatten)]
+    pub summary: UsageSummary,
+    pub buckets: Vec<UsageBucket>,
+    pub by_model: Vec<ModelUsage>,
 }
 
 #[derive(Clone)]
@@ -224,7 +245,7 @@ impl Store {
             "CREATE TABLE IF NOT EXISTS providers (id TEXT PRIMARY KEY, name TEXT NOT NULL, kind TEXT NOT NULL DEFAULT 'cloud', base_url TEXT NOT NULL, enabled INTEGER NOT NULL DEFAULT 1, preset_id TEXT NOT NULL DEFAULT 'openai', auth_mode TEXT NOT NULL DEFAULT 'api_key')",
             "CREATE TABLE IF NOT EXISTS model_targets (id TEXT PRIMARY KEY, provider_id TEXT, name TEXT NOT NULL, kind TEXT NOT NULL, provider_model TEXT NOT NULL, local_path TEXT, runtime_url TEXT, capabilities TEXT NOT NULL, enabled INTEGER NOT NULL DEFAULT 1, state TEXT NOT NULL DEFAULT 'ready', size_bytes INTEGER, wire_protocol TEXT NOT NULL DEFAULT 'open_ai_chat', FOREIGN KEY(provider_id) REFERENCES providers(id) ON DELETE CASCADE)",
             "CREATE TABLE IF NOT EXISTS routes (alias TEXT PRIMARY KEY, enabled INTEGER NOT NULL DEFAULT 1, capabilities TEXT NOT NULL)",
-            "CREATE TABLE IF NOT EXISTS route_targets (alias TEXT NOT NULL, target_id TEXT NOT NULL, priority INTEGER NOT NULL, PRIMARY KEY(alias, target_id), FOREIGN KEY(alias) REFERENCES routes(alias) ON DELETE CASCADE, FOREIGN KEY(target_id) REFERENCES model_targets(id) ON DELETE CASCADE)",
+            "CREATE TABLE IF NOT EXISTS route_targets (alias TEXT NOT NULL, target_id TEXT NOT NULL, priority INTEGER NOT NULL, kind TEXT NOT NULL DEFAULT 'cloud', model TEXT NOT NULL DEFAULT '', enabled INTEGER NOT NULL DEFAULT 1, PRIMARY KEY(alias, target_id), FOREIGN KEY(alias) REFERENCES routes(alias) ON DELETE CASCADE)",
             "CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
             "CREATE TABLE IF NOT EXISTS provider_models (provider_id TEXT NOT NULL, model_id TEXT NOT NULL, synced_at TEXT NOT NULL, wire_protocol TEXT NOT NULL DEFAULT 'open_ai_chat', capabilities TEXT NOT NULL DEFAULT '[\"chat\",\"streaming\"]', metadata TEXT NOT NULL DEFAULT '{}', PRIMARY KEY(provider_id, model_id), FOREIGN KEY(provider_id) REFERENCES providers(id) ON DELETE CASCADE)",
             "CREATE TABLE IF NOT EXISTS local_api_keys (id TEXT PRIMARY KEY, name TEXT NOT NULL, token_hash BLOB NOT NULL, created_at TEXT NOT NULL, last_used_at TEXT, revoked_at TEXT)",
@@ -240,6 +261,37 @@ impl Store {
             "CREATE TABLE IF NOT EXISTS routing_half_open_leases (target_id TEXT NOT NULL, task TEXT NOT NULL, lease_until TEXT NOT NULL, PRIMARY KEY(target_id,task))",
         ] {
             sqlx::query(statement).execute(&self.pool).await?;
+        }
+        let route_target_columns = sqlx::query("PRAGMA table_info(route_targets)")
+            .fetch_all(&self.pool)
+            .await?;
+        if !route_target_columns
+            .iter()
+            .any(|column| column.get::<String, _>("name") == "kind")
+        {
+            let mut connection = self.pool.acquire().await?;
+            sqlx::query("PRAGMA foreign_keys=OFF")
+                .execute(&mut *connection)
+                .await?;
+            sqlx::query(
+                "CREATE TABLE IF NOT EXISTS route_targets_v2 (alias TEXT NOT NULL, target_id TEXT NOT NULL, priority INTEGER NOT NULL, kind TEXT NOT NULL DEFAULT 'cloud', model TEXT NOT NULL DEFAULT '', enabled INTEGER NOT NULL DEFAULT 1, PRIMARY KEY(alias, target_id))",
+            )
+            .execute(&mut *connection)
+            .await?;
+            sqlx::query(
+                "INSERT INTO route_targets_v2(alias,target_id,priority,kind,model,enabled) SELECT rt.alias, rt.target_id, rt.priority, COALESCE(mt.kind,'alias'), COALESCE(mt.provider_model, rt.target_id), COALESCE(mt.enabled, 1) FROM route_targets rt LEFT JOIN model_targets mt ON mt.id=rt.target_id",
+            )
+            .execute(&mut *connection)
+            .await?;
+            sqlx::query("DROP TABLE route_targets")
+                .execute(&mut *connection)
+                .await?;
+            sqlx::query("ALTER TABLE route_targets_v2 RENAME TO route_targets")
+                .execute(&mut *connection)
+                .await?;
+            sqlx::query("PRAGMA foreign_keys=ON")
+                .execute(&mut *connection)
+                .await?;
         }
         let attempt_columns = sqlx::query("PRAGMA table_info(routing_attempts)")
             .fetch_all(&self.pool)
@@ -644,15 +696,15 @@ impl Store {
         let mut routes = Vec::new();
         for row in rows {
             let alias: String = row.get("alias");
-            let target_rows = sqlx::query("SELECT mt.id,mt.kind,mt.provider_model,mt.enabled,rt.priority FROM route_targets rt JOIN model_targets mt ON mt.id=rt.target_id WHERE rt.alias=? ORDER BY rt.priority")
+            let target_rows = sqlx::query("SELECT target_id,kind,model,enabled,priority FROM route_targets WHERE alias=? ORDER BY priority")
                 .bind(&alias).fetch_all(&self.pool).await?;
             let targets = target_rows
                 .into_iter()
                 .map(|target| {
                     Ok(RouteTarget {
-                        id: target.get("id"),
+                        id: target.get("target_id"),
                         kind: decode_kind(target.get::<String, _>("kind").as_str())?,
-                        model: target.get("provider_model"),
+                        model: target.get("model"),
                         priority: target.get("priority"),
                         enabled: target.get::<i64, _>("enabled") != 0,
                     })
@@ -685,10 +737,13 @@ impl Store {
             .execute(&mut *tx)
             .await?;
         for target in &route.targets {
-            sqlx::query("INSERT INTO route_targets(alias,target_id,priority) VALUES(?,?,?)")
+            sqlx::query("INSERT INTO route_targets(alias,target_id,priority,kind,model,enabled) VALUES(?,?,?,?,?,?)")
                 .bind(&route.alias)
                 .bind(&target.id)
                 .bind(target.priority)
+                .bind(encode_kind(&target.kind))
+                .bind(&target.model)
+                .bind(target.enabled as i64)
                 .execute(&mut *tx)
                 .await?;
         }
@@ -854,8 +909,33 @@ impl Store {
         let since = (Utc::now() - chrono::Duration::days(30)).to_rfc3339();
         let rows = sqlx::query("SELECT created_at,status,transient_failure,retry_after_until,latency_ms,ttft_ms FROM routing_attempts WHERE target_id=? AND task=? AND streaming=? AND created_at>=? ORDER BY created_at DESC LIMIT 100")
             .bind(target_id).bind(task).bind(streaming as i64).bind(since).fetch_all(&self.pool).await?;
+        let health_rows = sqlx::query("SELECT created_at,status,retry_after_until FROM routing_attempts WHERE target_id=? ORDER BY created_at DESC LIMIT 50")
+            .bind(target_id).fetch_all(&self.pool).await?;
+        let not_found_times = health_rows
+            .iter()
+            .take_while(|row| row.get::<i64, _>("status") == 404)
+            .filter_map(|row| {
+                DateTime::parse_from_rfc3339(&row.get::<String, _>("created_at"))
+                    .ok()
+                    .map(|value| value.with_timezone(&Utc))
+            })
+            .collect::<Vec<_>>();
+        let not_found_tripped = not_found_times.len() >= NOT_FOUND_TRIP;
+        let not_found_open = not_found_tripped
+            && not_found_times.first().is_some_and(|value| {
+                Utc::now() < *value + chrono::Duration::seconds(NOT_FOUND_COOLDOWN_SECS)
+            });
+        let retry_after_open = health_rows
+            .iter()
+            .filter_map(|row| row.get::<Option<String>, _>("retry_after_until"))
+            .filter_map(|value| DateTime::parse_from_rfc3339(&value).ok())
+            .any(|value| value.with_timezone(&Utc) > Utc::now());
         if rows.is_empty() {
-            return Ok(RoutingStats::default());
+            return Ok(RoutingStats {
+                circuit_open: not_found_open || retry_after_open,
+                half_open_required: not_found_tripped && !not_found_open && !retry_after_open,
+                ..RoutingStats::default()
+            });
         }
         let mut latencies = rows
             .iter()
@@ -875,6 +955,27 @@ impl Store {
         } else {
             latencies[((latencies.len() - 1) * 9) / 10].max(0) as u64
         };
+        let window_start = Utc::now() - chrono::Duration::seconds(SLOW_WINDOW_SECS);
+        let recent = rows
+            .iter()
+            .filter(|row| row.get::<i64, _>("status") < 400)
+            .filter_map(|row| {
+                let created = DateTime::parse_from_rfc3339(&row.get::<String, _>("created_at"))
+                    .ok()?
+                    .with_timezone(&Utc);
+                if created < window_start {
+                    return None;
+                }
+                let latency = if streaming {
+                    row.get::<Option<i64>, _>("ttft_ms")
+                        .unwrap_or_else(|| row.get("latency_ms"))
+                } else {
+                    row.get("latency_ms")
+                };
+                Some(latency.max(0) as u64)
+            })
+            .collect::<Vec<_>>();
+        let recent_latency_ms = crate::domain::median_u64(&recent);
         let success = rows
             .iter()
             .filter(|row| row.get::<i64, _>("status") < 400)
@@ -889,6 +990,7 @@ impl Store {
         // A successful probe resets the breaker. Other 4xx responses are neutral:
         // they neither open nor reset it. Keep the failure epoch across cooldowns so
         // repeated half-open failures can increase the backoff beyond 60 seconds.
+        // 404 uses a dedicated per-target breaker and is not mixed into this epoch.
         let failure_epoch = rows
             .iter()
             .take_while(|row| row.get::<i64, _>("status") >= 400)
@@ -902,28 +1004,23 @@ impl Store {
         let breaker_tripped = failure_epoch.windows(3).any(|window| {
             window[0].signed_duration_since(window[2]) <= chrono::Duration::seconds(60)
         });
-        let retry_after_open = rows
-            .iter()
-            .filter(|row| row.get::<i64, _>("transient_failure") != 0)
-            .filter_map(|row| row.get::<Option<String>, _>("retry_after_until"))
-            .filter_map(|value| DateTime::parse_from_rfc3339(&value).ok())
-            .any(|value| value.with_timezone(&Utc) > Utc::now());
-        let circuit_open = retry_after_open
-            || if breaker_tripped {
-                let exponent = failure_epoch.len().saturating_sub(3).min(4) as u32;
-                let cooldown = 30_i64.saturating_mul(2_i64.pow(exponent)).min(300);
-                failure_epoch
-                    .first()
-                    .is_some_and(|value| Utc::now() < *value + chrono::Duration::seconds(cooldown))
-            } else {
-                false
-            };
+        let transient_open = if breaker_tripped {
+            let exponent = failure_epoch.len().saturating_sub(3).min(4) as u32;
+            let cooldown = 30_i64.saturating_mul(2_i64.pow(exponent)).min(300);
+            failure_epoch
+                .first()
+                .is_some_and(|value| Utc::now() < *value + chrono::Duration::seconds(cooldown))
+        } else {
+            false
+        };
+        let circuit_open = retry_after_open || not_found_open || transient_open;
         Ok(RoutingStats {
             samples: eligible_samples,
             p90_latency_ms: p90,
+            recent_latency_ms,
             reliability,
             circuit_open,
-            half_open_required: breaker_tripped && !circuit_open,
+            half_open_required: (breaker_tripped || not_found_tripped) && !circuit_open,
         })
     }
 
@@ -1180,6 +1277,85 @@ impl Store {
         })
     }
 
+    pub async fn usage_for_key(&self, id: &str, period: &str) -> anyhow::Result<KeyUsageData> {
+        self.usage_for_key_at(id, period, Utc::now()).await
+    }
+
+    async fn usage_for_key_at(
+        &self,
+        id: &str,
+        period: &str,
+        now: DateTime<Utc>,
+    ) -> anyhow::Result<KeyUsageData> {
+        let key = self
+            .local_api_key(id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("local API key not found"))?;
+        let (cutoff, hourly) = match period {
+            "24h" => (Some(now - chrono::Duration::hours(24)), true),
+            "7d" => (Some(now - chrono::Duration::days(7)), false),
+            "30d" => (Some(now - chrono::Duration::days(30)), false),
+            "all" => (None, false),
+            _ => anyhow::bail!("usage period must be 24h, 7d, 30d or all"),
+        };
+
+        let metrics = "COUNT(*) AS request_count, COALESCE(SUM(CASE WHEN l.status >= 200 AND l.status < 300 THEN 1 ELSE 0 END),0) AS success_count, COALESCE(AVG(l.latency_ms),0.0) AS average_latency_ms, COALESCE(SUM(l.input_tokens),0) AS input_tokens, COALESCE(SUM(l.output_tokens),0) AS output_tokens, COALESCE(SUM(CASE WHEN l.input_tokens IS NULL OR l.output_tokens IS NULL THEN 1 ELSE 0 END),0) AS unknown_usage_count";
+        let mut summary_query =
+            QueryBuilder::<Sqlite>::new(format!("SELECT {metrics} FROM request_logs l"));
+        push_key_usage_filters(&mut summary_query, id, cutoff);
+        let summary = usage_summary_from_row(summary_query.build().fetch_one(&self.pool).await?);
+
+        let mut by_model_query = QueryBuilder::<Sqlite>::new(format!(
+            "SELECT l.alias,l.target,{metrics} FROM request_logs l"
+        ));
+        push_key_usage_filters(&mut by_model_query, id, cutoff);
+        by_model_query
+            .push(" GROUP BY l.alias,l.target ORDER BY request_count DESC,l.alias,l.target");
+        let by_model = by_model_query
+            .build()
+            .fetch_all(&self.pool)
+            .await?
+            .into_iter()
+            .map(|row| ModelUsage {
+                alias: row.get("alias"),
+                target: row.get("target"),
+                summary: usage_summary_from_row(row),
+            })
+            .collect();
+
+        let bucket_expression = if hourly {
+            "strftime('%Y-%m-%dT%H:00:00Z',l.created_at)"
+        } else {
+            "strftime('%Y-%m-%dT00:00:00Z',l.created_at)"
+        };
+        let mut bucket_query = QueryBuilder::<Sqlite>::new(format!(
+            "SELECT {bucket_expression} AS bucket_start,COUNT(*) AS request_count,COALESCE(SUM(l.input_tokens),0) AS input_tokens,COALESCE(SUM(l.output_tokens),0) AS output_tokens FROM request_logs l"
+        ));
+        push_key_usage_filters(&mut bucket_query, id, cutoff);
+        bucket_query.push(" GROUP BY bucket_start ORDER BY bucket_start");
+        let buckets = bucket_query
+            .build()
+            .fetch_all(&self.pool)
+            .await?
+            .into_iter()
+            .map(|row| {
+                Ok(UsageBucket {
+                    start: parse_timestamp(row.get("bucket_start"))?,
+                    request_count: row.get("request_count"),
+                    input_tokens: row.get("input_tokens"),
+                    output_tokens: row.get("output_tokens"),
+                })
+            })
+            .collect::<anyhow::Result<_>>()?;
+
+        Ok(KeyUsageData {
+            key,
+            summary,
+            buckets,
+            by_model,
+        })
+    }
+
     pub async fn clear_logs(&self) -> anyhow::Result<()> {
         sqlx::query("DELETE FROM request_logs")
             .execute(&self.pool)
@@ -1325,6 +1501,21 @@ fn push_usage_cutoff(builder: &mut QueryBuilder<'_, Sqlite>, cutoff: Option<Date
     if let Some(cutoff) = cutoff {
         builder
             .push(" WHERE l.created_at >= ")
+            .push_bind(cutoff.to_rfc3339());
+    }
+}
+
+fn push_key_usage_filters(
+    builder: &mut QueryBuilder<'_, Sqlite>,
+    api_key_id: &str,
+    cutoff: Option<DateTime<Utc>>,
+) {
+    builder
+        .push(" WHERE l.api_key_id = ")
+        .push_bind(api_key_id.to_owned());
+    if let Some(cutoff) = cutoff {
+        builder
+            .push(" AND l.created_at >= ")
             .push_bind(cutoff.to_rfc3339());
     }
 }
@@ -1491,6 +1682,7 @@ pub fn encode_kind(kind: &TargetKind) -> &'static str {
         TargetKind::Cloud => "cloud",
         TargetKind::Gguf => "gguf",
         TargetKind::Mlx => "mlx",
+        TargetKind::Alias => "alias",
     }
 }
 
@@ -1499,6 +1691,7 @@ pub fn decode_kind(value: &str) -> anyhow::Result<TargetKind> {
         "cloud" | "open_ai" | "open_router" => Ok(TargetKind::Cloud),
         "gguf" => Ok(TargetKind::Gguf),
         "mlx" => Ok(TargetKind::Mlx),
+        "alias" => Ok(TargetKind::Alias),
         _ => anyhow::bail!("unknown target kind: {value}"),
     }
 }
@@ -1900,6 +2093,137 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn key_usage_filters_by_key_and_groups_tokens_by_model() {
+        let store = Store::memory().await.unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 8, 17, 12, 0, 0).unwrap();
+        let key = LocalApiKey {
+            id: "client-one".into(),
+            name: "Client one".into(),
+            created_at: now,
+            last_used_at: None,
+            revoked_at: None,
+        };
+        store.insert_local_api_key(&key, &[7; 32]).await.unwrap();
+        store
+            .insert_local_api_key(
+                &LocalApiKey {
+                    id: "client-two".into(),
+                    name: "Client two".into(),
+                    created_at: now,
+                    last_used_at: None,
+                    revoked_at: None,
+                },
+                &[8; 32],
+            )
+            .await
+            .unwrap();
+
+        let log =
+            |id: &str, created_at, alias: &str, target: &str, input, output, api_key_id: &str| {
+                RequestLog {
+                    id: id.into(),
+                    created_at,
+                    endpoint: "/v1/chat/completions".into(),
+                    alias: Some(alias.into()),
+                    target: Some(target.into()),
+                    attempts: 1,
+                    status: 200,
+                    latency_ms: 10,
+                    input_tokens: Some(input),
+                    output_tokens: Some(output),
+                    error_code: None,
+                    api_key_id: Some(api_key_id.into()),
+                    api_key_name: None,
+                }
+            };
+        store
+            .insert_log(&log(
+                "chat",
+                now - chrono::Duration::minutes(10),
+                "assistant",
+                "coding",
+                32,
+                64,
+                "client-one",
+            ))
+            .await
+            .unwrap();
+        store
+            .insert_log(&log(
+                "embed",
+                now - chrono::Duration::minutes(5),
+                "embed",
+                "cloud",
+                8,
+                4,
+                "client-one",
+            ))
+            .await
+            .unwrap();
+        store
+            .insert_log(&log(
+                "other-key",
+                now - chrono::Duration::minutes(2),
+                "assistant",
+                "coding",
+                100,
+                200,
+                "client-two",
+            ))
+            .await
+            .unwrap();
+        store
+            .insert_log(&log(
+                "old",
+                now - chrono::Duration::hours(30),
+                "assistant",
+                "coding",
+                9,
+                9,
+                "client-one",
+            ))
+            .await
+            .unwrap();
+
+        let all = store
+            .usage_for_key_at("client-one", "all", now)
+            .await
+            .unwrap();
+        assert_eq!(all.key.id, "client-one");
+        assert_eq!(all.summary.request_count, 3);
+        assert_eq!(all.summary.input_tokens, 49);
+        assert_eq!(all.summary.output_tokens, 77);
+        assert_eq!(all.by_model.len(), 2);
+        let chat = all
+            .by_model
+            .iter()
+            .find(|item| {
+                item.alias.as_deref() == Some("assistant")
+                    && item.target.as_deref() == Some("coding")
+            })
+            .unwrap();
+        assert_eq!(chat.summary.request_count, 2);
+        assert_eq!(chat.summary.input_tokens, 41);
+        assert_eq!(chat.summary.output_tokens, 73);
+        let embed = all
+            .by_model
+            .iter()
+            .find(|item| item.alias.as_deref() == Some("embed"))
+            .unwrap();
+        assert_eq!(embed.summary.input_tokens, 8);
+        assert_eq!(embed.summary.output_tokens, 4);
+
+        let day = store
+            .usage_for_key_at("client-one", "24h", now)
+            .await
+            .unwrap();
+        assert_eq!(day.summary.request_count, 2);
+        assert_eq!(day.summary.input_tokens, 40);
+        assert_eq!(day.summary.output_tokens, 68);
+        assert_eq!(day.buckets.len(), 1);
+    }
+
+    #[tokio::test]
     async fn existing_cloud_gguf_and_mlx_targets_load_without_catalog_metadata() {
         let store = Store::memory().await.unwrap();
         for (id, kind) in [
@@ -2039,5 +2363,90 @@ mod tests {
                 .unwrap()
                 .circuit_open
         );
+    }
+
+    #[tokio::test]
+    async fn three_not_found_attempts_open_a_two_minute_circuit() {
+        let store = Store::memory().await.unwrap();
+        for index in 0..3 {
+            store
+                .insert_routing_attempt(&crate::routing::RoutingAttemptRecord {
+                    id: format!("missing-{index}"),
+                    request_id: "request".into(),
+                    created_at: Utc::now(),
+                    alias: "assistant".into(),
+                    task: "general".into(),
+                    task_source: "default".into(),
+                    target_id: "gone".into(),
+                    routing_mode: "adaptive".into(),
+                    status: 404,
+                    transient_failure: false,
+                    retry_after_until: None,
+                    latency_ms: 5,
+                    ttft_ms: None,
+                    streaming: false,
+                    input_tokens: None,
+                    output_tokens: None,
+                    estimated_cost_usd: None,
+                    cost_verified: false,
+                    score: None,
+                    reason: "default".into(),
+                })
+                .await
+                .unwrap();
+        }
+        let stats = store.routing_stats("gone", "general", false).await.unwrap();
+        assert!(stats.circuit_open);
+        assert!(!stats.half_open_required);
+    }
+
+    #[tokio::test]
+    async fn alias_hops_round_trip_without_a_model_target() {
+        let store = Store::memory().await.unwrap();
+        store
+            .upsert_target(&ModelTarget {
+                id: "cloud".into(),
+                provider_id: None,
+                name: "Cloud".into(),
+                kind: TargetKind::Cloud,
+                provider_model: "cloud".into(),
+                local_path: None,
+                runtime_url: None,
+                wire_protocol: WireProtocol::OpenAiChat,
+                capabilities: vec!["chat".into()],
+                enabled: true,
+                state: "ready".into(),
+                size_bytes: None,
+                local: LocalModelMeta::default(),
+            })
+            .await
+            .unwrap();
+        store
+            .upsert_route(&ModelRoute {
+                alias: "cheap".into(),
+                enabled: true,
+                capabilities: vec!["chat".into()],
+                targets: vec![
+                    RouteTarget {
+                        id: "cloud".into(),
+                        kind: TargetKind::Cloud,
+                        model: "cloud".into(),
+                        priority: 10,
+                        enabled: true,
+                    },
+                    RouteTarget {
+                        id: "adaptive-routing".into(),
+                        kind: TargetKind::Alias,
+                        model: "adaptive-routing".into(),
+                        priority: 20,
+                        enabled: true,
+                    },
+                ],
+            })
+            .await
+            .unwrap();
+        let loaded = store.route("cheap").await.unwrap().unwrap();
+        assert_eq!(loaded.targets[1].kind, TargetKind::Alias);
+        assert_eq!(loaded.targets[1].id, "adaptive-routing");
     }
 }

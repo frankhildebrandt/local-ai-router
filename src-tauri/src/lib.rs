@@ -78,6 +78,14 @@ pub fn run() {
                     let _ = handle.emit("install-job", event);
                 }
             });
+            let traffic = core.traffic.subscribe();
+            let traffic_handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                let mut events = traffic;
+                while let Ok(event) = events.recv().await {
+                    let _ = traffic_handle.emit("gateway-traffic", event);
+                }
+            });
             app.manage(AppServices {
                 core: core.clone(),
                 runtimes: runtimes.clone(),
@@ -230,6 +238,7 @@ pub fn run() {
             commands::import_routing_config,
             commands::list_logs,
             commands::get_usage,
+            commands::get_key_usage,
             commands::get_log_facets,
             commands::clear_logs,
             commands::export_logs_csv,

@@ -360,11 +360,8 @@ fn parse_discovered(value: &Value) -> Discovered {
         ),
         input_price_per_million: pricing_field(pricing, &["prompt", "input", "input_cost"])
             .or_else(|| first_f64(value, &["input_price_per_million", "input_price"])),
-        output_price_per_million: pricing_field(
-            pricing,
-            &["completion", "output", "output_cost"],
-        )
-        .or_else(|| first_f64(value, &["output_price_per_million", "output_price"])),
+        output_price_per_million: pricing_field(pricing, &["completion", "output", "output_cost"])
+            .or_else(|| first_f64(value, &["output_price_per_million", "output_price"])),
         ..Default::default()
     };
     push_unique(&mut discovered.capabilities, capabilities_from_api(value));
@@ -510,7 +507,10 @@ fn parse_decimal(text: &str) -> Option<f64> {
         }
         _ => trimmed,
     };
-    normalized.parse().ok().filter(|value: &f64| value.is_finite())
+    normalized
+        .parse()
+        .ok()
+        .filter(|value: &f64| value.is_finite())
 }
 
 fn string_list(value: Option<&Value>) -> Vec<String> {

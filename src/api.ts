@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { InstallJobEvent } from "./types";
+import type { InstallJobEvent, InFlightRequest } from "./types";
 
 export const isTauri = () => "__TAURI_INTERNALS__" in window;
 
@@ -12,6 +12,12 @@ export async function listenInstallJobs(handler: (event: InstallJobEvent) => voi
   if (!isTauri()) return () => undefined;
   const { listen } = await import("@tauri-apps/api/event");
   return listen<InstallJobEvent>("install-job", event => handler(event.payload));
+}
+
+export async function listenGatewayTraffic(handler: (inflight: InFlightRequest[]) => void): Promise<() => void> {
+  if (!isTauri()) return () => undefined;
+  const { listen } = await import("@tauri-apps/api/event");
+  return listen<InFlightRequest[]>("gateway-traffic", event => handler(event.payload));
 }
 
 export async function listenDesktopNavigate(handler: (page: string) => void): Promise<() => void> {

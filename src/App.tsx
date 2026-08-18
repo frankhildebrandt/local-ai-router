@@ -4,29 +4,32 @@ import { enable, disable, isEnabled } from "@tauri-apps/plugin-autostart";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import {
   Activity, BarChart3, BookOpen, Bot, Box, Check, ChevronRight, CircleAlert, Cloud, Copy, Database,
-  Download, Eye, EyeOff, FileDown, Gauge, KeyRound, Layers3, ListRestart, LoaderCircle, Menu,
-  Pencil, Plus, RefreshCw, Route, Search, Settings, ShieldCheck, Sparkles,
+  Download, Eye, FileDown, Gauge, KeyRound, Layers3, ListRestart, LoaderCircle, Menu,
+  Plus, RefreshCw, Route, Search, Settings, ShieldCheck, Sparkles, Timer,
   Trash2, X,
 } from "lucide-react";
-import { command, errorMessage, isTauri, listenDesktopNavigate } from "./api";
-import type { DashboardData, LocalApiKey, LocalApiKeyWithToken, LogFacets, LogQuery, LogResult, ModelMetadata, ModelRoute, ModelTarget, Provider, ProviderModel, ProviderPreset, PublicModel, RequestLog, ResourcePolicy, ResourceProfile, RoutingAttempt, RoutingConfigExport, RoutingEvaluation, RoutingPolicy, RoutingTaskDefinition, TargetRoutingProfile, UsageData, WireProtocol } from "./types";
+import { command, errorMessage, isTauri, listenDesktopNavigate, listenGatewayTraffic } from "./api";
+import type { DashboardData, InFlightRequest, LocalApiKey, LogFacets, LogQuery, LogResult, ModelMetadata, ModelRoute, ModelTarget, Provider, ProviderModel, ProviderPreset, PublicModel, RequestLog, ResourcePolicy, ResourceProfile, RoutingAttempt, RoutingConfigExport, RoutingEvaluation, RoutingPolicy, RoutingTaskDefinition, TargetKind, TargetRoutingProfile, UsageData, WireProtocol } from "./types";
+import { ApiKeysPage } from "./ApiKeysPage";
 import { LocalPage } from "./LocalPage";
 
-type Page = "overview" | "chat" | "usage" | "providers" | "cloud" | "local" | "routes" | "logs" | "settings";
+type Page = "overview" | "chat" | "keys" | "usage" | "providers" | "cloud" | "local" | "routes" | "logs" | "routing" | "settings";
 
 const nav: Array<{ page: Page; label: string; icon: typeof Activity }> = [
   { page: "overview", label: "Overview", icon: Gauge },
   { page: "chat", label: "Chat", icon: Bot },
+  { page: "keys", label: "API keys", icon: KeyRound },
   { page: "usage", label: "Usage", icon: BarChart3 },
   { page: "providers", label: "Providers", icon: KeyRound },
   { page: "cloud", label: "Cloud models", icon: Cloud },
   { page: "local", label: "Local models", icon: Box },
   { page: "routes", label: "Custom routes", icon: Route },
   { page: "logs", label: "Request logs", icon: Activity },
+  { page: "routing", label: "Routing", icon: Sparkles },
   { page: "settings", label: "Settings", icon: Settings },
 ];
 
-const emptyDashboard: DashboardData = { running: false, base_url: "http://127.0.0.1:11435/v1", provider_count: 0, target_count: 0, route_count: 0, recent_requests: 0, runtimes: [] };
+const emptyDashboard: DashboardData = { running: false, base_url: "http://127.0.0.1:11435/v1", provider_count: 0, target_count: 0, route_count: 0, recent_requests: 0, inflight: [], runtimes: [] };
 const defaultResourcePolicy: ResourcePolicy = { version: 1, profile: "stealth", memory_budget_percent: 50, memory_budget_mib: null, auto_load: true, idle_unload_minutes: 5, compute_duty_percent: 25, cpu_threads: Math.max(1, Math.floor((navigator.hardwareConcurrency || 4) / 2)), max_parallel_prompts: 1, process_priority: -1, gguf_gpu_layers: -1, disk_kv_enabled: true, disk_kv_max_bytes: 10 * 1024 ** 3 };
 const ChatPage = lazy(() => import("./ChatPage").then(module => ({ default: module.ChatPage })));
 
@@ -45,6 +48,7 @@ export default function App() {
   const [localKeys, setLocalKeys] = useState<LocalApiKey[]>([]);
   const [settings, setSettings] = useState<Record<string, string>>({});
   const [resourcePolicy, setResourcePolicy] = useState<ResourcePolicy>(defaultResourcePolicy);
+  const [inflight, setInflight] = useState<InFlightRequest[]>([]);
   const [notice, setNotice] = useState<{ type: "error" | "success"; text: string } | null>(null);
   const [loading, setLoading] = useState(true);
   const [sidebar, setSidebar] = useState(true);
@@ -59,11 +63,18 @@ export default function App() {
       ]);
       setDashboard(dash); setProviders(p); setProviderPresets(presets); setTargets(t); setRoutes(r); setPublicModels(models); setLogs(l.items); setSettings(s); setLocalKeys(k); setResourcePolicy(policy);
       setRoutingPolicies(routePolicies); setRoutingProfiles(targetProfiles); setRoutingTasks(tasks);
+      setInflight(dash.inflight ?? []);
     } catch (error) { setNotice({ type: "error", text: errorMessage(error) }); }
     finally { setLoading(false); }
   }, []);
 
-  useEffect(() => { void refresh(); const timer = window.setInterval(() => { if (page === "overview" || page === "usage" || page === "logs") void refresh(); }, 10_000); return () => clearInterval(timer); }, [refresh, page]);
+  useEffect(() => { void refresh(); const timer = window.setInterval(() => { if (page === "overview" || page === "keys" || page === "usage" || page === "logs" || page === "routing") void refresh(); }, 10_000); return () => clearInterval(timer); }, [refresh, page]);
+
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    void listenGatewayTraffic(next => setInflight(next)).then(fn => { unlisten = fn; }).catch(() => undefined);
+    return () => unlisten?.();
+  }, []);
 
   useEffect(() => {
     let unlisten: (() => void) | undefined;
@@ -91,14 +102,16 @@ export default function App() {
       <header className="topbar"><button className="icon-button" onClick={() => setSidebar(!sidebar)}><Menu size={19} /></button><div className="crumb" data-tauri-drag-region><span>Local AI Router</span><ChevronRight size={14} /><strong>{nav.find(item => item.page === page)?.label}</strong></div><button className="icon-button" onClick={() => void refresh()}><RefreshCw size={17} /></button></header>
       {notice && <div className={`toast ${notice.type}`}>{notice.type === "success" ? <Check size={17} /> : <CircleAlert size={17} />}<span>{notice.text}</span><button onClick={() => setNotice(null)}><X size={15} /></button></div>}
       <div className="content">
-        {loading ? <Loading /> : page === "overview" ? <Overview dashboard={dashboard} targets={targets} publicModels={publicModels} onNavigate={setPage} />
+        {loading ? <Loading /> : page === "overview" ? <Overview dashboard={dashboard} inflight={inflight} targets={targets} publicModels={publicModels} onNavigate={setPage} />
           : page === "chat" ? <Suspense fallback={<Loading />}><ChatPage publicModels={publicModels} /></Suspense>
+          : page === "keys" ? <ApiKeysPage localKeys={localKeys} refresh={refresh} success={success} fail={fail} />
           : page === "usage" ? <UsagePage />
           : page === "providers" ? <ProvidersPage {...common} />
           : page === "cloud" ? <CloudPage {...common} />
           : page === "local" ? <LocalPage {...common} />
-          : page === "routes" ? <RoutesPage {...common} />
+          : page === "routes" ? <RoutesPage {...common} publicModels={publicModels} />
           : page === "logs" ? <LogsPage {...common} />
+          : page === "routing" ? <RoutingLogsPage fail={fail} />
           : <SettingsPage {...common} dashboard={dashboard} />}
       </div>
     </main>
@@ -111,12 +124,12 @@ function PageHead({ eyebrow, title, description, action }: { eyebrow: string; ti
   return <div className="page-head"><div><span className="eyebrow">{eyebrow}</span><h1>{title}</h1><p>{description}</p></div>{action}</div>;
 }
 
-function Overview({ dashboard, targets, publicModels, onNavigate }: { dashboard: DashboardData; targets: ModelTarget[]; publicModels: PublicModel[]; onNavigate: (page: Page) => void }) {
+function Overview({ dashboard, inflight, targets, publicModels, onNavigate }: { dashboard: DashboardData; inflight: InFlightRequest[]; targets: ModelTarget[]; publicModels: PublicModel[]; onNavigate: (page: Page) => void }) {
   const local = targets.filter(target => target.kind === "gguf" || target.kind === "mlx");
   const exampleModel = publicModels.find(model => model.source === "adaptive")?.id
     ?? publicModels.find(model => model.capabilities.includes("chat"))?.id
     ?? "adaptive-routing";
-  const snippet = `from openai import OpenAI\n\nclient = OpenAI(\n    base_url="${dashboard.base_url}",\n    api_key="YOUR_LOCAL_KEY"\n)\n\nresponse = client.chat.completions.create(\n    model="${exampleModel}",\n    messages=[{"role": "user", "content": "Hello!"}]\n)`;
+  const snippet = `from openai import OpenAI\n\nclient = OpenAI(\n    base_url="${dashboard.base_url}",\n    api_key="YOUR_LOCAL_KEY"  # copy from API keys\n)\n\nresponse = client.chat.completions.create(\n    model="${exampleModel}",\n    messages=[{"role": "user", "content": "Hello!"}]\n)`;
   return <>
     <PageHead eyebrow="System" title="Your models, one local endpoint." description="Route cloud and on-device inference through a private OpenAI-compatible gateway." action={<button className="primary" onClick={() => onNavigate("cloud")}><Plus size={17} />Add model</button>} />
     <section className="status-hero"><div><div className="live-dot"><i />Live on localhost</div><h2>{dashboard.base_url}</h2><p>Bearer authentication required · prompts are never logged</p></div><CopyButton value={dashboard.base_url} label="Copy URL" /></section>
@@ -127,12 +140,23 @@ function Overview({ dashboard, targets, publicModels, onNavigate }: { dashboard:
       <Metric icon={<Activity />} value={dashboard.recent_requests} label="Recent requests" />
     </div>
     <div className="two-col">
-      <section className="panel"><div className="panel-title"><div><h3>Quickstart</h3><p>Works with the official OpenAI SDK.</p></div><CopyButton value={snippet} /></div><pre><code>{snippet}</code></pre></section>
+      <section className="panel"><div className="panel-title"><div><h3>Quickstart</h3><p>Works with the official OpenAI SDK. Copy a token from API keys.</p></div><div className="button-row"><button className="text-button" onClick={() => onNavigate("keys")}>Create a key <ChevronRight size={15} /></button><CopyButton value={snippet} /></div></div><pre><code>{snippet}</code></pre></section>
       <section className="panel"><div className="panel-title"><div><h3>Local runtimes</h3><p>{local.length} installed · {dashboard.runtimes.length} loaded</p></div><button className="text-button" onClick={() => onNavigate("local")}>Manage <ChevronRight size={15} /></button></div>
         <div className="stack-list">{local.length ? local.slice(0, 4).map(model => <ModelRow key={model.id} model={model} runtime={dashboard.runtimes.find(runtime => runtime.target_id === model.id)} compact />) : <Empty icon={<Box />} title="No local models" text="Import an MLX folder or GGUF file." />}</div>
       </section>
     </div>
+    <section className="panel">
+      <div className="panel-title"><div><h3>Active requests</h3><p>{inflight.length ? `${inflight.length} in flight` : "Live view of gateway traffic."}</p></div><button className="text-button" onClick={() => onNavigate("logs")}>Logs <ChevronRight size={15} /></button></div>
+      {inflight.length ? <div className="inflight-list">{inflight.map(request => <div className="inflight-row" key={request.id}><Timer size={15} /><div><strong>{request.alias}</strong><small>{request.target_name ?? request.target_id ?? "Selecting model"} · {request.phase}</small></div><code>{request.endpoint.replace("/v1/", "")}</code><Elapsed since={request.started_at} /></div>)}</div> : <Empty icon={<Timer />} title="No running requests" text="Authenticated inference shows the alias and selected model here." />}
+    </section>
   </>;
+}
+
+function Elapsed({ since }: { since: string }) {
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => { const timer = window.setInterval(() => setNow(Date.now()), 1000); return () => window.clearInterval(timer); }, []);
+  const ms = Math.max(0, now - new Date(since).getTime());
+  return <span>{ms < 1000 ? `${ms} ms` : `${(ms / 1000).toFixed(1)} s`}</span>;
 }
 
 const emptyUsage: UsageData = { request_count: 0, success_count: 0, average_latency_ms: 0, input_tokens: 0, output_tokens: 0, unknown_usage_count: 0, buckets: [], by_key: [] };
@@ -252,7 +276,7 @@ function CloudPage({ providers, targets, routingProfiles, refresh, success, fail
   </>;
 }
 
-function RoutesPage({ targets, routes, routingPolicies, routingProfiles, routingTasks, refresh, success, fail }: Common) {
+function RoutesPage({ targets, routes, publicModels, routingPolicies, routingProfiles, routingTasks, refresh, success, fail }: Common & { publicModels: PublicModel[] }) {
   const [editing, setEditing] = useState<ModelRoute | null | undefined>();
   const [policyRoute, setPolicyRoute] = useState<ModelRoute | null>(null);
   const [profileTarget, setProfileTarget] = useState<ModelTarget | null>(null);
@@ -270,10 +294,10 @@ function RoutesPage({ targets, routes, routingPolicies, routingProfiles, routing
       <article className="route-card builtin-route-card">
         <div className="route-main"><div className="route-icon"><Sparkles /></div><div><div className="row"><h3>adaptive-routing</h3><Badge tone="good">Built-in</Badge></div><p>Always-on ranking across every enabled model by task quality, price, and the inferred task.</p></div></div>
       </article>
-      {routes.map(route => { const policy = routingPolicies.find(item => item.alias === route.alias); const enabled = adaptiveEnabled(policy); return <article className="route-card adaptive-route-card" key={route.alias}><div className="route-main"><div className="route-icon"><Route /></div><div><div className="row"><h3>{route.alias}</h3>{enabled && <Badge tone={policy?.status === "active" ? "good" : "warn"}>{policy?.status === "active" ? "Adaptive" : "Shadow"}</Badge>}</div><CapabilityList items={route.capabilities} /></div></div><div className="route-flow">{[...route.targets].sort((a,b) => a.priority-b.priority).map((item, index) => <div key={item.id} className="route-target"><span>{index ? `Fallback ${index}` : "Primary"}</span><strong>{targets.find(target => target.id === item.id)?.name ?? item.model}</strong></div>)}</div><div className="alias-adaptive"><span>Adaptive</span><Toggle label={`Adaptive routing for ${route.alias}`} checked={enabled} onChange={() => void enableAdaptive(route, policy, !enabled)} /><button className="secondary compact" onClick={() => setPolicyRoute(route)}><Gauge size={15} />Configure</button></div><button className="icon-button" onClick={() => setEditing(route)}><Settings size={17} /></button><button className="icon-button danger" onClick={() => void remove(route.alias)}><Trash2 size={17} /></button></article>; })}
+      {routes.map(route => { const policy = routingPolicies.find(item => item.alias === route.alias); const enabled = adaptiveEnabled(policy); return <article className="route-card adaptive-route-card" key={route.alias}><div className="route-main"><div className="route-icon"><Route /></div><div><div className="row"><h3>{route.alias}</h3>{enabled && <Badge tone={policy?.status === "active" ? "good" : "warn"}>{policy?.status === "active" ? "Adaptive" : "Shadow"}</Badge>}</div><CapabilityList items={route.capabilities} /></div></div><div className="route-flow">{[...route.targets].sort((a,b) => a.priority-b.priority).map((item, index) => <div key={`${item.id}-${index}`} className="route-target"><span>{index ? `Fallback ${index}` : "Primary"}</span><strong>{item.kind === "alias" ? item.id : (targets.find(target => target.id === item.id)?.name ?? item.model)}</strong></div>)}</div><div className="alias-adaptive"><span>Adaptive</span><Toggle label={`Adaptive routing for ${route.alias}`} checked={enabled} onChange={() => void enableAdaptive(route, policy, !enabled)} /><button className="secondary compact" onClick={() => setPolicyRoute(route)}><Gauge size={15} />Configure</button></div><button className="icon-button" onClick={() => setEditing(route)}><Settings size={17} /></button><button className="icon-button danger" onClick={() => void remove(route.alias)}><Trash2 size={17} /></button></article>; })}
     </div>
     {!routes.length && <Empty icon={<Route />} title="No custom routes yet" text="Create a named stack only when you need a custom fallback order." />}
-    {editing !== undefined && <RouteModal route={editing} targets={targets} close={() => setEditing(undefined)} done={async () => { setEditing(undefined); await refresh(); success("Custom route saved"); }} fail={fail} />}
+    {editing !== undefined && <RouteModal route={editing} targets={targets} publicModels={publicModels} close={() => setEditing(undefined)} done={async () => { setEditing(undefined); await refresh(); success("Custom route saved"); }} fail={fail} />}
     {policyRoute && <RoutingPolicyModal route={policyRoute} policy={routingPolicies.find(item => item.alias === policyRoute.alias) ?? null} tasks={routingTasks} targets={targets} profiles={routingProfiles} onEditProfile={setProfileTarget} onTasksChanged={refresh} close={() => setPolicyRoute(null)} done={async () => { setPolicyRoute(null); await refresh(); success("Routing policy saved"); }} fail={fail} />}
     {profileTarget && <TargetProfileModal target={profileTarget} profile={routingProfiles.find(item => item.target_id === profileTarget.id) ?? null} tasks={routingTasks} close={() => setProfileTarget(null)} done={async () => { setProfileTarget(null); await refresh(); success("Target routing profile saved"); }} fail={fail} />}
     {showConfig && <RoutingConfigModal close={() => setShowConfig(false)} refresh={refresh} success={success} fail={fail} />}
@@ -355,16 +379,19 @@ function RoutingConfigModal({ close, refresh, success, fail }: { close: () => vo
   return <Modal title="Routing policy JSON" close={close}><div className="form"><textarea className="config-json" aria-label="Routing configuration JSON" value={json} onChange={event => setJson(event.target.value)} />{preview.map(item => <small className="config-warning" key={item}>{item}</small>)}<div className="security-note"><ShieldCheck size={17} /><span>Exports exclude credentials, request history, prompts and responses. Preview validates every reference before changes are applied.</span></div><div className="modal-actions"><button className="secondary" onClick={close}>Cancel</button><button className="secondary" disabled={busy} onClick={() => void run(false)}>Validate preview</button><button className="primary" disabled={busy} onClick={() => void run(true)}>Apply import</button></div></div></Modal>;
 }
 
-function RouteModal({ route, targets, close, done, fail }: { route: ModelRoute | null; targets: ModelTarget[]; close: () => void; done: () => Promise<void>; fail: (e: unknown) => void }) {
-  const [alias, setAlias] = useState(route?.alias ?? ""); const [selected, setSelected] = useState<string[]>(route?.targets.sort((a,b) => a.priority-b.priority).map(item => item.id) ?? [targets[0]?.id].filter(Boolean)); const [busy, setBusy] = useState(false);
-  const availableCapabilities = useMemo(() => selected.map(id => targets.find(target => target.id === id)?.capabilities ?? []).reduce((common, capabilities, index) => index ? common.filter(item => capabilities.includes(item)) : capabilities, [] as string[]), [selected, targets]);
-  const submit = async (event: FormEvent) => { event.preventDefault(); setBusy(true); try { await command("save_route", { route: { alias, enabled: true, capabilities: availableCapabilities, targets: selected.map((id, index) => { const target = targets.find(item => item.id === id)!; return { id, kind: target.kind, model: target.provider_model, priority: (index + 1) * 10, enabled: true }; }) } }); await done(); } catch (e) { fail(e); } finally { setBusy(false); } };
-  return <Modal title={route ? "Edit custom route" : "Create custom route"} close={close}><form className="form" onSubmit={submit}><Field label="Public model name"><input value={alias} onChange={e => setAlias(e.target.value.replace(/\s+/g, "-"))} placeholder="my-assistant" required disabled={!!route} /></Field><Field label="Targets in fallback order"><div className="target-picker">{selected.map((id, index) => <div className="picker-row" key={`${id}-${index}`}><span>{index ? `Fallback ${index}` : "Primary"}</span><select value={id} onChange={e => setSelected(selected.map((item, itemIndex) => itemIndex === index ? e.target.value : item))}>{targets.map(target => <option value={target.id} key={target.id}>{target.name} · {target.kind}</option>)}</select>{selected.length > 1 && <button type="button" className="icon-button" onClick={() => setSelected(selected.filter((_, itemIndex) => itemIndex !== index))}><X size={15} /></button>}</div>)}<button type="button" className="text-button" onClick={() => setSelected([...selected, targets[0].id])}><Plus size={15} />Add fallback</button></div></Field><div><span className="field-label">Shared capabilities</span><CapabilityList items={availableCapabilities} /></div><div className="security-note"><ListRestart size={17} /><span>Fallbacks run only for network errors, timeouts, 429 and 5xx responses—never after streaming has started.</span></div><ModalActions close={close} busy={busy} label="Save route" /></form></Modal>;
+function RouteModal({ route, targets, publicModels, close, done, fail }: { route: ModelRoute | null; targets: ModelTarget[]; publicModels: PublicModel[]; close: () => void; done: () => Promise<void>; fail: (e: unknown) => void }) {
+  const hopOptions = useMemo(() => [
+    ...targets.map(target => ({ value: target.id, label: `${target.name} · ${target.kind}`, kind: target.kind as TargetKind, model: target.provider_model, capabilities: target.capabilities })),
+    ...publicModels.filter(model => (model.source === "alias" || model.source === "adaptive") && model.id !== (route?.alias ?? "")).map(model => ({ value: model.id, label: `${model.id} · alias`, kind: "alias" as TargetKind, model: model.id, capabilities: model.capabilities })),
+  ], [targets, publicModels, route?.alias]);
+  const [alias, setAlias] = useState(route?.alias ?? ""); const [selected, setSelected] = useState<string[]>(route?.targets.sort((a,b) => a.priority-b.priority).map(item => item.id) ?? [hopOptions[0]?.value].filter(Boolean)); const [busy, setBusy] = useState(false);
+  const availableCapabilities = useMemo(() => selected.map(id => hopOptions.find(hop => hop.value === id)?.capabilities ?? []).reduce((common, capabilities, index) => index ? common.filter(item => capabilities.includes(item)) : capabilities, [] as string[]), [selected, hopOptions]);
+  const submit = async (event: FormEvent) => { event.preventDefault(); setBusy(true); try { await command("save_route", { route: { alias, enabled: true, capabilities: availableCapabilities, targets: selected.map((id, index) => { const hop = hopOptions.find(item => item.value === id); return { id, kind: hop?.kind ?? "cloud", model: hop?.model ?? id, priority: (index + 1) * 10, enabled: true }; }) } }); await done(); } catch (e) { fail(e); } finally { setBusy(false); } };
+  return <Modal title={route ? "Edit custom route" : "Create custom route"} close={close}><form className="form" onSubmit={submit}><Field label="Public model name"><input value={alias} onChange={e => setAlias(e.target.value.replace(/\s+/g, "-"))} placeholder="my-assistant" required disabled={!!route} /></Field><Field label="Targets in fallback order"><div className="target-picker">{selected.map((id, index) => <div className="picker-row" key={`${id}-${index}`}><span>{index ? `Fallback ${index}` : "Primary"}</span><select value={id} onChange={e => setSelected(selected.map((item, itemIndex) => itemIndex === index ? e.target.value : item))}>{hopOptions.map(hop => <option value={hop.value} key={hop.value}>{hop.label}</option>)}</select>{selected.length > 1 && <button type="button" className="icon-button" onClick={() => setSelected(selected.filter((_, itemIndex) => itemIndex !== index))}><X size={15} /></button>}</div>)}<button type="button" className="text-button" disabled={!hopOptions.length} onClick={() => setSelected([...selected, hopOptions[0].value])}><Plus size={15} />Add fallback</button></div></Field><div><span className="field-label">Shared capabilities</span><CapabilityList items={availableCapabilities} /></div><div className="security-note"><ListRestart size={17} /><span>Fallbacks run for network errors, timeouts, 404, 429 and 5xx before the first response chunk—never after streaming has started. Slow models can be skipped for 45 seconds.</span></div><ModalActions close={close} busy={busy} label="Save route" /></form></Modal>;
 }
 
 function LogsPage({ localKeys, refresh, success, fail }: Common) {
   const [items, setItems] = useState<RequestLog[]>([]); const [total, setTotal] = useState(0); const [page, setPage] = useState(0); const [reload, setReload] = useState(0);
-  const [routingAttempts, setRoutingAttempts] = useState<RoutingAttempt[]>([]);
   const [facets, setFacets] = useState<LogFacets>({ aliases: [], targets: [], endpoints: [] });
   const [text, setText] = useState(""); const [keyFilter, setKeyFilter] = useState(""); const [alias, setAlias] = useState(""); const [target, setTarget] = useState(""); const [endpoint, setEndpoint] = useState(""); const [status, setStatus] = useState(""); const [from, setFrom] = useState(""); const [to, setTo] = useState("");
   const logQuery = (withPage = true): LogQuery => ({
@@ -373,8 +400,14 @@ function LogsPage({ localKeys, refresh, success, fail }: Common) {
     from: from ? new Date(from).toISOString() : null, to: to ? new Date(to).toISOString() : null,
     ...(withPage ? { limit: 50, offset: page * 50 } : {}),
   });
+  useEffect(() => {
+    if (!isTauri()) return;
+    let unlisten: (() => void) | undefined;
+    void listenGatewayTraffic(() => setReload(value => value + 1)).then(fn => { unlisten = fn; }).catch(() => undefined);
+    const timer = window.setInterval(() => setReload(value => value + 1), 2000);
+    return () => { unlisten?.(); window.clearInterval(timer); };
+  }, []);
   useEffect(() => { if (!isTauri()) return; void command<LogFacets>("get_log_facets").then(setFacets).catch(fail); }, [reload]);
-  useEffect(() => { if (!isTauri()) return; void command<RoutingAttempt[]>("list_routing_attempts", { requestId: null, limit: 50 }).then(setRoutingAttempts).catch(fail); }, [reload]);
   useEffect(() => { if (!isTauri()) return; const timer = window.setTimeout(() => { void command<LogResult>("list_logs", { query: logQuery() }).then(result => { setItems(result.items); setTotal(result.total); }).catch(fail); }, 180); return () => clearTimeout(timer); }, [text, keyFilter, alias, target, endpoint, status, from, to, page, reload]);
   const updateFilter = (setter: (value: string) => void, value: string) => { setter(value); setPage(0); };
   const reset = () => { setText(""); setKeyFilter(""); setAlias(""); setTarget(""); setEndpoint(""); setStatus(""); setFrom(""); setTo(""); setPage(0); };
@@ -389,14 +422,40 @@ function LogsPage({ localKeys, refresh, success, fail }: Common) {
       <select aria-label="Status" value={status} onChange={e => updateFilter(setStatus, e.target.value)}><option value="">All statuses</option><option value="success">Success</option><option value="4xx">4xx</option><option value="5xx">5xx</option></select>
       <label className="date-filter"><span>From</span><input type="datetime-local" value={from} onChange={e => updateFilter(setFrom, e.target.value)} /></label><label className="date-filter"><span>To</span><input type="datetime-local" value={to} onChange={e => updateFilter(setTo, e.target.value)} /></label><button className="secondary" onClick={reset}><X size={15} />Reset</button>
     </div></section>
-    {!!routingAttempts.length && <section className="panel routing-log-panel"><div className="panel-title"><div><h3>Adaptive routing</h3><p>Optional extra. Decision metadata only; request and response content is never stored.</p></div></div><div className="routing-attempt-list">{routingAttempts.slice(0, 12).map(attempt => <div className="routing-attempt" key={attempt.id}><span>{new Date(attempt.created_at).toLocaleTimeString()}</span><strong>{attempt.alias} · {attempt.task}</strong><span>{attempt.routing_mode} → {attempt.target_id}</span><span>{attempt.score ? `${(attempt.score.total * 100).toFixed(1)} score` : "fixed order"}</span><span>{attempt.cost_verified ? `$${attempt.estimated_cost_usd?.toFixed(5)}` : "cost unknown"}</span><Badge tone={attempt.status < 400 ? "good" : "warn"}>{attempt.status}</Badge><small className="routing-reason">{attempt.reason}</small></div>)}</div></section>}
     <div className="result-meta"><span>{total} matching request{total === 1 ? "" : "s"}</span><span>Page {page + 1} of {Math.max(1, Math.ceil(total / 50))}</span></div>
     <div className="log-table"><div className="log-head"><span>Time</span><span>API key</span><span>Endpoint</span><span>Route</span><span>Status</span><span>Latency</span><span>Tokens</span><span>Attempts</span></div>{items.map(log => <div className="log-row" key={log.id}><span>{new Date(log.created_at).toLocaleString()}</span><strong>{log.api_key_name ?? "Unknown / Legacy"}</strong><code>{log.endpoint.replace("/v1/", "")}</code><span><strong>{log.alias ?? "—"}</strong><small>{log.target ?? "No target"}</small></span><Badge tone={statusTone(log.status)}>{log.status}</Badge><span>{log.latency_ms} ms</span><span>{log.input_tokens == null || log.output_tokens == null ? "—" : formatNumber(log.input_tokens + log.output_tokens)}</span><span>{log.attempts}</span></div>)}</div>{!items.length && <Empty icon={<Activity />} title="No matching requests" text="Adjust the filters or make an authenticated request." />}
     {total > 50 && <div className="pagination"><button className="secondary" disabled={page === 0} onClick={() => setPage(page - 1)}>Previous</button><button className="secondary" disabled={(page + 1) * 50 >= total} onClick={() => setPage(page + 1)}>Next</button></div>}
   </>;
 }
 
-function SettingsPage({ settings, resourcePolicy, dashboard, localKeys, refresh, success, fail }: Common & { dashboard: DashboardData }) {
+function RoutingLogsPage({ fail }: { fail: (error: unknown) => void }) {
+  const [items, setItems] = useState<RoutingAttempt[]>([]);
+  const [alias, setAlias] = useState("");
+  const [reload, setReload] = useState(0);
+  useEffect(() => {
+    if (!isTauri()) return;
+    let unlisten: (() => void) | undefined;
+    void listenGatewayTraffic(() => setReload(value => value + 1)).then(fn => { unlisten = fn; }).catch(() => undefined);
+    const timer = window.setInterval(() => setReload(value => value + 1), 2000);
+    return () => { unlisten?.(); window.clearInterval(timer); };
+  }, []);
+  useEffect(() => {
+    if (!isTauri()) return;
+    void command<RoutingAttempt[]>("list_routing_attempts", { requestId: null, limit: 200 }).then(setItems).catch(fail);
+  }, [reload]);
+  const aliases = [...new Set(items.map(item => item.alias))];
+  const visible = items.filter(item => !alias || item.alias === alias);
+  return <><PageHead eyebrow="Observability" title="Routing" description="Decision metadata for adaptive ranking, fallbacks, rate limits and slow-model avoidance. Prompt and response content is never stored." />
+    <section className="panel log-filters"><div className="filter-grid"><select aria-label="Alias" value={alias} onChange={e => setAlias(e.target.value)}><option value="">All aliases</option>{aliases.map(value => <option key={value}>{value}</option>)}</select></div></section>
+    <div className="result-meta"><span>{visible.length} attempt{visible.length === 1 ? "" : "s"}</span></div>
+    <div className="log-table routing-table"><div className="log-head routing-head"><span>Time</span><span>Alias / task</span><span>Target</span><span>Mode</span><span>Status</span><span>Latency</span><span>Score</span><span>Reason</span></div>
+      {visible.map(attempt => <div className="log-row routing-row" key={attempt.id}><span>{new Date(attempt.created_at).toLocaleString()}</span><span><strong>{attempt.alias}</strong><small>{attempt.task} · {attempt.task_source}</small></span><span><strong>{attempt.target_id}</strong><small>{attempt.retry_after_until ? `limited until ${new Date(attempt.retry_after_until).toLocaleTimeString()}` : attempt.transient_failure ? "fallback" : "served"}</small></span><code>{attempt.routing_mode}</code><Badge tone={attempt.status < 400 ? "good" : attempt.status === 404 || attempt.status === 429 ? "warn" : "bad"}>{attempt.status}</Badge><span>{attempt.ttft_ms != null ? `${attempt.ttft_ms} ms TTFT` : `${attempt.latency_ms} ms`}</span><span>{attempt.score ? (attempt.score.total * 100).toFixed(1) : "—"}</span><small className="routing-reason">{attempt.reason}</small></div>)}
+    </div>
+    {!visible.length && <Empty icon={<Sparkles />} title="No routing attempts" text="Call adaptive-routing or a custom alias to record ranking and fallback decisions." />}
+  </>;
+}
+
+function SettingsPage({ settings, resourcePolicy, dashboard, refresh, success, fail }: Common & { dashboard: DashboardData }) {
   const [autostart, setAutostart] = useState(false); const [hf, setHf] = useState(""); const [civitai, setCivitai] = useState(""); const [policy, setPolicy] = useState(resourcePolicy);
   useEffect(() => { if (isTauri()) { void isEnabled().then(setAutostart).catch(() => {}); } }, []);
   useEffect(() => setPolicy(resourcePolicy), [resourcePolicy]);
@@ -408,7 +467,7 @@ function SettingsPage({ settings, resourcePolicy, dashboard, localKeys, refresh,
   const memoryWarning = dashboard.runtimes.some(runtime => runtime.memory_warning);
   return <><PageHead eyebrow="Application" title="Settings" description="Security, resources and background behavior." />
     {memoryWarning && <div className="security-note"><CircleAlert size={17} /><span>Resident local runtimes currently exceed the soft memory budget. Active responses are allowed to finish.</span></div>}
-    <div className="settings-list"><Setting title="Local endpoint" description="The gateway is bound to 127.0.0.1 and is not reachable from your network."><code>{dashboard.base_url}</code></Setting><section className="setting api-key-setting"><div><h3>Local API keys</h3><p>Named client keys are stored in macOS Keychain and can be attributed in usage and logs.</p></div><ApiKeysSetting keys={localKeys} refresh={refresh} success={success} fail={fail} /></section><Setting title="Launch at login" description="Keep the menu bar gateway available after signing in."><Toggle checked={autostart} onChange={() => void toggleAutostart()} /></Setting>
+    <div className="settings-list"><Setting title="Local endpoint" description="The gateway is bound to 127.0.0.1 and is not reachable from your network."><code>{dashboard.base_url}</code></Setting><Setting title="Launch at login" description="Keep the menu bar gateway available after signing in."><Toggle checked={autostart} onChange={() => void toggleAutostart()} /></Setting>
       <Setting title="Inference profile" description="Stealth caps runnable inference time to 25%; this is not an exact Metal GPU utilization quota."><select aria-label="Inference profile" value={policy.profile} onChange={event => void chooseProfile(event.target.value as ResourceProfile)}><option value="stealth">Stealth</option><option value="balanced">Balanced</option><option value="performance">Performance</option><option value="custom">Custom</option></select></Setting>
       <Setting title="Soft memory budget" description="Blocks new model admission and unloads idle models; an active response is never killed."><div className="resource-controls"><ResourceNumber label="Percent" value={policy.memory_budget_percent} min={10} max={95} suffix="%" onChange={value => updatePolicy({ memory_budget_percent: value })} onSave={() => void savePolicy(policy)} /><ResourceNumber label="Absolute cap" value={policy.memory_budget_mib ?? 0} min={0} max={1048576} suffix="MiB (0 = off)" onChange={value => updatePolicy({ memory_budget_mib: value || null })} onSave={() => void savePolicy(policy)} /></div></Setting>
       <Setting title="Compute duty cycle" description="Sidecars may run for this share of each 400 ms window. Short GPU bursts can exceed this percentage."><ResourceNumber label="Duty" value={policy.compute_duty_percent} min={5} max={100} suffix="%" onChange={value => updatePolicy({ compute_duty_percent: value })} onSave={() => void savePolicy(policy)} /></Setting>
@@ -420,16 +479,6 @@ function SettingsPage({ settings, resourcePolicy, dashboard, localKeys, refresh,
       <Setting title="Hugging Face token" description="Optional for gated and private model repositories."><div className="inline-form"><input type="password" value={hf} onChange={e => setHf(e.target.value)} placeholder={settings.has_hf_token === "true" ? "Token stored in Keychain" : "hf_…"} /><button className="secondary" onClick={async () => { try { await command("save_hugging_face_token", { token: hf }); setHf(""); await refresh(); success("Hugging Face token saved"); } catch (e) { fail(e); } }}>Save</button></div></Setting>
       <Setting title="CivitAI token" description="Optional for CivitAI checkpoint downloads."><div className="inline-form"><input type="password" value={civitai} onChange={e => setCivitai(e.target.value)} placeholder={settings.has_civitai_token === "true" ? "Token stored in Keychain" : "API token"} /><button className="secondary" onClick={async () => { try { await command("save_civitai_token", { token: civitai }); setCivitai(""); await refresh(); success("CivitAI token saved"); } catch (e) { fail(e); } }}>Save</button></div></Setting></div>
   </>;
-}
-
-function ApiKeysSetting({ keys, refresh, success, fail }: { keys: LocalApiKey[] } & Pick<Common, "refresh" | "success" | "fail">) {
-  const [name, setName] = useState(""); const [tokens, setTokens] = useState<Record<string, string>>({}); const [busy, setBusy] = useState(false);
-  const create = async () => { if (!name.trim()) return; setBusy(true); try { const result = await command<LocalApiKeyWithToken>("create_local_api_key", { name }); setTokens(current => ({ ...current, [result.id]: result.token })); setName(""); await refresh(); success("Local API key created"); } catch (e) { fail(e); } finally { setBusy(false); } };
-  const reveal = async (key: LocalApiKey) => { if (tokens[key.id]) { setTokens(current => { const next = { ...current }; delete next[key.id]; return next; }); return; } try { const token = await command<string>("reveal_local_api_key", { id: key.id }); setTokens(current => ({ ...current, [key.id]: token })); } catch (e) { fail(e); } };
-  const rename = async (key: LocalApiKey) => { const next = prompt("API key name", key.name)?.trim(); if (!next || next === key.name) return; try { await command("rename_local_api_key", { id: key.id, name: next }); await refresh(); success("API key renamed"); } catch (e) { fail(e); } };
-  const rotate = async (key: LocalApiKey) => { if (!confirm(`Rotate “${key.name}”? The current token will stop working immediately.`)) return; try { const token = await command<string>("rotate_local_api_key", { id: key.id }); setTokens(current => ({ ...current, [key.id]: token })); await refresh(); success("API key rotated"); } catch (e) { fail(e); } };
-  const revoke = async (key: LocalApiKey) => { if (!confirm(`Revoke “${key.name}”? This cannot be undone.`)) return; try { await command("revoke_local_api_key", { id: key.id }); setTokens(current => { const next = { ...current }; delete next[key.id]; return next; }); await refresh(); success("API key revoked"); } catch (e) { fail(e); } };
-  return <div className="api-key-manager"><div className="inline-form"><input value={name} onChange={event => setName(event.target.value)} placeholder="New key name" maxLength={80} /><button className="primary" disabled={!name.trim() || busy} onClick={() => void create()}><Plus size={16} />Create key</button></div><div className="api-key-list">{keys.map(key => <article className={`api-key-row ${key.revoked_at ? "revoked" : ""}`} key={key.id}><div className="api-key-title"><div><strong>{key.name}</strong><Badge tone={key.revoked_at ? "neutral" : "good"}>{key.revoked_at ? "Revoked" : "Active"}</Badge></div><small>Created {new Date(key.created_at).toLocaleDateString()} · {key.last_used_at ? `Last used ${new Date(key.last_used_at).toLocaleString()}` : "Never used"}</small></div>{!key.revoked_at && <><div className="secret"><code>{tokens[key.id] ?? "••••••••••••••••••••••••"}</code><button className="icon-button" title={tokens[key.id] ? "Hide" : "Reveal"} onClick={() => void reveal(key)}>{tokens[key.id] ? <EyeOff size={15} /> : <Eye size={15} />}</button>{tokens[key.id] && <CopyButton value={tokens[key.id]} />}</div><div className="api-key-actions"><button className="icon-button" title="Rename" onClick={() => void rename(key)}><Pencil size={15} /></button><button className="secondary" onClick={() => void rotate(key)}><RefreshCw size={15} />Rotate</button><button className="icon-button danger" title="Revoke" onClick={() => void revoke(key)}><Trash2 size={15} /></button></div></>}</article>)}</div></div>;
 }
 
 function ModelRow({ model, runtime, compact }: { model: ModelTarget; runtime?: DashboardData["runtimes"][number]; compact?: boolean }) { return <div className="model-row"><div className="model-icon small"><Box size={17} /></div><div className="grow"><strong>{model.name}</strong><span>{runtime ? `${runtime.profile} · ${runtime.compute_duty_percent}% duty · ${formatBytes(runtime.resident_bytes)} RSS · ${runtime.active} active / ${runtime.queued} queued${runtime.pending_restart ? " · restart pending" : ""}` : `${model.kind.toUpperCase()} ${model.size_bytes ? `· ${formatBytes(model.size_bytes)}` : ""}`}</span></div><Badge tone={runtime?.memory_warning ? "warn" : model.state === "ready" ? "good" : "neutral"}>{runtime?.memory_warning ? "Over budget" : compact && model.state === "stopped" ? "Installed" : model.state}</Badge></div>; }

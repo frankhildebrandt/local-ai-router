@@ -304,6 +304,7 @@ pub struct RoutingEvaluation {
     pub shadow_target_id: Option<String>,
     pub half_open_target_ids: Vec<String>,
     pub estimated_input_tokens: u64,
+    pub peer_latency_ms: Option<u64>,
 }
 
 pub struct RouteEvaluationInput<'a> {
@@ -336,12 +337,20 @@ pub async fn evaluate_route(
             .and_then(|request| request.max_tokens)
             .unwrap_or(4_096),
     };
+    let mut scoped_route = route.clone();
+    if !policy.candidate_target_ids.is_empty() {
+        scoped_route
+            .targets
+            .retain(|hop| policy.candidate_target_ids.contains(&hop.id));
+    }
+    let expanded =
+        crate::public_models::expand_route_targets(store, &scoped_route, &mut Default::default())
+            .await?;
     let mut candidates = Vec::new();
     let mut half_open_target_ids = Vec::new();
-    for route_target in route.ordered_targets() {
-        if !policy.candidate_target_ids.is_empty()
-            && !policy.candidate_target_ids.contains(&route_target.id)
-        {
+    let mut seen = std::collections::HashSet::new();
+    for route_target in &expanded {
+        if !seen.insert(route_target.id.clone()) {
             continue;
         }
         let Some(target) = store.target(&route_target.id).await? else {
@@ -367,16 +376,43 @@ pub async fn evaluate_route(
             stats,
         });
     }
+    let recent_by_target: std::collections::HashMap<_, _> = candidates
+        .iter()
+        .map(|candidate| {
+            (
+                candidate.target_id.clone(),
+                candidate.stats.recent_latency_ms,
+            )
+        })
+        .collect();
     let decision = rank_candidates(policy, &selected.task, &request, candidates);
+    let peer_latency_ms = crate::domain::median_u64(
+        &decision
+            .ranked
+            .iter()
+            .filter_map(|candidate| {
+                recent_by_target
+                    .get(&candidate.target_id)
+                    .copied()
+                    .flatten()
+            })
+            .collect::<Vec<_>>(),
+    );
+    let blocked: std::collections::HashSet<_> = decision
+        .excluded
+        .iter()
+        .filter(|candidate| candidate.reason == "circuit_open" || candidate.reason == "slow")
+        .map(|candidate| candidate.target_id.clone())
+        .collect();
     let adaptive_order = decision
         .ranked
         .iter()
         .map(|candidate| candidate.target_id.clone())
         .collect::<Vec<_>>();
-    let fixed_order = route
-        .ordered_targets()
+    let fixed_order = expanded
         .into_iter()
-        .map(|target| target.id.clone())
+        .filter(|target| !blocked.contains(&target.id))
+        .map(|target| target.id)
         .collect::<Vec<_>>();
     let (mode, ordered_target_ids, shadow_target_id) = match (policy.mode, policy.status) {
         (RoutingMode::Adaptive, PolicyStatus::Active) => ("adaptive", adaptive_order, None),
@@ -395,6 +431,7 @@ pub async fn evaluate_route(
         shadow_target_id,
         half_open_target_ids,
         estimated_input_tokens: signals.estimated_input_tokens,
+        peer_latency_ms,
     })
 }
 
@@ -492,6 +529,7 @@ pub struct TaskSelection {
 pub struct RoutingStats {
     pub samples: usize,
     pub p90_latency_ms: u64,
+    pub recent_latency_ms: Option<u64>,
     pub reliability: f64,
     pub circuit_open: bool,
     pub half_open_required: bool,
@@ -502,6 +540,7 @@ impl Default for RoutingStats {
         Self {
             samples: 0,
             p90_latency_ms: 0,
+            recent_latency_ms: None,
             reliability: 0.95,
             circuit_open: false,
             half_open_required: false,
@@ -564,9 +603,9 @@ pub fn rank_candidates(
     request: &RoutingRequest,
     candidates: Vec<CandidateInput>,
 ) -> RoutingDecision {
-    let mut ranked = Vec::new();
-    let mut excluded = Vec::new();
     let weights = normalized_weights(&policy.weights);
+    let mut pending = Vec::new();
+    let mut excluded = Vec::new();
     for candidate in candidates {
         let exclude = if !candidate.enabled {
             Some("disabled")
@@ -595,6 +634,34 @@ pub fn rank_candidates(
             excluded.push(ExcludedCandidate {
                 target_id: candidate.target_id,
                 reason: reason.into(),
+            });
+            continue;
+        }
+        pending.push(candidate);
+    }
+    let peer_median = crate::domain::median_u64(
+        &pending
+            .iter()
+            .filter_map(|candidate| candidate.stats.recent_latency_ms)
+            .collect::<Vec<_>>(),
+    );
+    let peer_count = pending
+        .iter()
+        .filter(|candidate| candidate.stats.recent_latency_ms.is_some())
+        .count();
+    let mut ranked = Vec::new();
+    for candidate in pending {
+        if peer_count >= 2
+            && peer_median.is_some_and(|median| {
+                candidate
+                    .stats
+                    .recent_latency_ms
+                    .is_some_and(|latency| crate::domain::is_slow_outlier(latency, median))
+            })
+        {
+            excluded.push(ExcludedCandidate {
+                target_id: candidate.target_id,
+                reason: "slow".into(),
             });
             continue;
         }
@@ -1026,5 +1093,57 @@ mod tests {
         assert_eq!(profile.input_price_per_million, Some(2.50));
         assert_eq!(profile.output_price_per_million, Some(10.00));
         assert!(profile.task_quality.get("coding").copied().unwrap() > 50.0);
+    }
+
+    #[test]
+    fn ranking_excludes_targets_with_huge_recent_latency_gaps() {
+        let policy = RoutingPolicy {
+            status: PolicyStatus::Active,
+            privacy: PrivacyMode::CloudAllowed,
+            ..RoutingPolicy::new("assistant")
+        };
+        let request = RoutingRequest {
+            required_capabilities: vec!["chat".into()],
+            estimated_input_tokens: 10,
+            max_output_tokens: 10,
+        };
+        let candidate = |id: &str, recent: Option<u64>| {
+            let mut stats = RoutingStats::default();
+            stats.recent_latency_ms = recent;
+            stats.samples = if recent.is_some() { 3 } else { 0 };
+            CandidateInput {
+                target_id: id.into(),
+                kind: TargetKind::Cloud,
+                priority: 10,
+                enabled: true,
+                capabilities: vec!["chat".into()],
+                profile: TargetRoutingProfile::neutral(id, TargetKind::Cloud),
+                stats,
+            }
+        };
+
+        let decision = rank_candidates(
+            &policy,
+            "general",
+            &request,
+            vec![
+                candidate("fast-a", Some(1_000)),
+                candidate("fast-b", Some(1_200)),
+                candidate("slow", Some(30_000)),
+            ],
+        );
+
+        assert!(decision
+            .excluded
+            .iter()
+            .any(|item| item.target_id == "slow" && item.reason == "slow"));
+        assert_eq!(
+            decision
+                .ranked
+                .iter()
+                .map(|item| item.target_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["fast-a", "fast-b"]
+        );
     }
 }
