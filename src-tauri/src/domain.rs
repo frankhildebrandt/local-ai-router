@@ -122,7 +122,7 @@ pub fn is_transient_status(status: u16) -> bool {
 }
 
 pub fn is_fallback_status(status: u16) -> bool {
-    status == 404 || is_transient_status(status)
+    status >= 400
 }
 
 pub fn is_slow_outlier(latency_ms: u64, peer_median_ms: u64) -> bool {
@@ -222,12 +222,16 @@ mod tests {
     }
 
     #[test]
-    fn fallbacks_include_not_found_rate_limits_and_server_errors() {
+    fn fallbacks_include_client_and_server_errors() {
+        assert!(is_fallback_status(400));
+        assert!(is_fallback_status(401));
+        assert!(is_fallback_status(403));
         assert!(is_fallback_status(404));
         assert!(is_fallback_status(429));
+        assert!(is_fallback_status(500));
         assert!(is_fallback_status(503));
-        assert!(!is_fallback_status(400));
-        assert!(!is_fallback_status(401));
+        assert!(!is_fallback_status(200));
+        assert!(!is_fallback_status(399));
     }
 
     #[test]

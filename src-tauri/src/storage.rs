@@ -124,6 +124,7 @@ pub struct RequestLog {
     pub input_tokens: Option<i64>,
     pub output_tokens: Option<i64>,
     pub error_code: Option<String>,
+    pub error_message: Option<String>,
     pub api_key_id: Option<String>,
     pub api_key_name: Option<String>,
 }
@@ -249,7 +250,7 @@ impl Store {
             "CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
             "CREATE TABLE IF NOT EXISTS provider_models (provider_id TEXT NOT NULL, model_id TEXT NOT NULL, synced_at TEXT NOT NULL, wire_protocol TEXT NOT NULL DEFAULT 'open_ai_chat', capabilities TEXT NOT NULL DEFAULT '[\"chat\",\"streaming\"]', metadata TEXT NOT NULL DEFAULT '{}', PRIMARY KEY(provider_id, model_id), FOREIGN KEY(provider_id) REFERENCES providers(id) ON DELETE CASCADE)",
             "CREATE TABLE IF NOT EXISTS local_api_keys (id TEXT PRIMARY KEY, name TEXT NOT NULL, token_hash BLOB NOT NULL, created_at TEXT NOT NULL, last_used_at TEXT, revoked_at TEXT)",
-            "CREATE TABLE IF NOT EXISTS request_logs (id TEXT PRIMARY KEY, created_at TEXT NOT NULL, endpoint TEXT NOT NULL, alias TEXT, target TEXT, attempts INTEGER NOT NULL, status INTEGER NOT NULL, latency_ms INTEGER NOT NULL, input_tokens INTEGER, output_tokens INTEGER, error_code TEXT)",
+            "CREATE TABLE IF NOT EXISTS request_logs (id TEXT PRIMARY KEY, created_at TEXT NOT NULL, endpoint TEXT NOT NULL, alias TEXT, target TEXT, attempts INTEGER NOT NULL, status INTEGER NOT NULL, latency_ms INTEGER NOT NULL, input_tokens INTEGER, output_tokens INTEGER, error_code TEXT, error_message TEXT)",
             "CREATE INDEX IF NOT EXISTS request_logs_created_idx ON request_logs(created_at DESC)",
             "CREATE INDEX IF NOT EXISTS local_api_keys_active_idx ON local_api_keys(revoked_at)",
             "CREATE TABLE IF NOT EXISTS routing_policies (alias TEXT PRIMARY KEY, policy TEXT NOT NULL, FOREIGN KEY(alias) REFERENCES routes(alias) ON DELETE CASCADE)",
@@ -344,6 +345,14 @@ impl Store {
             .any(|column| column.get::<String, _>("name") == "api_key_id")
         {
             sqlx::query("ALTER TABLE request_logs ADD COLUMN api_key_id TEXT")
+                .execute(&self.pool)
+                .await?;
+        }
+        if !log_columns
+            .iter()
+            .any(|column| column.get::<String, _>("name") == "error_message")
+        {
+            sqlx::query("ALTER TABLE request_logs ADD COLUMN error_message TEXT")
                 .execute(&self.pool)
                 .await?;
         }
@@ -1155,9 +1164,9 @@ impl Store {
     }
 
     pub async fn insert_log(&self, log: &RequestLog) -> anyhow::Result<()> {
-        sqlx::query("INSERT INTO request_logs(id,created_at,endpoint,alias,target,attempts,status,latency_ms,input_tokens,output_tokens,error_code,api_key_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)")
+        sqlx::query("INSERT INTO request_logs(id,created_at,endpoint,alias,target,attempts,status,latency_ms,input_tokens,output_tokens,error_code,error_message,api_key_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)")
             .bind(&log.id).bind(log.created_at.to_rfc3339()).bind(&log.endpoint).bind(&log.alias).bind(&log.target)
-            .bind(log.attempts).bind(log.status).bind(log.latency_ms).bind(log.input_tokens).bind(log.output_tokens).bind(&log.error_code).bind(&log.api_key_id)
+            .bind(log.attempts).bind(log.status).bind(log.latency_ms).bind(log.input_tokens).bind(log.output_tokens).bind(&log.error_code).bind(&log.error_message).bind(&log.api_key_id)
             .execute(&self.pool).await?;
         Ok(())
     }
@@ -1514,7 +1523,7 @@ fn push_log_filters(builder: &mut QueryBuilder<'_, Sqlite>, query: &LogQuery) {
         .filter(|value| !value.is_empty())
     {
         builder
-            .push(" AND lower(l.endpoint || ' ' || coalesce(l.alias,'') || ' ' || coalesce(l.target,'') || ' ' || l.status || ' ' || coalesce(l.error_code,'') || ' ' || coalesce(k.name,'')) LIKE ")
+            .push(" AND lower(l.endpoint || ' ' || coalesce(l.alias,'') || ' ' || coalesce(l.target,'') || ' ' || l.status || ' ' || coalesce(l.error_code,'') || ' ' || coalesce(l.error_message,'') || ' ' || coalesce(k.name,'')) LIKE ")
             .push_bind(format!("%{}%", search.to_lowercase()));
     }
 }
@@ -1584,6 +1593,7 @@ fn row_to_request_log(row: sqlx::sqlite::SqliteRow) -> anyhow::Result<RequestLog
         input_tokens: row.get("input_tokens"),
         output_tokens: row.get("output_tokens"),
         error_code: row.get("error_code"),
+        error_message: row.get("error_message"),
         api_key_name: Some(stored_name.unwrap_or_else(|| {
             if api_key_id.is_none() {
                 "Unknown / Legacy".into()
@@ -2028,6 +2038,7 @@ mod tests {
                 input_tokens: Some(2),
                 output_tokens: Some(3),
                 error_code: None,
+                error_message: None,
                 api_key_id: None,
                 api_key_name: None,
             })
@@ -2069,6 +2080,7 @@ mod tests {
                 input_tokens: None,
                 output_tokens: None,
                 error_code: None,
+                error_message: None,
                 api_key_id: None,
                 api_key_name: None,
             })
@@ -2101,6 +2113,7 @@ mod tests {
                 input_tokens: Some(12),
                 output_tokens: Some(4),
                 error_code: Some("upstream".into()),
+                error_message: Some("provider failed".into()),
                 api_key_id: Some("client-one".into()),
                 api_key_name: None,
             })
@@ -2166,6 +2179,7 @@ mod tests {
                     input_tokens: Some(2),
                     output_tokens: Some(3),
                     error_code: None,
+                    error_message: None,
                     api_key_id: None,
                     api_key_name: None,
                 })
@@ -2221,6 +2235,7 @@ mod tests {
                     input_tokens: Some(input),
                     output_tokens: Some(output),
                     error_code: None,
+                    error_message: None,
                     api_key_id: Some(api_key_id.into()),
                     api_key_name: None,
                 }

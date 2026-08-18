@@ -78,12 +78,20 @@ pub fn run() {
                     let _ = handle.emit("install-job", event);
                 }
             });
-            let traffic = core.traffic.subscribe();
+            let traffic_hub = core.traffic.clone();
             let traffic_handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
-                let mut events = traffic;
-                while let Ok(event) = events.recv().await {
-                    let _ = traffic_handle.emit("gateway-traffic", event);
+                let mut events = traffic_hub.subscribe();
+                loop {
+                    match events.recv().await {
+                        Ok(event) => {
+                            let _ = traffic_handle.emit("gateway-traffic", event);
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                            let _ = traffic_handle.emit("gateway-traffic", traffic_hub.snapshot());
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    }
                 }
             });
             app.manage(AppServices {
@@ -187,6 +195,8 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             commands::dashboard,
+            commands::cancel_inflight_request,
+            commands::cancel_all_inflight_requests,
             commands::list_local_api_keys,
             commands::create_local_api_key,
             commands::reveal_local_api_key,

@@ -153,6 +153,21 @@ pub async fn dashboard(state: State<'_, AppServices>) -> Result<Dashboard, Strin
 }
 
 #[tauri::command]
+pub async fn cancel_inflight_request(
+    state: State<'_, AppServices>,
+    id: String,
+) -> Result<(), String> {
+    state.core.traffic.cancel(&id);
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn cancel_all_inflight_requests(state: State<'_, AppServices>) -> Result<(), String> {
+    state.core.traffic.cancel_all();
+    Ok(())
+}
+
+#[tauri::command]
 pub async fn list_local_api_keys(
     state: State<'_, AppServices>,
 ) -> Result<Vec<LocalApiKey>, String> {
@@ -1514,7 +1529,7 @@ async fn logs_csv(store: &Store, mut query: LogQuery) -> anyhow::Result<String> 
         }
         query.offset = Some(logs.len() as i64);
     }
-    let mut csv = String::from("id,created_at,api_key_id,api_key_name,endpoint,alias,target,attempts,status,latency_ms,input_tokens,output_tokens,error_code\n");
+    let mut csv = String::from("id,created_at,api_key_id,api_key_name,endpoint,alias,target,attempts,status,latency_ms,input_tokens,output_tokens,error_code,error_message\n");
     for log in logs {
         let values = [
             log.id,
@@ -1531,6 +1546,7 @@ async fn logs_csv(store: &Store, mut query: LogQuery) -> anyhow::Result<String> 
             log.input_tokens.map(|v| v.to_string()).unwrap_or_default(),
             log.output_tokens.map(|v| v.to_string()).unwrap_or_default(),
             log.error_code.unwrap_or_default(),
+            log.error_message.unwrap_or_default(),
         ];
         csv.push_str(
             &values
@@ -1779,6 +1795,7 @@ mod tests {
                     input_tokens: Some(1),
                     output_tokens: Some(1),
                     error_code: None,
+                    error_message: None,
                     api_key_id: None,
                     api_key_name: None,
                 })
@@ -1798,6 +1815,7 @@ mod tests {
                 input_tokens: None,
                 output_tokens: None,
                 error_code: None,
+                error_message: None,
                 api_key_id: None,
                 api_key_name: None,
             })

@@ -28,7 +28,7 @@ beforeEach(() => {
     if (name === "export_routing_config") return Promise.resolve({ schema: "local-ai-router/routing-policy/v1", tasks: [], profiles: [], policies: [] });
     if (name === "list_provider_presets") return Promise.resolve([]);
     if (name === "list_local_api_keys") return Promise.resolve([{ id: "default", name: "Default", created_at: "2026-08-17T10:00:00Z", last_used_at: null, revoked_at: null }]);
-    if (name === "list_logs") return Promise.resolve({ total: 1, items: [{ id: "request", created_at: "2026-08-17T10:00:00Z", endpoint: "/v1/chat/completions", alias: "assistant", target: "cloud", attempts: 1, status: 200, latency_ms: 12, input_tokens: 3, output_tokens: 5, error_code: null, api_key_id: "default", api_key_name: "Default" }] });
+    if (name === "list_logs") return Promise.resolve({ total: 1, items: [{ id: "request", created_at: "2026-08-17T10:00:00Z", endpoint: "/v1/chat/completions", alias: "assistant", target: "cloud", attempts: 1, status: 200, latency_ms: 12, input_tokens: 3, output_tokens: 5, error_code: null, error_message: null, api_key_id: "default", api_key_name: "Default" }] });
     if (name === "get_settings") return Promise.resolve({});
     if (name === "get_resource_policy") return Promise.resolve({ version: 1, profile: "stealth", memory_budget_percent: 50, memory_budget_mib: null, auto_load: true, idle_unload_minutes: 5, compute_duty_percent: 25, cpu_threads: 4, max_parallel_prompts: 1, process_priority: -1, gguf_gpu_layers: -1, disk_kv_enabled: true, disk_kv_max_bytes: 10 * 1024 ** 3 });
     if (name === "get_resource_profile_preset") return Promise.resolve({ version: 1, profile: "balanced", memory_budget_percent: 70, memory_budget_mib: null, auto_load: true, idle_unload_minutes: 15, compute_duty_percent: 60, cpu_threads: 8, max_parallel_prompts: 2, process_priority: 0, gguf_gpu_layers: -1, disk_kv_enabled: false, disk_kv_max_bytes: 10 * 1024 ** 3 });
@@ -91,6 +91,52 @@ describe("Local AI Router shell", () => {
     expect(screen.getByRole("heading", { name: "Active requests" })).toBeInTheDocument();
     expect(screen.getByText("No running requests")).toBeInTheDocument();
     expect(command).toHaveBeenCalledWith("list_logs", { query: { legacy_only: false, limit: 100 } });
+  });
+
+  it("lets the user stop in-flight requests from overview", async () => {
+    const previous = command.getMockImplementation();
+    command.mockImplementation((name: string, args?: unknown) => {
+      if (name === "dashboard") {
+        return Promise.resolve({
+          running: true,
+          base_url: "http://127.0.0.1:11435/v1",
+          provider_count: 0,
+          target_count: 0,
+          route_count: 0,
+          recent_requests: 1,
+          inflight: [
+            {
+              id: "req-1",
+              started_at: "2026-08-18T10:00:00Z",
+              endpoint: "/v1/chat/completions",
+              alias: "assistant",
+              target_id: "cloud",
+              target_name: "Coding model",
+              phase: "streaming",
+            },
+            {
+              id: "req-2",
+              started_at: "2026-08-18T10:00:01Z",
+              endpoint: "/v1/responses",
+              alias: "coder",
+              target_id: "local",
+              target_name: "Local model",
+              phase: "trying",
+            },
+          ],
+          runtimes: [],
+        });
+      }
+      return previous?.(name, args);
+    });
+    render(<App />);
+    expect(await screen.findByText("assistant")).toBeInTheDocument();
+    expect(screen.getByText("coder")).toBeInTheDocument();
+    expect(screen.getByText("2 in flight")).toBeInTheDocument();
+    fireEvent.click(screen.getAllByRole("button", { name: "Stop request" })[0]);
+    await waitFor(() => expect(command).toHaveBeenCalledWith("cancel_inflight_request", { id: "req-1" }));
+    fireEvent.click(screen.getByRole("button", { name: "Stop all" }));
+    await waitFor(() => expect(command).toHaveBeenCalledWith("cancel_all_inflight_requests"));
   });
 
   it("keeps window chrome draggable without capturing toolbar buttons", async () => {

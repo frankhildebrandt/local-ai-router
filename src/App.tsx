@@ -86,6 +86,8 @@ export default function App() {
 
   const success = (text: string) => { setNotice({ type: "success", text }); window.setTimeout(() => setNotice(null), 3500); };
   const fail = (error: unknown) => setNotice({ type: "error", text: errorMessage(error) });
+  const stopRequest = (id: string) => { void command("cancel_inflight_request", { id }).then(() => setInflight(current => current.filter(item => item.id !== id))).catch(fail); };
+  const stopAll = () => { void command("cancel_all_inflight_requests").then(() => setInflight([])).catch(fail); };
   const common = { providers, providerPresets, targets, routes, routingPolicies, routingProfiles, routingTasks, logs, localKeys, settings, resourcePolicy, refresh, success, fail };
 
   return <div className="shell">
@@ -102,7 +104,7 @@ export default function App() {
       <header className="topbar"><button className="icon-button" onClick={() => setSidebar(!sidebar)}><Menu size={19} /></button><div className="crumb" data-tauri-drag-region><span>Local AI Router</span><ChevronRight size={14} /><strong>{nav.find(item => item.page === page)?.label}</strong></div><button className="icon-button" onClick={() => void refresh()}><RefreshCw size={17} /></button></header>
       {notice && <div className={`toast ${notice.type}`}>{notice.type === "success" ? <Check size={17} /> : <CircleAlert size={17} />}<span>{notice.text}</span><button onClick={() => setNotice(null)}><X size={15} /></button></div>}
       <div className="content">
-        {loading ? <Loading /> : page === "overview" ? <Overview dashboard={dashboard} inflight={inflight} targets={targets} publicModels={publicModels} onNavigate={setPage} />
+        {loading ? <Loading /> : page === "overview" ? <Overview dashboard={dashboard} inflight={inflight} targets={targets} publicModels={publicModels} onNavigate={setPage} onStop={stopRequest} onStopAll={stopAll} />
           : page === "chat" ? <Suspense fallback={<Loading />}><ChatPage publicModels={publicModels} /></Suspense>
           : page === "keys" ? <ApiKeysPage localKeys={localKeys} refresh={refresh} success={success} fail={fail} />
           : page === "usage" ? <UsagePage />
@@ -124,7 +126,7 @@ function PageHead({ eyebrow, title, description, action }: { eyebrow: string; ti
   return <div className="page-head"><div><span className="eyebrow">{eyebrow}</span><h1>{title}</h1><p>{description}</p></div>{action}</div>;
 }
 
-function Overview({ dashboard, inflight, targets, publicModels, onNavigate }: { dashboard: DashboardData; inflight: InFlightRequest[]; targets: ModelTarget[]; publicModels: PublicModel[]; onNavigate: (page: Page) => void }) {
+function Overview({ dashboard, inflight, targets, publicModels, onNavigate, onStop, onStopAll }: { dashboard: DashboardData; inflight: InFlightRequest[]; targets: ModelTarget[]; publicModels: PublicModel[]; onNavigate: (page: Page) => void; onStop: (id: string) => void; onStopAll: () => void }) {
   const local = targets.filter(target => target.kind === "gguf" || target.kind === "mlx");
   const exampleModel = publicModels.find(model => model.source === "adaptive")?.id
     ?? publicModels.find(model => model.capabilities.includes("chat"))?.id
@@ -146,8 +148,8 @@ function Overview({ dashboard, inflight, targets, publicModels, onNavigate }: { 
       </section>
     </div>
     <section className="panel">
-      <div className="panel-title"><div><h3>Active requests</h3><p>{inflight.length ? `${inflight.length} in flight` : "Live view of gateway traffic."}</p></div><button className="text-button" onClick={() => onNavigate("logs")}>Logs <ChevronRight size={15} /></button></div>
-      {inflight.length ? <div className="inflight-list">{inflight.map(request => <div className="inflight-row" key={request.id}><Timer size={15} /><div><strong>{request.alias}</strong><small>{request.target_name ?? request.target_id ?? "Selecting model"} · {request.phase}</small></div><code>{request.endpoint.replace("/v1/", "")}</code><Elapsed since={request.started_at} /></div>)}</div> : <Empty icon={<Timer />} title="No running requests" text="Authenticated inference shows the alias and selected model here." />}
+      <div className="panel-title"><div><h3>Active requests</h3><p>{inflight.length ? `${inflight.length} in flight` : "Live view of gateway traffic."}</p></div><div className="button-row">{inflight.length > 0 && <button className="text-button" onClick={onStopAll}>Stop all</button>}<button className="text-button" onClick={() => onNavigate("logs")}>Logs <ChevronRight size={15} /></button></div></div>
+      {inflight.length ? <div className="inflight-list">{inflight.map(request => <div className="inflight-row" key={request.id}><Timer size={15} /><div><strong>{request.alias}</strong><small>{request.target_name ?? request.target_id ?? "Selecting model"} · {request.phase}</small></div><code>{request.endpoint.replace("/v1/", "")}</code><Elapsed since={request.started_at} /><button type="button" className="icon-button" aria-label="Stop request" onClick={() => onStop(request.id)}><X size={15} /></button></div>)}</div> : <Empty icon={<Timer />} title="No running requests" text="Authenticated inference shows the alias and selected model here." />}
     </section>
   </>;
 }
@@ -494,7 +496,7 @@ function LogsPage({ localKeys, refresh, success, fail }: Common) {
       <label className="date-filter"><span>From</span><input type="datetime-local" value={from} onChange={e => updateFilter(setFrom, e.target.value)} /></label><label className="date-filter"><span>To</span><input type="datetime-local" value={to} onChange={e => updateFilter(setTo, e.target.value)} /></label><button className="secondary" onClick={reset}><X size={15} />Reset</button>
     </div></section>
     <div className="result-meta"><span>{total} matching request{total === 1 ? "" : "s"}</span><span>Page {page + 1} of {Math.max(1, Math.ceil(total / 50))}</span></div>
-    <div className="log-table"><div className="log-head"><span>Time</span><span>API key</span><span>Endpoint</span><span>Route</span><span>Status</span><span>Latency</span><span>Tokens</span><span>Attempts</span></div>{items.map(log => <div className="log-row" key={log.id}><span>{new Date(log.created_at).toLocaleString()}</span><strong>{log.api_key_name ?? "Unknown / Legacy"}</strong><code>{log.endpoint.replace("/v1/", "")}</code><span><strong>{log.alias ?? "—"}</strong><small>{log.target ?? "No target"}</small></span><Badge tone={statusTone(log.status)}>{log.status}</Badge><span>{log.latency_ms} ms</span><span>{log.input_tokens == null || log.output_tokens == null ? "—" : formatNumber(log.input_tokens + log.output_tokens)}</span><span>{log.attempts}</span></div>)}</div>{!items.length && <Empty icon={<Activity />} title="No matching requests" text="Adjust the filters or make an authenticated request." />}
+    <div className="log-table"><div className="log-head"><span>Time</span><span>API key</span><span>Endpoint</span><span>Route</span><span>Status</span><span>Latency</span><span>Tokens</span><span>Attempts</span></div>{items.map(log => <div className="log-row" key={log.id}><span>{new Date(log.created_at).toLocaleString()}</span><strong>{log.api_key_name ?? "Unknown / Legacy"}</strong><code>{log.endpoint.replace("/v1/", "")}</code><span><strong>{log.alias ?? "—"}</strong><small>{log.target ?? "No target"}</small></span><span><Badge tone={statusTone(log.status)}>{log.status}</Badge>{(log.error_code || log.error_message) && <small>{[log.error_code, log.error_message].filter(Boolean).join(" · ")}</small>}</span><span>{log.latency_ms} ms</span><span>{log.input_tokens == null || log.output_tokens == null ? "—" : formatNumber(log.input_tokens + log.output_tokens)}</span><span>{log.attempts}</span></div>)}</div>{!items.length && <Empty icon={<Activity />} title="No matching requests" text="Adjust the filters or make an authenticated request." />}
     {total > 50 && <div className="pagination"><button className="secondary" disabled={page === 0} onClick={() => setPage(page - 1)}>Previous</button><button className="secondary" disabled={(page + 1) * 50 >= total} onClick={() => setPage(page + 1)}>Next</button></div>}
   </>;
 }

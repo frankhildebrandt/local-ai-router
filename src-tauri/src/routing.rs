@@ -304,6 +304,8 @@ pub struct RoutingEvaluation {
     pub mode: String,
     pub task: String,
     pub task_source: String,
+    #[serde(default)]
+    pub task_rule_id: Option<String>,
     pub decision: RoutingDecision,
     pub ordered_target_ids: Vec<String>,
     pub shadow_target_id: Option<String>,
@@ -456,6 +458,7 @@ pub async fn evaluate_route(
         mode: mode.into(),
         task: selected.task,
         task_source: selected.source.into(),
+        task_rule_id: selected.rule_id,
         decision,
         ordered_target_ids,
         shadow_target_id,
@@ -553,6 +556,7 @@ pub struct TaskSignals {
 pub struct TaskSelection {
     pub task: String,
     pub source: &'static str,
+    pub rule_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -869,6 +873,7 @@ pub fn determine_task(
         return Ok(TaskSelection {
             task: task.to_owned(),
             source: "header",
+            rule_id: None,
         });
     }
     let mut rules = policy.rules.iter().collect::<Vec<_>>();
@@ -878,12 +883,14 @@ pub fn determine_task(
             return Ok(TaskSelection {
                 task: rule.task.clone(),
                 source: "rule",
+                rule_id: Some(rule.id.clone()),
             });
         }
     }
     Ok(TaskSelection {
         task: policy.default_task.clone(),
         source: "default",
+        rule_id: None,
     })
 }
 
@@ -982,7 +989,8 @@ mod tests {
             selected,
             TaskSelection {
                 task: "coding".into(),
-                source: "header"
+                source: "header",
+                rule_id: None,
             }
         );
     }
@@ -1061,12 +1069,10 @@ mod tests {
             .iter()
             .map(|value| (*value).to_owned())
             .collect::<Vec<_>>();
-        assert_eq!(
-            determine_task(&policy, None, &known, &signals)
-                .unwrap()
-                .task,
-            "tool_use"
-        );
+        let selected = determine_task(&policy, None, &known, &signals).unwrap();
+        assert_eq!(selected.task, "tool_use");
+        assert_eq!(selected.source, "rule");
+        assert_eq!(selected.rule_id.as_deref(), Some("builtin-tools"));
     }
 
     #[test]

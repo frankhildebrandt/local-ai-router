@@ -179,6 +179,7 @@ export interface RoutingEvaluation {
   mode: "fixed" | "shadow" | "adaptive";
   task: string;
   task_source: "header" | "rule" | "default";
+  task_rule_id?: string | null;
   decision: {
     task: string;
     ranked: Array<{ target_id: string; score: ScoreComponents; estimated_cost_usd: number | null; cost_verified: boolean }>;
@@ -218,6 +219,7 @@ export interface RequestLog {
   input_tokens: number | null;
   output_tokens: number | null;
   error_code: string | null;
+  error_message: string | null;
   api_key_id: string | null;
   api_key_name: string | null;
 }

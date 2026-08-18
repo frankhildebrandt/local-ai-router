@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 use tokio::sync::{broadcast, OwnedSemaphorePermit, Semaphore};
+use tokio_util::sync::CancellationToken;
 
 use crate::{
     oauth::OAuthManager,
@@ -45,9 +46,14 @@ pub struct InFlightRequest {
     pub phase: String,
 }
 
+struct LiveRequest {
+    info: InFlightRequest,
+    cancel: CancellationToken,
+}
+
 #[derive(Clone)]
 pub struct TrafficHub {
-    inflight: Arc<parking_lot::Mutex<HashMap<String, InFlightRequest>>>,
+    inflight: Arc<parking_lot::Mutex<HashMap<String, LiveRequest>>>,
     tx: broadcast::Sender<Vec<InFlightRequest>>,
 }
 
@@ -71,14 +77,27 @@ impl TrafficHub {
     }
 
     pub fn snapshot(&self) -> Vec<InFlightRequest> {
-        let mut items: Vec<_> = self.inflight.lock().values().cloned().collect();
+        let mut items: Vec<_> = self
+            .inflight
+            .lock()
+            .values()
+            .map(|live| live.info.clone())
+            .collect();
         items.sort_by(|left, right| left.started_at.cmp(&right.started_at));
         items
     }
 
-    pub fn start(&self, request: InFlightRequest) {
-        self.inflight.lock().insert(request.id.clone(), request);
+    pub fn start(&self, request: InFlightRequest) -> CancellationToken {
+        let cancel = CancellationToken::new();
+        self.inflight.lock().insert(
+            request.id.clone(),
+            LiveRequest {
+                info: request,
+                cancel: cancel.clone(),
+            },
+        );
         self.publish();
+        cancel
     }
 
     pub fn update(
@@ -89,10 +108,10 @@ impl TrafficHub {
         phase: &str,
     ) {
         let mut inflight = self.inflight.lock();
-        if let Some(request) = inflight.get_mut(id) {
-            request.target_id = Some(target_id.into());
-            request.target_name = Some(target_name.into());
-            request.phase = phase.into();
+        if let Some(live) = inflight.get_mut(id) {
+            live.info.target_id = Some(target_id.into());
+            live.info.target_name = Some(target_name.into());
+            live.info.phase = phase.into();
         }
         drop(inflight);
         self.publish();
@@ -100,6 +119,25 @@ impl TrafficHub {
 
     pub fn finish(&self, id: &str) {
         self.inflight.lock().remove(id);
+        self.publish();
+    }
+
+    pub fn cancel(&self, id: &str) -> bool {
+        let Some(live) = self.inflight.lock().remove(id) else {
+            return false;
+        };
+        live.cancel.cancel();
+        self.publish();
+        true
+    }
+
+    pub fn cancel_all(&self) {
+        let mut inflight = self.inflight.lock();
+        for live in inflight.values() {
+            live.cancel.cancel();
+        }
+        inflight.clear();
+        drop(inflight);
         self.publish();
     }
 
@@ -111,42 +149,28 @@ impl TrafficHub {
 pub struct InFlightGuard {
     hub: TrafficHub,
     id: String,
-    handed_off: bool,
+    cancel: CancellationToken,
 }
 
 impl InFlightGuard {
     pub fn new(hub: TrafficHub, request: InFlightRequest) -> Self {
         let id = request.id.clone();
-        hub.start(request);
-        Self {
-            hub,
-            id,
-            handed_off: false,
-        }
+        let cancel = hub.start(request);
+        Self { hub, id, cancel }
     }
 
     pub fn update(&self, target_id: &str, target_name: &str, phase: &str) {
         self.hub.update(&self.id, target_id, target_name, phase);
     }
 
-    pub fn hand_off(&mut self) {
-        self.handed_off = true;
-    }
-
-    pub fn hub(&self) -> TrafficHub {
-        self.hub.clone()
-    }
-
-    pub fn id(&self) -> &str {
-        &self.id
+    pub fn cancellation(&self) -> CancellationToken {
+        self.cancel.clone()
     }
 }
 
 impl Drop for InFlightGuard {
     fn drop(&mut self) {
-        if !self.handed_off {
-            self.hub.finish(&self.id);
-        }
+        self.hub.finish(&self.id);
     }
 }
 
@@ -709,6 +733,93 @@ mod tests {
         assert_eq!(hub.snapshot()[0].target_id.as_deref(), Some("primary"));
         assert_eq!(hub.snapshot()[0].phase, "streaming");
         drop(guard);
+        assert!(hub.snapshot().is_empty());
+    }
+
+    #[test]
+    fn inflight_cancel_signals_token_and_clears_snapshot() {
+        let hub = TrafficHub::new();
+        let guard = InFlightGuard::new(
+            hub.clone(),
+            InFlightRequest {
+                id: "req".into(),
+                started_at: chrono::Utc::now(),
+                endpoint: "/v1/chat/completions".into(),
+                alias: "assistant".into(),
+                target_id: None,
+                target_name: None,
+                phase: "trying".into(),
+            },
+        );
+        let cancel = guard.cancellation();
+        assert!(!cancel.is_cancelled());
+        assert!(hub.cancel("req"));
+        assert!(cancel.is_cancelled());
+        assert!(hub.snapshot().is_empty());
+        assert!(!hub.cancel("req"));
+        drop(guard);
+        assert!(hub.snapshot().is_empty());
+    }
+
+    #[test]
+    fn inflight_cancel_all_clears_every_request() {
+        let hub = TrafficHub::new();
+        let first = InFlightGuard::new(
+            hub.clone(),
+            InFlightRequest {
+                id: "one".into(),
+                started_at: chrono::Utc::now(),
+                endpoint: "/v1/chat/completions".into(),
+                alias: "assistant".into(),
+                target_id: None,
+                target_name: None,
+                phase: "trying".into(),
+            },
+        );
+        let second = InFlightGuard::new(
+            hub.clone(),
+            InFlightRequest {
+                id: "two".into(),
+                started_at: chrono::Utc::now(),
+                endpoint: "/v1/chat/completions".into(),
+                alias: "coder".into(),
+                target_id: None,
+                target_name: None,
+                phase: "streaming".into(),
+            },
+        );
+        hub.cancel_all();
+        assert!(first.cancellation().is_cancelled());
+        assert!(second.cancellation().is_cancelled());
+        assert!(hub.snapshot().is_empty());
+    }
+
+    #[tokio::test]
+    async fn inflight_clears_when_stream_owned_guard_drops() {
+        use futures_util::StreamExt;
+
+        let hub = TrafficHub::new();
+        let guard = InFlightGuard::new(
+            hub.clone(),
+            InFlightRequest {
+                id: "stream".into(),
+                started_at: chrono::Utc::now(),
+                endpoint: "/v1/chat/completions".into(),
+                alias: "assistant".into(),
+                target_id: None,
+                target_name: None,
+                phase: "streaming".into(),
+            },
+        );
+        let mut stream = Box::pin(async_stream::stream! {
+            let _inflight = guard;
+            yield 1u8;
+            std::future::pending::<()>().await;
+            yield 2u8;
+        });
+        assert_eq!(stream.next().await, Some(1));
+        assert_eq!(hub.snapshot().len(), 1);
+        drop(stream);
         assert!(hub.snapshot().is_empty());
     }
 
