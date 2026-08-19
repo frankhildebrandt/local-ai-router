@@ -602,7 +602,7 @@ async fn proxy(
                 .unwrap_or(false);
             let load = if auto_load {
                 match runtimes.as_ref() {
-                    Some(runtimes) => runtimes.start(&target).await,
+                    Some(runtimes) => runtimes.start_resolved(&core.store, &target).await,
                     None => Err(anyhow::anyhow!("runtime manager unavailable")),
                 }
             } else {

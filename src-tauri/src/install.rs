@@ -484,6 +484,7 @@ impl InstallManager {
                 ),
                 resource_overrides: None,
                 force_tool_support: None,
+                speculative_config: None,
             },
         };
         self.store.upsert_target(&target).await?;

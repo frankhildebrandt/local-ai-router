@@ -23,6 +23,7 @@ use crate::{
     secrets::{
         local_api_key_account, provider_account, CIVITAI_ACCOUNT, HF_ACCOUNT, LOCAL_API_KEY,
     },
+    speculative::{self, SpeculativeConfig},
     storage::{
         KeyUsageData, LocalApiKey, LogFacets, LogQuery, LogResult, ModelTarget, Provider,
         ProviderModel, Store, UsageData,
@@ -846,8 +847,29 @@ pub async fn save_target(
 
 #[tauri::command]
 pub async fn delete_target(state: State<'_, AppServices>, id: String) -> Result<(), String> {
+    let dependents: Vec<String> = state
+        .core
+        .store
+        .targets()
+        .await
+        .map_err(err)?
+        .into_iter()
+        .filter(|target| {
+            target
+                .local
+                .speculative_config
+                .as_ref()
+                .and_then(|config| config.draft_target_id.as_deref())
+                == Some(id.as_str())
+        })
+        .map(|target| target.id)
+        .collect();
     state.runtimes.stop(&id).await.map_err(err)?;
-    state.core.store.delete_target(&id).await.map_err(err)
+    state.core.store.delete_target(&id).await.map_err(err)?;
+    for dependent in dependents {
+        state.runtimes.mark_target_pending_restart(&dependent);
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -925,7 +947,11 @@ pub async fn start_local_model(
         .await
         .map_err(err)?
         .ok_or("model not found")?;
-    let runtime_url = state.runtimes.start(&target).await.map_err(err)?;
+    let runtime_url = state
+        .runtimes
+        .start_resolved(&state.core.store, &target)
+        .await
+        .map_err(err)?;
     let active = state
         .runtimes
         .statuses()
@@ -1741,6 +1767,41 @@ pub async fn save_model_resource_overrides(
         .effective_resource_policy(&target)
         .await
         .map_err(err)?;
+    state.core.store.upsert_target(&target).await.map_err(err)?;
+    state.runtimes.mark_target_pending_restart(&id);
+    Ok(target)
+}
+
+#[tauri::command]
+pub async fn save_model_speculative_config(
+    state: State<'_, AppServices>,
+    id: String,
+    config: Option<SpeculativeConfig>,
+) -> Result<ModelTarget, String> {
+    let mut target = state
+        .core
+        .store
+        .target(&id)
+        .await
+        .map_err(err)?
+        .ok_or("model not found")?;
+    let config = config.map(|value| value.normalized(target.kind));
+    if let Some(config) = config.as_ref() {
+        let draft = match config.draft_target_id.as_deref() {
+            Some(draft_id) => Some(
+                state
+                    .core
+                    .store
+                    .target(draft_id)
+                    .await
+                    .map_err(err)?
+                    .ok_or("draft model is no longer in the library")?,
+            ),
+            None => None,
+        };
+        speculative::validate(&target, config, draft.as_ref()).map_err(err)?;
+    }
+    target.local.speculative_config = config;
     state.core.store.upsert_target(&target).await.map_err(err)?;
     state.runtimes.mark_target_pending_restart(&id);
     Ok(target)

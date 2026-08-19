@@ -21,6 +21,7 @@ A private, multi-protocol model gateway for Apple Silicon Macs. Local AI Router 
 - Curated MLX catalog with RAM-aware install, live Hugging Face MLX search, CivitAI image downloads, managed imports and resumable downloads
 - Stealth, Balanced, Performance and Custom resource profiles with automatic loading, idle unloading, prompt concurrency and per-model overrides
 - Native MLX chat, image and speech sidecars plus Metal-enabled llama.cpp
+- Optional speculative decoding for local chat models: pair a smaller draft from the library, or GGUF n-gram without an extra model
 
 The gateway listens only on `http://127.0.0.1:11435`. Every request requires a local token managed under **API keys**. Supply it as `Authorization: Bearer`, `x-api-key`, or `x-goog-api-key`; query-string keys are deliberately rejected because URLs are commonly logged.
 

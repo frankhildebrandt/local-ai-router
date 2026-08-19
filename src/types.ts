@@ -79,6 +79,15 @@ export interface ModelTarget {
   trust_status?: string | null;
   resource_overrides?: ResourceOverrides | null;
   force_tool_support?: boolean | null;
+  speculative_config?: SpeculativeConfig | null;
+}
+
+export type SpeculativeMode = "draft_model" | "ngram";
+
+export interface SpeculativeConfig {
+  mode: SpeculativeMode;
+  draft_target_id?: string | null;
+  n_max: number;
 }
 
 export interface ProviderModel {
@@ -191,6 +200,8 @@ export interface RoutingEvaluation {
     excluded: Array<{ target_id: string; reason: string }>;
   };
   ordered_target_ids: string[];
+  primary_target_ids?: string[];
+  fallback_target_ids?: string[];
   shadow_target_id: string | null;
   half_open_target_ids: string[];
   estimated_input_tokens: number;

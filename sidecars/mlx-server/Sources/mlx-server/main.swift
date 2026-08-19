@@ -19,6 +19,8 @@ struct Options {
     let stub: Bool
     let memoryLimitMiB: Int?
     let slotSavePath: String?
+    let draftModel: String?
+    let draftTokens: Int
 
     static func parse() throws -> Options {
         let args = Array(CommandLine.arguments.dropFirst())
@@ -30,6 +32,8 @@ struct Options {
         let stub = ProcessInfo.processInfo.environment["LOCAL_AI_ROUTER_STUB_ENGINE"] == "1" || args.contains("--stub")
         let memoryLimitMiB = value("--memory-limit-mib").flatMap(Int.init)
         if let memoryLimitMiB, memoryLimitMiB < 512 { throw ServerError.badRequest("--memory-limit-mib must be at least 512") }
+        let draftTokens = value("--draft-tokens").flatMap(Int.init) ?? 5
+        if draftTokens < 1 { throw ServerError.badRequest("--draft-tokens must be at least 1") }
         return Options(
             model: model,
             host: host,
@@ -38,7 +42,9 @@ struct Options {
             token: token,
             stub: stub,
             memoryLimitMiB: memoryLimitMiB,
-            slotSavePath: value("--slot-save-path")
+            slotSavePath: value("--slot-save-path"),
+            draftModel: value("--draft-model"),
+            draftTokens: draftTokens
         )
     }
 }
@@ -57,18 +63,22 @@ private struct LivePromptCache: @unchecked Sendable {
 
 actor InferenceEngine {
     let container: ModelContainer?
+    let draftContainer: ModelContainer?
+    let draftTokens: Int
     let alias: String
     let stub: Bool
     let vision: Bool
     private let slotSaveRoot: URL?
     private var live: LivePromptCache?
 
-    init(modelPath: String, alias: String, stub: Bool, slotSavePath: String?) async throws {
+    init(modelPath: String, alias: String, stub: Bool, slotSavePath: String?, draftPath: String?, draftTokens: Int) async throws {
         self.alias = alias
         self.stub = stub
+        self.draftTokens = max(draftTokens, 1)
         self.slotSaveRoot = slotSavePath.map { URL(filePath: $0, directoryHint: .isDirectory) }
         if stub {
             self.container = nil
+            self.draftContainer = nil
             self.vision = true
             return
         }
@@ -78,6 +88,12 @@ actor InferenceEngine {
         // Importing MLXVLM registers its factory trampoline so this macro can
         // resolve either MLXLLM or MLXVLM from the pinned 3.31.4 registry.
         self.container = try await #huggingFaceLoadModelContainer(configuration: configuration)
+        if let draftPath {
+            let draftConfiguration = ModelConfiguration(directory: URL(filePath: draftPath))
+            self.draftContainer = try await #huggingFaceLoadModelContainer(configuration: draftConfiguration)
+        } else {
+            self.draftContainer = nil
+        }
     }
 
     func generate(payload: sending [String: Any], namespace: String, session: String?) async throws -> AsyncThrowingStream<String, Error> {
@@ -99,11 +115,25 @@ actor InferenceEngine {
         let temperature = payload["temperature"] as? Float ?? Float(payload["temperature"] as? Double ?? 0.7)
         let parameters = GenerateParameters(maxTokens: maxTokens, temperature: temperature)
         let turns = parsed.turns
-        let usePrefixCache = !vision && parsed.images.isEmpty
+        let draftTokens = self.draftTokens
+        let usePrefixCache = !vision && parsed.images.isEmpty && draftContainer == nil
+        let useSpeculative = draftContainer != nil && !vision && parsed.images.isEmpty
         return AsyncThrowingStream { continuation in
             Task {
                 do {
-                    if usePrefixCache {
+                    if useSpeculative, let draftContainer {
+                        let session = ChatSession(
+                            container,
+                            speculativeDecoding: SpeculativeDecodingConfig(
+                                draftModel: draftContainer,
+                                numDraftTokens: draftTokens
+                            ),
+                            generateParameters: parameters
+                        )
+                        for try await text in session.streamResponse(to: chatMessages(from: turns)) {
+                            continuation.yield(text)
+                        }
+                    } else if usePrefixCache {
                         try await self.generateCached(
                             container: container,
                             turns: turns,
@@ -556,7 +586,9 @@ func errorObject(_ code: String, _ message: String) -> [String: Any] { ["error":
             modelPath: options.model,
             alias: options.alias,
             stub: options.stub,
-            slotSavePath: options.slotSavePath
+            slotSavePath: options.slotSavePath,
+            draftPath: options.draftModel,
+            draftTokens: options.draftTokens
         )
         try await HTTPServer(options: options, engine: engine).run()
     }

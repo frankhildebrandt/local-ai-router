@@ -16,6 +16,7 @@ use crate::{
         RoutingAttemptRecord, RoutingConfigExport, RoutingPolicy, RoutingStats,
         RoutingTaskDefinition, TargetRoutingProfile,
     },
+    speculative::SpeculativeConfig,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -49,6 +50,8 @@ pub struct LocalModelMeta {
     pub resource_overrides: Option<ResourceOverrides>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub force_tool_support: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub speculative_config: Option<SpeculativeConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -490,6 +493,7 @@ impl Store {
             ("trust_status", "TEXT"),
             ("resource_overrides", "TEXT"),
             ("force_tool_support", "INTEGER"),
+            ("speculative_config", "TEXT"),
         ] {
             if !target_columns
                 .iter()
@@ -740,10 +744,16 @@ impl Store {
             .map(serde_json::to_string)
             .transpose()?;
         let force_tool_support = target.local.force_tool_support.map(|value| value as i64);
-        sqlx::query("INSERT INTO model_targets(id,provider_id,name,kind,provider_model,local_path,runtime_url,capabilities,enabled,state,size_bytes,wire_protocol,task,runtime_engine,source_repo,source_revision,estimated_memory_bytes,catalog_id,trust_status,resource_overrides,force_tool_support) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET provider_id=excluded.provider_id,name=excluded.name,kind=excluded.kind,provider_model=excluded.provider_model,local_path=excluded.local_path,runtime_url=excluded.runtime_url,capabilities=excluded.capabilities,enabled=excluded.enabled,state=excluded.state,size_bytes=excluded.size_bytes,wire_protocol=excluded.wire_protocol,task=excluded.task,runtime_engine=excluded.runtime_engine,source_repo=excluded.source_repo,source_revision=excluded.source_revision,estimated_memory_bytes=excluded.estimated_memory_bytes,catalog_id=excluded.catalog_id,trust_status=excluded.trust_status,resource_overrides=excluded.resource_overrides,force_tool_support=excluded.force_tool_support")
+        let speculative_config = target
+            .local
+            .speculative_config
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()?;
+        sqlx::query("INSERT INTO model_targets(id,provider_id,name,kind,provider_model,local_path,runtime_url,capabilities,enabled,state,size_bytes,wire_protocol,task,runtime_engine,source_repo,source_revision,estimated_memory_bytes,catalog_id,trust_status,resource_overrides,force_tool_support,speculative_config) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET provider_id=excluded.provider_id,name=excluded.name,kind=excluded.kind,provider_model=excluded.provider_model,local_path=excluded.local_path,runtime_url=excluded.runtime_url,capabilities=excluded.capabilities,enabled=excluded.enabled,state=excluded.state,size_bytes=excluded.size_bytes,wire_protocol=excluded.wire_protocol,task=excluded.task,runtime_engine=excluded.runtime_engine,source_repo=excluded.source_repo,source_revision=excluded.source_revision,estimated_memory_bytes=excluded.estimated_memory_bytes,catalog_id=excluded.catalog_id,trust_status=excluded.trust_status,resource_overrides=excluded.resource_overrides,force_tool_support=excluded.force_tool_support,speculative_config=excluded.speculative_config")
             .bind(&target.id).bind(&target.provider_id).bind(&target.name).bind(encode_kind(&target.kind)).bind(&target.provider_model)
             .bind(&target.local_path).bind(&target.runtime_url).bind(capabilities).bind(target.enabled as i64).bind(&target.state).bind(target.size_bytes).bind(encode_wire_protocol(target.wire_protocol))
-            .bind(&target.local.task).bind(&target.local.runtime_engine).bind(&target.local.source_repo).bind(&target.local.source_revision).bind(target.local.estimated_memory_bytes).bind(&target.local.catalog_id).bind(&target.local.trust_status).bind(resource_overrides).bind(force_tool_support)
+            .bind(&target.local.task).bind(&target.local.runtime_engine).bind(&target.local.source_repo).bind(&target.local.source_revision).bind(target.local.estimated_memory_bytes).bind(&target.local.catalog_id).bind(&target.local.trust_status).bind(resource_overrides).bind(force_tool_support).bind(speculative_config)
             .execute(&self.pool).await?;
         Ok(())
     }
@@ -771,10 +781,27 @@ impl Store {
     }
 
     pub async fn delete_target(&self, id: &str) -> anyhow::Result<()> {
+        self.clear_speculative_drafts_of(id).await?;
         sqlx::query("DELETE FROM model_targets WHERE id=?")
             .bind(id)
             .execute(&self.pool)
             .await?;
+        Ok(())
+    }
+
+    async fn clear_speculative_drafts_of(&self, draft_id: &str) -> anyhow::Result<()> {
+        for mut target in self.targets().await? {
+            let uses_draft = target
+                .local
+                .speculative_config
+                .as_ref()
+                .and_then(|config| config.draft_target_id.as_deref())
+                == Some(draft_id);
+            if uses_draft {
+                target.local.speculative_config = None;
+                self.upsert_target(&target).await?;
+            }
+        }
         Ok(())
     }
 
@@ -2120,6 +2147,10 @@ fn row_to_target(row: sqlx::sqlite::SqliteRow) -> anyhow::Result<ModelTarget> {
                 .ok()
                 .flatten()
                 .map(|value| value != 0),
+            speculative_config: optional_column(&row, "speculative_config")
+                .map(|value| serde_json::from_str(&value))
+                .transpose()
+                .context("invalid speculative config")?,
         },
     })
 }
@@ -2316,6 +2347,50 @@ mod tests {
             store.target("model").await.unwrap().unwrap().wire_protocol,
             crate::providers::WireProtocol::OpenAiChat
         );
+    }
+
+    fn local_chat(id: &str) -> ModelTarget {
+        ModelTarget {
+            id: id.into(),
+            provider_id: None,
+            name: id.into(),
+            kind: TargetKind::Gguf,
+            provider_model: id.into(),
+            local_path: Some(format!("/models/{id}.gguf")),
+            runtime_url: None,
+            wire_protocol: crate::providers::WireProtocol::OpenAiChat,
+            capabilities: vec!["chat".into()],
+            enabled: true,
+            state: "stopped".into(),
+            size_bytes: Some(1_000),
+            local: LocalModelMeta {
+                runtime_engine: Some("llama".into()),
+                ..Default::default()
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn speculative_config_round_trips_and_clears_when_draft_is_deleted() {
+        let store = Store::memory().await.unwrap();
+        let mut target = local_chat("big");
+        let draft = local_chat("small");
+        target.local.speculative_config = Some(crate::speculative::SpeculativeConfig {
+            mode: crate::speculative::SpeculativeMode::DraftModel,
+            draft_target_id: Some("small".into()),
+            n_max: 16,
+        });
+        store.upsert_target(&target).await.unwrap();
+        store.upsert_target(&draft).await.unwrap();
+        let loaded = store.target("big").await.unwrap().unwrap();
+        assert_eq!(
+            loaded.local.speculative_config,
+            target.local.speculative_config
+        );
+
+        store.delete_target("small").await.unwrap();
+        let cleared = store.target("big").await.unwrap().unwrap();
+        assert!(cleared.local.speculative_config.is_none());
     }
 
     #[tokio::test]

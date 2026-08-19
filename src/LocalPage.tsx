@@ -6,7 +6,7 @@ import {
 import { command, listenInstallJobs } from "./api";
 import type {
   CatalogCategory, CatalogEntry, InstallJob, InstallJobEvent, LocalCatalog, ModelInspection,
-  ModelTarget, RamFit, ResourceOverrides, ResourcePolicy, SearchPage, TargetKind,
+  ModelTarget, RamFit, ResourceOverrides, ResourcePolicy, SearchPage, SpeculativeConfig, SpeculativeMode, TargetKind,
 } from "./types";
 import { displayModelName, groupCatalogEntries, preferredQuantization } from "./catalogGroups";
 
@@ -175,19 +175,49 @@ function InstalledLibrary({ local, resourcePolicy, refresh, success, fail }: { l
   const [editing, setEditing] = useState<ModelTarget | null>(null);
   const toggle = async (model: ModelTarget) => { try { await command(model.state === "ready" ? "stop_local_model" : "start_local_model", { id: model.id }); await refresh(); success(model.state === "ready" ? "Model unloaded" : "Model loaded"); } catch (e) { fail(e); } };
   return <>
-    <div className="model-grid">{local.map(model => <article className="model-card" key={model.id}><div className="model-icon"><Box /></div><div className="grow"><div className="row"><h3>{model.name}</h3><span className={`badge ${model.state === "ready" ? "good" : "neutral"}`}>{model.state}</span>{model.resource_overrides && <span className="badge neutral">Custom resources</span>}</div><p>{model.kind.toUpperCase()} · {formatBytes(model.size_bytes)}{model.provider_model ? ` · ${model.provider_model}` : ""}</p><div className="capabilities">{model.capabilities.map(item => <span key={item}>{item}</span>)}</div></div><button className="icon-button" title="Resource overrides" onClick={() => setEditing(model)}><Settings size={16} /></button><button className={model.state === "ready" ? "secondary" : "primary"} onClick={() => void toggle(model)}>{model.state === "ready" ? <Square size={15} /> : <Play size={15} />}{model.state === "ready" ? "Unload" : "Load"}</button><button className="icon-button danger" onClick={async () => { if (!confirm("Delete this model target?")) return; try { await command("delete_target", { id: model.id }); await refresh(); success("Model target deleted"); } catch (e) { fail(e); } }}><Trash2 size={16} /></button></article>)}</div>
+    <div className="model-grid">{local.map(model => <article className="model-card" key={model.id}><div className="model-icon"><Box /></div><div className="grow"><div className="row"><h3>{model.name}</h3><span className={`badge ${model.state === "ready" ? "good" : "neutral"}`}>{model.state}</span>{model.resource_overrides && <span className="badge neutral">Custom resources</span>}{model.speculative_config && <span className="badge neutral">Speculative</span>}</div><p>{model.kind.toUpperCase()} · {formatBytes(model.size_bytes)}{model.provider_model ? ` · ${model.provider_model}` : ""}</p><div className="capabilities">{model.capabilities.map(item => <span key={item}>{item}</span>)}</div></div><button className="icon-button" title="Resource overrides" onClick={() => setEditing(model)}><Settings size={16} /></button><button className={model.state === "ready" ? "secondary" : "primary"} onClick={() => void toggle(model)}>{model.state === "ready" ? <Square size={15} /> : <Play size={15} />}{model.state === "ready" ? "Unload" : "Load"}</button><button className="icon-button danger" onClick={async () => { if (!confirm("Delete this model target?")) return; try { await command("delete_target", { id: model.id }); await refresh(); success("Model target deleted"); } catch (e) { fail(e); } }}><Trash2 size={16} /></button></article>)}</div>
     {!local.length && <div className="empty"><div><Box /></div><h3>Your local library is empty</h3><p>Install a catalog model, import a GGUF file, or download from Hugging Face.</p></div>}
-    {editing && <ModelResourceEditor model={editing} global={resourcePolicy} close={() => setEditing(null)} done={async () => { setEditing(null); await refresh(); success("Model resource overrides saved; a loaded runtime restarts after active requests finish"); }} success={success} fail={fail} />}
+    {editing && <ModelResourceEditor model={editing} local={local} global={resourcePolicy} close={() => setEditing(null)} done={async () => { setEditing(null); await refresh(); success("Model resource overrides saved; a loaded runtime restarts after active requests finish"); }} success={success} fail={fail} />}
   </>;
 }
 
-function ModelResourceEditor({ model, global, close, done, success, fail }: { model: ModelTarget; global: ResourcePolicy; close: () => void; done: () => Promise<void>; success: (text: string) => void; fail: (error: unknown) => void }) {
+function isLocalChat(model: ModelTarget) {
+  if (!model.capabilities.includes("chat")) return false;
+  if (model.kind === "gguf") return true;
+  return model.kind === "mlx" && (model.runtime_engine ?? "mlx_chat") === "mlx_chat";
+}
+
+function defaultDraftTokens(mode: SpeculativeMode | "off", kind: TargetKind) {
+  if (mode === "ngram") return 64;
+  return kind === "mlx" ? 5 : 16;
+}
+
+function ModelResourceEditor({ model, local, global, close, done, success, fail }: { model: ModelTarget; local: ModelTarget[]; global: ResourcePolicy; close: () => void; done: () => Promise<void>; success: (text: string) => void; fail: (error: unknown) => void }) {
   const [values, setValues] = useState<ResourceOverrides>({ ...model.resource_overrides });
   const [forceTools, setForceTools] = useState(model.force_tool_support ?? model.kind === "mlx");
+  const [specMode, setSpecMode] = useState<SpeculativeMode | "off">(model.speculative_config?.mode ?? "off");
+  const [draftId, setDraftId] = useState(model.speculative_config?.draft_target_id ?? "");
+  const [nMax, setNMax] = useState(model.speculative_config?.n_max ?? defaultDraftTokens(model.speculative_config?.mode ?? "off", model.kind));
   const [busy, setBusy] = useState(false);
   const number = (key: keyof ResourceOverrides, fallback: number) => Number(values[key] ?? fallback);
-  const save = async (overrides: ResourceOverrides | null) => { setBusy(true); try { await command("save_model_resource_overrides", { id: model.id, overrides, forceToolSupport: forceTools }); await done(); } catch (error) { fail(error); } finally { setBusy(false); } };
+  const drafts = local.filter(item => item.id !== model.id && item.kind === model.kind && isLocalChat(item));
+  const speculative = (): SpeculativeConfig | null => {
+    if (specMode === "off") return null;
+    return { mode: specMode, draft_target_id: specMode === "draft_model" ? draftId || null : null, n_max: nMax };
+  };
+  const save = async (overrides: ResourceOverrides | null) => {
+    setBusy(true);
+    try {
+      await command("save_model_resource_overrides", { id: model.id, overrides, forceToolSupport: forceTools });
+      await command("save_model_speculative_config", { id: model.id, config: speculative() });
+      await done();
+    } catch (error) { fail(error); } finally { setBusy(false); }
+  };
   const updateParallel = (value: number) => setValues(current => ({ ...current, max_parallel_prompts: value, disk_kv_enabled: value === 1 ? current.disk_kv_enabled : false }));
+  const changeMode = (mode: SpeculativeMode | "off") => {
+    setSpecMode(mode);
+    setNMax(current => model.speculative_config?.mode === mode ? (model.speculative_config?.n_max ?? current) : defaultDraftTokens(mode, model.kind));
+  };
   return <div className="modal-backdrop" onMouseDown={close}><div className="modal" onMouseDown={event => event.stopPropagation()}><div className="modal-head"><h2>{model.name} resources</h2><button className="icon-button" onClick={close}>×</button></div><div className="form resource-override-form">
     <label className="field"><span>Compute duty %</span><input type="number" min="5" max="100" value={number("compute_duty_percent", global.compute_duty_percent)} onChange={event => setValues({ ...values, compute_duty_percent: Number(event.target.value) })} /></label>
     <label className="field"><span>CPU threads</span><input type="number" min="1" max="128" value={number("cpu_threads", global.cpu_threads)} onChange={event => setValues({ ...values, cpu_threads: Number(event.target.value) })} /></label>
@@ -201,6 +231,13 @@ function ModelResourceEditor({ model, global, close, done, success, fail }: { mo
     {model.kind === "mlx" && <p className="catalog-hint">MLX reuses a prefix KV in RAM without a session header. Disk restore uses token-block hashes; X-Local-AI-Session is optional isolation. MLX uses Metal; Apple Neural Engine quotas are unavailable.</p>}
     {model.capabilities.includes("chat") && <label className="field"><span>Force tool support</span><input type="checkbox" checked={forceTools} onChange={event => setForceTools(event.target.checked)} /></label>}
     {model.capabilities.includes("chat") && <p className="catalog-hint">Injects tools into the prompt and parses text tool calls. Less reliable than native provider tool APIs.</p>}
+    {isLocalChat(model) && <>
+      <h3 className="catalog-section">Speculative decoding</h3>
+      <label className="field"><span>Mode</span><select value={specMode} onChange={event => changeMode(event.target.value as SpeculativeMode | "off")}><option value="off">Off</option><option value="draft_model">Draft model</option>{model.kind === "gguf" && <option value="ngram">n-gram</option>}</select></label>
+      {specMode === "draft_model" && <label className="field"><span>Draft model</span><select value={draftId} onChange={event => setDraftId(event.target.value)}><option value="">Select a smaller chat model</option>{drafts.map(item => <option value={item.id} key={item.id}>{item.name}</option>)}</select></label>}
+      {specMode !== "off" && <label className="field"><span>Draft tokens</span><input type="number" min="1" max="128" value={nMax} onChange={event => setNMax(Number(event.target.value))} /></label>}
+      <p className="catalog-hint">{specMode === "ngram" ? "n-gram speculation needs no extra model and helps most with repetitive code or text." : "Pick a smaller same-family chat model. The draft loads inside this sidecar; a loaded runtime restarts after save."}</p>
+    </>}
     <div className="modal-actions">{(model.kind === "gguf" || model.kind === "mlx") && <button className="secondary danger-text" disabled={busy} onClick={async () => { if (!confirm(`Delete persistent KV snapshots for “${model.name}”?`)) return; try { await command("clear_kv_cache", { targetId: model.id }); success("Model KV snapshots deleted"); } catch (error) { fail(error); } }}><Trash2 size={15} />Clear KV cache</button>}<button className="secondary" disabled={busy} onClick={() => void save(null)}>Use global profile</button><button className="primary" disabled={busy} onClick={() => void save(values)}>{busy && <LoaderCircle className="spin" size={15} />}Save overrides</button></div>
   </div></div></div>;
 }

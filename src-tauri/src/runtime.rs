@@ -21,7 +21,8 @@ use crate::{
     core::LocalActivityRegistry,
     domain::TargetKind,
     resource::{ResourcePolicy, ResourceProfile},
-    storage::ModelTarget,
+    speculative,
+    storage::{ModelTarget, Store},
 };
 
 struct RuntimeEntry {
@@ -227,9 +228,10 @@ impl RuntimeManager {
             .unwrap_or_default();
         let policy = self.effective_policy(target);
         let mlx = target.kind == TargetKind::Mlx;
+        let spec = speculative::fingerprint(target.local.speculative_config.as_ref(), None);
         let fingerprint = if mlx {
             format!(
-                "v2-mlx\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}",
+                "v2-mlx\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}",
                 target.id,
                 path,
                 target.local.source_revision.as_deref().unwrap_or_default(),
@@ -240,11 +242,12 @@ impl RuntimeManager {
                 modified,
                 policy.max_parallel_prompts,
                 api_key_id,
-                session_id
+                session_id,
+                spec
             )
         } else {
             format!(
-                "v2\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}",
+                "v2\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}",
                 target.id,
                 path,
                 target.local.source_revision.as_deref().unwrap_or_default(),
@@ -258,7 +261,8 @@ impl RuntimeManager {
                 policy.gguf_gpu_layers,
                 policy.compute_duty_percent,
                 api_key_id,
-                session_id
+                session_id,
+                spec
             )
         };
         (
@@ -287,7 +291,20 @@ impl RuntimeManager {
         Ok(())
     }
 
-    pub async fn start(&self, target: &ModelTarget) -> anyhow::Result<String> {
+    pub async fn start_resolved(
+        &self,
+        store: &Store,
+        target: &ModelTarget,
+    ) -> anyhow::Result<String> {
+        let draft = speculative::resolve_draft(store, target).await?;
+        self.start(target, draft.as_ref()).await
+    }
+
+    pub async fn start(
+        &self,
+        target: &ModelTarget,
+        draft: Option<&ModelTarget>,
+    ) -> anyhow::Result<String> {
         let _start_guard = self.starts.lock().await;
         if let Some(port) = self.entries.lock().get(&target.id).map(|entry| entry.port) {
             return Ok(format!("http://127.0.0.1:{port}/v1"));
@@ -296,13 +313,31 @@ impl RuntimeManager {
             .local_path
             .as_deref()
             .context("local model path missing")?;
-        let size = target
-            .local
-            .estimated_memory_bytes
-            .or(target.size_bytes)
-            .unwrap_or(0)
-            .max(0) as u64;
         let policy = self.effective_policy(target);
+        let mut size = speculative::estimated_bytes(target);
+        let mut speculative_args = Vec::new();
+        if let Some(config) = target.local.speculative_config.as_ref() {
+            speculative::validate(target, config, draft)?;
+            let draft_path = draft.and_then(|item| item.local_path.as_deref());
+            if let Some(draft) = draft {
+                let draft_file = draft
+                    .local_path
+                    .as_deref()
+                    .context("draft model path missing")?;
+                anyhow::ensure!(
+                    Path::new(draft_file).exists(),
+                    "draft model file is missing"
+                );
+                size = size.saturating_add(speculative::estimated_bytes(draft));
+            }
+            speculative_args = match target.kind {
+                TargetKind::Gguf => {
+                    speculative::gguf_speculative_args(config, draft_path, policy.gguf_gpu_layers)
+                }
+                TargetKind::Mlx => speculative::mlx_speculative_args(config, draft_path),
+                _ => Ok(Vec::new()),
+            }?;
+        }
         policy.validate()?;
         self.activity
             .configure(&target.id, policy.max_parallel_prompts)?;
@@ -408,6 +443,9 @@ impl RuntimeManager {
                 }
             }
             _ => unreachable!(),
+        }
+        if !speculative_args.is_empty() {
+            command.args(&speculative_args);
         }
         command
             .current_dir(&self.bin_dir)
@@ -1119,6 +1157,15 @@ mod tests {
         let (_, gpu_file) = manager.kv_snapshot(&gpu_mlx, "key", "session");
         assert_eq!(mlx_file, gpu_file);
         assert!(!supports_named_kv(&image_target(None, "/models/flux")));
+
+        let mut spec = gguf.clone();
+        spec.local.speculative_config = Some(crate::speculative::SpeculativeConfig {
+            mode: crate::speculative::SpeculativeMode::Ngram,
+            draft_target_id: None,
+            n_max: 64,
+        });
+        let (_, spec_file) = manager.kv_snapshot(&spec, "key", "session");
+        assert_ne!(gguf_file, spec_file);
     }
 
     #[tokio::test]

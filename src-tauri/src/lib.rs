@@ -18,6 +18,7 @@ pub mod resource;
 pub mod routing;
 pub mod runtime;
 pub mod secrets;
+pub mod speculative;
 pub mod storage;
 pub mod tool_emulation;
 
@@ -128,7 +129,7 @@ pub fn run() {
                             target.state = if may_restart { "restarting" } else { "error" }.into();
                             let _ = maintenance_store.upsert_target(&target).await;
                             if may_restart {
-                                match maintenance.start(&target).await {
+                                match maintenance.start_resolved(&maintenance_store, &target).await {
                                     Ok(url) => {
                                         target.runtime_url = Some(url);
                                         target.state = "ready".into();
@@ -146,7 +147,7 @@ pub fn run() {
                             target.runtime_url = None;
                             target.state = "restarting".into();
                             let _ = maintenance_store.upsert_target(&target).await;
-                            match maintenance.start(&target).await {
+                            match maintenance.start_resolved(&maintenance_store, &target).await {
                                 Ok(url) => {
                                     target.runtime_url = Some(url);
                                     target.state = "ready".into();
@@ -259,6 +260,7 @@ pub fn run() {
             commands::get_resource_profile_preset,
             commands::save_resource_policy,
             commands::save_model_resource_overrides,
+            commands::save_model_speculative_config,
             commands::clear_kv_cache,
             commands::save_hugging_face_token,
             commands::save_civitai_token,
