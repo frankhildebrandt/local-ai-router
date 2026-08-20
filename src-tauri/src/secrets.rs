@@ -41,14 +41,14 @@ impl SecretStore for KeychainItems {
         match entry.get_password() {
             Ok(value) => Ok(Some(value)),
             Err(keyring::Error::NoEntry) => Ok(None),
-            Err(error) => Err(error).context("reading macOS Keychain"),
+            Err(error) => Err(error).context("reading the platform keyring"),
         }
     }
 
     fn set(&self, account: &str, value: &str) -> anyhow::Result<()> {
         keyring::Entry::new(&self.service, account)?
             .set_password(value)
-            .context("writing macOS Keychain")
+            .context("writing the platform keyring")
     }
 
     fn delete(&self, account: &str) -> anyhow::Result<()> {
@@ -101,7 +101,7 @@ impl<S: SecretStore> BundledStore<S> {
 
 fn parse_vault(raw: &str) -> anyhow::Result<HashMap<String, String>> {
     let vault: CredentialVault =
-        serde_json::from_str(raw).context("invalid credential vault in Keychain")?;
+        serde_json::from_str(raw).context("invalid credential vault in the platform keyring")?;
     Ok(vault.secrets)
 }
 
@@ -301,6 +301,10 @@ pub fn file_secrets(path: PathBuf) -> Arc<dyn SecretStore> {
     Arc::new(FileSecrets::new(path))
 }
 
+pub fn default_secrets_file(data_dir: &std::path::Path) -> PathBuf {
+    data_dir.join("secrets.json")
+}
+
 pub fn generate_local_token() -> String {
     let mut bytes = [0u8; 32];
     rand::rng().fill_bytes(&mut bytes);
@@ -436,5 +440,17 @@ mod tests {
             let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
             assert_eq!(mode, 0o600);
         }
+    }
+
+    #[test]
+    fn systemd_unit_uses_the_default_secrets_file_in_the_service_data_dir() {
+        let unit = include_str!("../../packaging/linux/local-ai-router.service");
+        let dir = PathBuf::from("/var/lib/local-ai-router");
+        assert!(unit.contains("ExecStart=/usr/bin/local-ai-router serve"));
+        assert!(unit.contains(&format!(
+            "--secrets-file {}",
+            default_secrets_file(&dir).display()
+        )));
+        assert!(unit.contains(&format!("--data-dir {}", dir.display())));
     }
 }

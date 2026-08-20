@@ -128,7 +128,7 @@ impl TrafficHub {
             .values()
             .map(|live| live.info.clone())
             .collect();
-        items.sort_by(|left, right| left.started_at.cmp(&right.started_at));
+        items.sort_by_key(|item| item.started_at);
         items
     }
 

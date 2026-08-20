@@ -27,11 +27,13 @@
   },
   "bundle": {
     "active": true,
-    "targets": ["dmg", "app"],
+    "targets": ["dmg", "app", "appimage", "deb"],
     "icon": [
       "icons/icon.icns",
+      "icons/icon.png",
       "icons/32x32.png",
       "icons/128x128.png",
+      "icons/128x128@2x.png",
       "icons/icon.ico"
     ],
     "createUpdaterArtifacts": true,
@@ -39,7 +41,8 @@
       "../sidecars/bin/": "sidecars/bin/",
       "../sidecars/licenses/": "sidecars/licenses/",
       "../THIRD_PARTY_NOTICES.md": "THIRD_PARTY_NOTICES.md",
-      "ui/": "ui/"
+      "ui/": "ui/",
+      "../packaging/linux/local-ai-router.service": "local-ai-router.service"
     },
     "macOS": {
       "minimumSystemVersion": "15.0",

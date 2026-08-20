@@ -1,4 +1,4 @@
-name: Release macOS app
+name: Release
 
 on:
   push:
@@ -8,7 +8,7 @@ permissions:
   contents: write
 
 jobs:
-  release:
+  macos:
     runs-on: macos-26
     steps:
       - uses: actions/checkout@v4
@@ -23,7 +23,7 @@ jobs:
         working-directory: src-tauri
         run: |
           ls -la icons
-          for f in icons/icon.icns icons/32x32.png icons/128x128.png icons/icon.ico; do
+          for f in icons/icon.icns icons/icon.png icons/32x32.png icons/128x128.png icons/icon.ico; do
             test -f "$f" || { echo "missing $f"; exit 1; }
           done
       - run: xcodebuild -downloadComponent MetalToolchain
@@ -76,3 +76,45 @@ jobs:
           releaseName: Local AI Router ${{ github.ref_name }}
           releaseDraft: true
           prerelease: false
+          args: --bundles dmg,app
+
+  linux:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+      - run: ./scripts/install-linux-build-deps.sh
+      - run: npm ci
+      - name: Verify bundle icons
+        working-directory: src-tauri
+        run: |
+          for f in icons/icon.png icons/32x32.png icons/128x128.png icons/icon.ico; do
+            test -f "$f" || { echo "missing $f"; exit 1; }
+          done
+      - run: ./scripts/build-sidecars.sh
+      - uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          NO_STRIP: "true"
+          APPIMAGE_EXTRACT_AND_RUN: "1"
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: Local AI Router ${{ github.ref_name }}
+          releaseDraft: true
+          prerelease: false
+          includeUpdaterJson: false
+          args: --bundles deb,appimage --config '{"bundle":{"createUpdaterArtifacts":false}}'
+      - run: ./scripts/package-linux-headless.sh
+      - name: Attach headless archive
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload "${{ github.ref_name }}" \
+            src-tauri/target/release/local-ai-router-linux-headless.tar.gz \
+            --clobber

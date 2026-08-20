@@ -154,8 +154,7 @@ pub fn first_byte_timeout_ms(peer_median_ms: Option<u64>, has_fallback: bool) ->
     peer_median_ms
         .unwrap_or(0)
         .saturating_mul(SLOW_OUTLIER_FACTOR)
-        .max(SLOW_MIN_LATENCY_MS)
-        .min(UPSTREAM_TIMEOUT_MS)
+        .clamp(SLOW_MIN_LATENCY_MS, UPSTREAM_TIMEOUT_MS)
 }
 
 pub fn median_u64(values: &[u64]) -> Option<u64> {

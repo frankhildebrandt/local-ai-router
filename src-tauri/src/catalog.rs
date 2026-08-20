@@ -854,6 +854,26 @@ mod tests {
     use super::*;
 
     #[test]
+    fn mlx_catalog_is_locked_off_apple_silicon() {
+        let platform = mac_compatibility();
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        {
+            assert!(platform.apple_silicon);
+            assert_eq!(platform.compatible, platform.macos_15_plus);
+        }
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        {
+            assert!(!platform.apple_silicon);
+            assert!(!platform.compatible);
+            assert!(platform
+                .reason
+                .as_deref()
+                .unwrap_or("")
+                .contains("Apple Silicon"));
+        }
+    }
+
+    #[test]
     fn ram_classes_use_eighty_and_one_hundred_percent_thresholds() {
         let budget = 10 * 1024 * 1024 * 1024;
         assert_eq!(classify_ram(budget * 80 / 100, budget), RamFit::Fits);

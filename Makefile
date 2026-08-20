@@ -1,4 +1,4 @@
-.PHONY: dev test build build-dmg
+.PHONY: dev test build build-dmg build-linux
 
 dev:
 	npm run tauri dev
@@ -13,3 +13,6 @@ build:
 
 build-dmg:
 	npm run tauri build -- --bundles dmg
+
+build-linux:
+	npm run tauri build -- --bundles appimage,deb
