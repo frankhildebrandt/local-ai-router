@@ -19,10 +19,11 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::{
-    core::{AppCore, InFlightGuard, InFlightRequest},
+    core::{AppCore, InFlightGuard, InFlightProgress, InFlightRequest},
     domain::{
-        first_byte_timeout_ms, is_fallback_status, is_transient_status, supports_capability,
-        RATE_LIMIT_DEFAULT_SECS, SLOW_WINDOW_SECS,
+        can_retry_same_target, first_byte_timeout_ms, is_fallback_status, is_transient_status,
+        supports_capability, RATE_LIMIT_DEFAULT_SECS, SAME_TARGET_RETRY_DELAY_MS,
+        SAME_TARGET_RETRY_LIMIT, SAME_TARGET_RETRY_MAX_WAIT_MS, SLOW_WINDOW_SECS,
     },
     protocol::{
         decode_request, decode_response, encode_request, encode_response, validate_cross_protocol,
@@ -406,6 +407,9 @@ async fn proxy(
             target_id: None,
             target_name: None,
             phase: "trying".into(),
+            attempt: 0,
+            last_error_code: None,
+            last_error_message: None,
         },
     ));
     let cancel = inflight.as_ref().expect("in-flight guard").cancellation();
@@ -432,7 +436,6 @@ async fn proxy(
             },
         );
     }
-    let total_targets = target_ids.len() as i64;
 
     let mut attempts = 0i64;
     let mut last_error: Option<Response<Body>> = None;
@@ -443,8 +446,10 @@ async fn proxy(
     let mut last_capability_error: Option<String> = None;
     let mut previous_failure: Option<(u16, Option<String>)> = None;
     let mut request_logged = false;
-    for target_id in &target_ids {
-        attempts += 1;
+    'hops: for target_id in &target_ids {
+        let has_later_hop = evaluation.has_later_hop(target_id);
+        let is_fallback_hop = evaluation.is_fallback_hop(target_id);
+        let tighten_first_byte = !is_fallback_hop && evaluation.has_later_primary(target_id);
         if evaluation.mode == "adaptive"
             && evaluation.half_open_target_ids.contains(target_id)
             && !core
@@ -453,258 +458,481 @@ async fn proxy(
                 .await
                 .unwrap_or(false)
         {
+            attempts += 1;
             continue;
         }
-        let attempt_started = Instant::now();
-        let Ok(Some(mut target)) = core.store.target(target_id).await else {
-            continue;
-        };
-        inflight
-            .as_ref()
-            .expect("in-flight guard")
-            .update(&target.id, &target.name, "trying");
-        if !target_supports_capability(&target, capability) {
-            last_capability_error =
-                Some("No target in this alias supports the requested capability".into());
-            continue;
-        }
-        if decoded.is_none()
-            && !matches!(
-                target.wire_protocol,
-                WireProtocol::OpenAiChat | WireProtocol::OpenAiResponses
-            )
-        {
-            continue;
-        }
-        let mut canonical = decoded.clone();
-        if let Some(canonical) = canonical.as_mut() {
-            if canonical.reasoning.is_some() && !target_supports_capability(&target, "reasoning") {
-                canonical.reasoning = None;
-            }
-            if canonical.response_format.is_some()
-                && !target_supports_capability(&target, "structured_output")
-            {
-                canonical.response_format = None;
-            }
-            let required = [
-                (is_stream, "streaming"),
-                (!canonical.tools.is_empty(), "tools"),
-                (
-                    canonical
-                        .messages
-                        .iter()
-                        .flat_map(|message| &message.content)
-                        .any(|block| matches!(block, crate::protocol::ContentBlock::Image { .. })),
-                    "vision",
-                ),
-                (
-                    canonical
-                        .messages
-                        .iter()
-                        .flat_map(|message| &message.content)
-                        .any(|block| matches!(block, crate::protocol::ContentBlock::Audio { .. })),
-                    "audio_input",
-                ),
-                (
-                    canonical
-                        .messages
-                        .iter()
-                        .flat_map(|message| &message.content)
-                        .any(|block| matches!(block, crate::protocol::ContentBlock::Video { .. })),
-                    "video_input",
-                ),
-            ];
-            if let Some((_, missing)) = required.into_iter().find(|(needed, capability)| {
-                *needed && !target_supports_capability(&target, capability)
-            }) {
-                last_capability_error =
-                    Some(format!("No target in this alias supports `{missing}`"));
-                continue;
-            }
-        }
-        let tools_for_salvage = canonical
-            .as_ref()
-            .map(|request| request.tools.clone())
-            .unwrap_or_default();
-        let emulation = canonical
-            .as_ref()
-            .map(|request| {
-                crate::tool_emulation::tool_emulation_for(&target, !request.tools.is_empty())
-            })
-            .unwrap_or(crate::tool_emulation::ToolEmulation::None);
-        if emulation == crate::tool_emulation::ToolEmulation::MlxInject {
-            if let Some(request) = canonical.as_mut() {
-                crate::tool_emulation::prepare_mlx_request(request);
-            }
-        }
-        let buffer_emulation = emulation == crate::tool_emulation::ToolEmulation::MlxInject;
-        if matches!(
-            target.kind,
-            crate::domain::TargetKind::Gguf | crate::domain::TargetKind::Mlx
-        ) {
-            if uri.path() == "/v1/images/generations" {
-                if let Some(payload) = json_payload.as_ref() {
-                    if let Err(error) = validate_local_image_request(payload) {
-                        return request_error(
-                            public_protocol,
-                            StatusCode::BAD_REQUEST,
-                            "unsupported_parameter",
-                            &error.to_string(),
-                        );
-                    }
-                }
-            }
-            if uri.path() == "/v1/audio/speech" {
-                if let Some(payload) = json_payload.as_ref() {
-                    if let Err(error) = validate_local_speech_request(payload) {
-                        return request_error(
-                            public_protocol,
-                            StatusCode::BAD_REQUEST,
-                            "unsupported_parameter",
-                            &error.to_string(),
-                        );
-                    }
-                }
-            }
-            if let Some(canonical) = canonical.as_mut() {
-                if let Err(error) =
-                    crate::media::resolve_request_media(&core.client, canonical).await
-                {
-                    return request_error(
-                        public_protocol,
-                        StatusCode::BAD_REQUEST,
-                        "invalid_media",
-                        &error.to_string(),
-                    );
-                }
-            }
-        }
-        if matches!(
-            target.kind,
-            crate::domain::TargetKind::Gguf | crate::domain::TargetKind::Mlx
-        ) && runtimes
-            .as_ref()
-            .is_some_and(|runtimes| !runtimes.is_running(&target.id))
-        {
-            target.runtime_url = None;
-            target.state = "stopped".into();
-            let _ = core.store.upsert_target(&target).await;
-        }
-        if matches!(
-            target.kind,
-            crate::domain::TargetKind::Gguf | crate::domain::TargetKind::Mlx
-        ) && target.runtime_url.is_none()
-        {
-            let auto_load = core
-                .effective_resource_policy(&target)
-                .await
-                .map(|policy| policy.auto_load)
-                .unwrap_or(false);
-            let load = if auto_load {
-                match runtimes.as_ref() {
-                    Some(runtimes) => runtimes.start_resolved(&core.store, &target).await,
-                    None => Err(anyhow::anyhow!("runtime manager unavailable")),
-                }
-            } else {
-                Err(anyhow::anyhow!("automatic loading is disabled"))
+        let mut same_target_attempt = 0u32;
+        'retry: loop {
+            same_target_attempt += 1;
+            attempts += 1;
+            let attempt_started = Instant::now();
+            let Ok(Some(mut target)) = core.store.target(target_id).await else {
+                continue 'hops;
             };
-            match load {
-                Ok(url) => {
-                    target.runtime_url = Some(url);
-                    target.state = "ready".into();
-                    let _ = core.store.upsert_target(&target).await;
-                    if let Some(runtimes) = runtimes.as_ref() {
-                        sync_runtime_states(&core, runtimes).await;
-                    }
+            let phase = if same_target_attempt > 1 {
+                "retrying"
+            } else if previous_failure.is_some() {
+                "rerouting"
+            } else {
+                "trying"
+            };
+            let live_error_code = last_error_detail
+                .as_ref()
+                .and_then(|(_, code, _)| code.clone());
+            let live_error_message = last_error_detail
+                .as_ref()
+                .and_then(|(_, _, message)| message.clone());
+            inflight.as_ref().expect("in-flight guard").apply(
+                InFlightProgress::new(&target.id, &target.name, phase)
+                    .with_attempt(same_target_attempt)
+                    .with_error(live_error_code.as_deref(), live_error_message.as_deref()),
+            );
+            if !target_supports_capability(&target, capability) {
+                last_capability_error =
+                    Some("No target in this alias supports the requested capability".into());
+                continue 'hops;
+            }
+            if decoded.is_none()
+                && !matches!(
+                    target.wire_protocol,
+                    WireProtocol::OpenAiChat | WireProtocol::OpenAiResponses
+                )
+            {
+                continue 'hops;
+            }
+            let mut canonical = decoded.clone();
+            if let Some(canonical) = canonical.as_mut() {
+                if canonical.reasoning.is_some()
+                    && !target_supports_capability(&target, "reasoning")
+                {
+                    canonical.reasoning = None;
                 }
-                Err(error) if attempts < total_targets => {
-                    tracing::warn!(target = %target.id, %error, "local model load failed; trying fallback");
-                    continue;
+                if canonical.response_format.is_some()
+                    && !target_supports_capability(&target, "structured_output")
+                {
+                    canonical.response_format = None;
                 }
-                Err(error) => {
-                    return request_error(
-                        public_protocol,
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        "local_load_failed",
-                        &format!("The local model could not be loaded: {error}"),
-                    );
+                let required = [
+                    (is_stream, "streaming"),
+                    (!canonical.tools.is_empty(), "tools"),
+                    (
+                        canonical
+                            .messages
+                            .iter()
+                            .flat_map(|message| &message.content)
+                            .any(|block| {
+                                matches!(block, crate::protocol::ContentBlock::Image { .. })
+                            }),
+                        "vision",
+                    ),
+                    (
+                        canonical
+                            .messages
+                            .iter()
+                            .flat_map(|message| &message.content)
+                            .any(|block| {
+                                matches!(block, crate::protocol::ContentBlock::Audio { .. })
+                            }),
+                        "audio_input",
+                    ),
+                    (
+                        canonical
+                            .messages
+                            .iter()
+                            .flat_map(|message| &message.content)
+                            .any(|block| {
+                                matches!(block, crate::protocol::ContentBlock::Video { .. })
+                            }),
+                        "video_input",
+                    ),
+                ];
+                if let Some((_, missing)) = required.into_iter().find(|(needed, capability)| {
+                    *needed && !target_supports_capability(&target, capability)
+                }) {
+                    last_capability_error =
+                        Some(format!("No target in this alias supports `{missing}`"));
+                    continue 'hops;
                 }
             }
-        }
-        let local_permit = tokio::select! {
-            result = core.acquire_local_slot(&target) => match result {
-                Ok(permit) => permit,
-                Err(error) if attempts < total_targets => {
-                    tracing::warn!(target = %target.id, %error, "local admission failed; trying fallback");
-                    continue;
+            let tools_for_salvage = canonical
+                .as_ref()
+                .map(|request| request.tools.clone())
+                .unwrap_or_default();
+            let emulation = canonical
+                .as_ref()
+                .map(|request| {
+                    crate::tool_emulation::tool_emulation_for(&target, !request.tools.is_empty())
+                })
+                .unwrap_or(crate::tool_emulation::ToolEmulation::None);
+            if emulation == crate::tool_emulation::ToolEmulation::MlxInject {
+                if let Some(request) = canonical.as_mut() {
+                    crate::tool_emulation::prepare_mlx_request(request);
                 }
-                Err(error) => {
-                    return request_error(
+            }
+            let buffer_emulation = emulation == crate::tool_emulation::ToolEmulation::MlxInject;
+            if matches!(
+                target.kind,
+                crate::domain::TargetKind::Gguf | crate::domain::TargetKind::Mlx
+            ) {
+                if uri.path() == "/v1/images/generations" {
+                    if let Some(payload) = json_payload.as_ref() {
+                        if let Err(error) = validate_local_image_request(payload) {
+                            return request_error(
+                                public_protocol,
+                                StatusCode::BAD_REQUEST,
+                                "unsupported_parameter",
+                                &error.to_string(),
+                            );
+                        }
+                    }
+                }
+                if uri.path() == "/v1/audio/speech" {
+                    if let Some(payload) = json_payload.as_ref() {
+                        if let Err(error) = validate_local_speech_request(payload) {
+                            return request_error(
+                                public_protocol,
+                                StatusCode::BAD_REQUEST,
+                                "unsupported_parameter",
+                                &error.to_string(),
+                            );
+                        }
+                    }
+                }
+                if let Some(canonical) = canonical.as_mut() {
+                    if let Err(error) =
+                        crate::media::resolve_request_media(&core.client, canonical).await
+                    {
+                        return request_error(
+                            public_protocol,
+                            StatusCode::BAD_REQUEST,
+                            "invalid_media",
+                            &error.to_string(),
+                        );
+                    }
+                }
+            }
+            if matches!(
+                target.kind,
+                crate::domain::TargetKind::Gguf | crate::domain::TargetKind::Mlx
+            ) && runtimes
+                .as_ref()
+                .is_some_and(|runtimes| !runtimes.is_running(&target.id))
+            {
+                target.runtime_url = None;
+                target.state = "stopped".into();
+                let _ = core.store.upsert_target(&target).await;
+            }
+            if matches!(
+                target.kind,
+                crate::domain::TargetKind::Gguf | crate::domain::TargetKind::Mlx
+            ) && target.runtime_url.is_none()
+            {
+                let auto_load = core
+                    .effective_resource_policy(&target)
+                    .await
+                    .map(|policy| policy.auto_load)
+                    .unwrap_or(false);
+                let load = if auto_load {
+                    match runtimes.as_ref() {
+                        Some(runtimes) => runtimes.start_resolved(&core.store, &target).await,
+                        None => Err(anyhow::anyhow!("runtime manager unavailable")),
+                    }
+                } else {
+                    Err(anyhow::anyhow!("automatic loading is disabled"))
+                };
+                match load {
+                    Ok(url) => {
+                        target.runtime_url = Some(url);
+                        target.state = "ready".into();
+                        let _ = core.store.upsert_target(&target).await;
+                        if let Some(runtimes) = runtimes.as_ref() {
+                            sync_runtime_states(&core, runtimes).await;
+                        }
+                    }
+                    Err(error) => {
+                        tracing::warn!(target = %target.id, %error, "local model load failed");
+                        let message = format!("The local model could not be loaded: {error}");
+                        record_skipped_hop(
+                            &core,
+                            &evaluation,
+                            &request_id,
+                            &target.id,
+                            attempt_started,
+                            is_stream,
+                            &mut previous_failure,
+                            503,
+                            "local_load_failed",
+                            message.clone(),
+                            same_target_attempt,
+                        )
+                        .await;
+                        last_error = Some(request_error(
+                            public_protocol,
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "local_load_failed",
+                            &message,
+                        ));
+                        last_error_target_id = Some(target.id.clone());
+                        last_error_target_name = Some(target.name.clone());
+                        last_error_detail =
+                            Some((503, Some("local_load_failed".into()), Some(message.clone())));
+                        match recover_failed_hop(
+                            &cancel,
+                            FailedHop {
+                                inflight: inflight.as_ref(),
+                                target_id: &target.id,
+                                target_name: &target.name,
+                                status: 503,
+                                error_code: Some("local_load_failed"),
+                                error_message: Some(&message),
+                                same_target_attempt,
+                                has_later_hop,
+                                retry_after_until: None,
+                            },
+                        )
+                        .await
+                        {
+                            HopRecovery::RetrySame => continue 'retry,
+                            HopRecovery::NextHop => continue 'hops,
+                            HopRecovery::Cancelled => {
+                                return cancelled_proxy_response(
+                                    &core,
+                                    public_protocol,
+                                    &request_id,
+                                    &api_key_id,
+                                    uri.path(),
+                                    &alias,
+                                    Some(&target.name),
+                                    attempts,
+                                    started,
+                                )
+                                .await;
+                            }
+                            HopRecovery::Exhausted => {
+                                return request_error(
+                                    public_protocol,
+                                    StatusCode::SERVICE_UNAVAILABLE,
+                                    "local_load_failed",
+                                    &message,
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            let local_permit = tokio::select! {
+                result = core.acquire_local_slot(&target) => match result {
+                    Ok(permit) => permit,
+                    Err(error) => {
+                        tracing::warn!(target = %target.id, %error, "local admission failed");
+                        let message = format!("The local model could not admit the request: {error}");
+                        record_skipped_hop(
+                            &core,
+                            &evaluation,
+                            &request_id,
+                            &target.id,
+                            attempt_started,
+                            is_stream,
+                            &mut previous_failure,
+                            503,
+                            "local_busy",
+                            message.clone(),
+                            same_target_attempt,
+                        )
+                        .await;
+                        last_error = Some(request_error(
+                            public_protocol,
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "local_busy",
+                            &message,
+                        ));
+                        last_error_target_id = Some(target.id.clone());
+                        last_error_target_name = Some(target.name.clone());
+                        last_error_detail =
+                            Some((503, Some("local_busy".into()), Some(message.clone())));
+                        match recover_failed_hop(
+                            &cancel,
+                            FailedHop {
+                                inflight: inflight.as_ref(),
+                                target_id: &target.id,
+                                target_name: &target.name,
+                                status: 503,
+                                error_code: Some("local_busy"),
+                                error_message: Some(&message),
+                                same_target_attempt,
+                                has_later_hop,
+                                retry_after_until: None,
+                            },
+                        )
+                        .await
+                        {
+                            HopRecovery::RetrySame => continue 'retry,
+                            HopRecovery::NextHop => continue 'hops,
+                            HopRecovery::Cancelled => {
+                                return cancelled_proxy_response(
+                                    &core,
+                                    public_protocol,
+                                    &request_id,
+                                    &api_key_id,
+                                    uri.path(),
+                                    &alias,
+                                    Some(&target.name),
+                                    attempts,
+                                    started,
+                                )
+                                .await;
+                            }
+                            HopRecovery::Exhausted => {
+                                return request_error(
+                                    public_protocol,
+                                    StatusCode::SERVICE_UNAVAILABLE,
+                                    "local_busy",
+                                    &message,
+                                )
+                            }
+                        }
+                    }
+                },
+                _ = cancel.cancelled() => {
+                    return cancelled_proxy_response(
+                        &core,
                         public_protocol,
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        "local_busy",
-                        &format!("The local model could not admit the request: {error}"),
+                        &request_id,
+                        &api_key_id,
+                        uri.path(),
+                        &alias,
+                        Some(&target.name),
+                        attempts,
+                        started,
                     )
+                    .await;
                 }
-            },
-            _ = cancel.cancelled() => {
-                return cancelled_proxy_response(
+            };
+            let Ok((base_url, credential, account_id)) = core.target_endpoint(&target).await else {
+                record_skipped_hop(
                     &core,
-                    public_protocol,
+                    &evaluation,
                     &request_id,
-                    &api_key_id,
-                    uri.path(),
-                    &alias,
-                    Some(&target.name),
-                    attempts,
-                    started,
+                    &target.id,
+                    attempt_started,
+                    is_stream,
+                    &mut previous_failure,
+                    502,
+                    "upstream_unavailable",
+                    "The selected backend could not be reached".into(),
+                    same_target_attempt,
                 )
                 .await;
-            }
-        };
-        let Ok((base_url, credential, account_id)) = core.target_endpoint(&target).await else {
-            continue;
-        };
-        let kv_context = if matches!(
-            target.kind,
-            crate::domain::TargetKind::Gguf | crate::domain::TargetKind::Mlx
-        ) {
-            match (runtimes.as_ref(), session_id.as_deref()) {
-                (Some(runtimes), Some(session_id)) => {
-                    if let Err(error) = runtimes.restore_kv(&target, &api_key_id, session_id).await
-                    {
-                        tracing::warn!(target = %target.id, %error, "discarding unusable KV snapshot");
+                last_error = Some(request_error(
+                    public_protocol,
+                    StatusCode::BAD_GATEWAY,
+                    "upstream_unavailable",
+                    "The selected backend could not be reached",
+                ));
+                last_error_target_id = Some(target.id.clone());
+                last_error_target_name = Some(target.name.clone());
+                last_error_detail = Some((
+                    502,
+                    Some("upstream_unavailable".into()),
+                    Some("The selected backend could not be reached".into()),
+                ));
+                match recover_failed_hop(
+                    &cancel,
+                    FailedHop {
+                        inflight: inflight.as_ref(),
+                        target_id: &target.id,
+                        target_name: &target.name,
+                        status: 502,
+                        error_code: Some("upstream_unavailable"),
+                        error_message: Some("The selected backend could not be reached"),
+                        same_target_attempt,
+                        has_later_hop,
+                        retry_after_until: None,
+                    },
+                )
+                .await
+                {
+                    HopRecovery::RetrySame => continue 'retry,
+                    HopRecovery::NextHop => continue 'hops,
+                    HopRecovery::Cancelled => {
+                        return cancelled_proxy_response(
+                            &core,
+                            public_protocol,
+                            &request_id,
+                            &api_key_id,
+                            uri.path(),
+                            &alias,
+                            Some(&target.name),
+                            attempts,
+                            started,
+                        )
+                        .await;
                     }
-                    Some((
-                        runtimes.clone(),
-                        target.clone(),
-                        api_key_id.clone(),
-                        session_id.to_owned(),
-                    ))
+                    HopRecovery::Exhausted => {
+                        request_logged = true;
+                        log_request(
+                            &core,
+                            LogMetadata {
+                                id: &request_id,
+                                api_key_id: &api_key_id,
+                                endpoint: uri.path(),
+                                alias: Some(&alias),
+                                target: Some(&target.name),
+                                attempts,
+                                status: 502,
+                                latency_ms: started.elapsed().as_millis() as i64,
+                                usage: TokenUsage::default(),
+                                error_code: Some("upstream_unavailable"),
+                                error_message: Some("The selected backend could not be reached"),
+                            },
+                        )
+                        .await;
+                        continue 'hops;
+                    }
                 }
-                _ => None,
-            }
-        } else {
-            None
-        };
-        let provider = if let Some(provider_id) = target.provider_id.as_deref() {
-            core.store.provider(provider_id).await.ok().flatten()
-        } else {
-            None
-        };
-        let upstream_path = if provider
-            .as_ref()
-            .is_some_and(|provider| provider.preset_id == "openai_subscription")
-            && canonical.is_some()
-        {
-            "/responses".into()
-        } else if canonical.is_some() {
-            text_upstream_path(target.wire_protocol, &target.provider_model, is_stream)
-        } else {
-            uri.path().to_owned()
-        };
-        let upstream_url =
-            if target.wire_protocol == WireProtocol::GeminiGenerateContent && canonical.is_some() {
+            };
+            let kv_context = if matches!(
+                target.kind,
+                crate::domain::TargetKind::Gguf | crate::domain::TargetKind::Mlx
+            ) {
+                match (runtimes.as_ref(), session_id.as_deref()) {
+                    (Some(runtimes), Some(session_id)) => {
+                        if let Err(error) =
+                            runtimes.restore_kv(&target, &api_key_id, session_id).await
+                        {
+                            tracing::warn!(target = %target.id, %error, "discarding unusable KV snapshot");
+                        }
+                        Some((
+                            runtimes.clone(),
+                            target.clone(),
+                            api_key_id.clone(),
+                            session_id.to_owned(),
+                        ))
+                    }
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            let provider = if let Some(provider_id) = target.provider_id.as_deref() {
+                core.store.provider(provider_id).await.ok().flatten()
+            } else {
+                None
+            };
+            let upstream_path = if provider
+                .as_ref()
+                .is_some_and(|provider| provider.preset_id == "openai_subscription")
+                && canonical.is_some()
+            {
+                "/responses".into()
+            } else if canonical.is_some() {
+                text_upstream_path(target.wire_protocol, &target.provider_model, is_stream)
+            } else {
+                uri.path().to_owned()
+            };
+            let upstream_url = if target.wire_protocol == WireProtocol::GeminiGenerateContent
+                && canonical.is_some()
+            {
                 format!(
                     "{}/{}",
                     base_url.trim_end_matches('/'),
@@ -713,496 +941,531 @@ async fn proxy(
             } else {
                 join_api_url(&base_url, &upstream_path)
             };
-        let mut request = core.client.post(upstream_url);
-        if let Some(payload) = json_payload.as_mut() {
-            let mut outbound = if let Some(canonical) = canonical.as_ref() {
-                let protocol = public_protocol.unwrap();
-                if !matches!(
-                    target.kind,
-                    crate::domain::TargetKind::Gguf | crate::domain::TargetKind::Mlx
-                ) && protocol_matches(protocol, target.wire_protocol)
-                {
-                    let mut native = payload.clone();
-                    if protocol != PublicProtocol::Gemini {
-                        native["model"] = Value::String(target.provider_model.clone());
+            let mut request = core.client.post(upstream_url);
+            if let Some(payload) = json_payload.as_mut() {
+                let mut outbound = if let Some(canonical) = canonical.as_ref() {
+                    let protocol = public_protocol.unwrap();
+                    if !matches!(
+                        target.kind,
+                        crate::domain::TargetKind::Gguf | crate::domain::TargetKind::Mlx
+                    ) && protocol_matches(protocol, target.wire_protocol)
+                    {
+                        let mut native = payload.clone();
+                        if protocol != PublicProtocol::Gemini {
+                            native["model"] = Value::String(target.provider_model.clone());
+                        }
+                        native
+                    } else {
+                        if !protocol_matches(protocol, target.wire_protocol) {
+                            if let Err(error) = validate_cross_protocol(protocol, payload) {
+                                last_translation_error = Some(error.to_string());
+                                continue 'hops;
+                            }
+                        }
+                        match encode_request(
+                            target.wire_protocol,
+                            canonical,
+                            &target.provider_model,
+                        ) {
+                            Ok(value) => value,
+                            Err(error) => {
+                                last_translation_error = Some(error.to_string());
+                                continue 'hops;
+                            }
+                        }
                     }
-                    native
                 } else {
-                    if !protocol_matches(protocol, target.wire_protocol) {
-                        if let Err(error) = validate_cross_protocol(protocol, payload) {
-                            last_translation_error = Some(error.to_string());
-                            continue;
-                        }
-                    }
-                    match encode_request(target.wire_protocol, canonical, &target.provider_model) {
-                        Ok(value) => value,
-                        Err(error) => {
-                            last_translation_error = Some(error.to_string());
-                            continue;
-                        }
-                    }
+                    payload["model"] = Value::String(target.provider_model.clone());
+                    payload.clone()
+                };
+                if buffer_emulation {
+                    crate::tool_emulation::strip_unsupported_mlx_fields(&mut outbound);
                 }
+                request = request.json(&outbound);
             } else {
-                payload["model"] = Value::String(target.provider_model.clone());
-                payload.clone()
-            };
-            if buffer_emulation {
-                crate::tool_emulation::strip_unsupported_mlx_fields(&mut outbound);
+                request = request
+                    .header(header::CONTENT_TYPE, content_type)
+                    .body(rewrite_multipart_model(&body, &target.provider_model));
             }
-            request = request.json(&outbound);
-        } else {
-            request = request
-                .header(header::CONTENT_TYPE, content_type)
-                .body(rewrite_multipart_model(&body, &target.provider_model));
-        }
-        if let Some(credential) = credential {
-            request = match provider
+            if let Some(credential) = credential {
+                request = match provider
+                    .as_ref()
+                    .and_then(|provider| provider_preset(&provider.preset_id))
+                    .map(|preset| preset.auth_scheme)
+                    .unwrap_or(AuthScheme::Bearer)
+                {
+                    AuthScheme::Bearer => request.bearer_auth(credential),
+                    AuthScheme::XApiKey => request
+                        .header("x-api-key", credential)
+                        .header("anthropic-version", "2023-06-01"),
+                    AuthScheme::XGoogApiKey => request.header("x-goog-api-key", credential),
+                    AuthScheme::OpenAiSubscription => request
+                        .bearer_auth(credential)
+                        .header("originator", "local_ai_router")
+                        .header("OpenAI-Beta", "responses=experimental"),
+                };
+            }
+            if let Some(account_id) = account_id {
+                request = request.header("ChatGPT-Account-Id", account_id);
+            }
+            if target.wire_protocol == WireProtocol::AnthropicMessages {
+                request = request.header("anthropic-version", "2023-06-01");
+            }
+            let is_openrouter = provider
                 .as_ref()
-                .and_then(|provider| provider_preset(&provider.preset_id))
-                .map(|preset| preset.auth_scheme)
-                .unwrap_or(AuthScheme::Bearer)
-            {
-                AuthScheme::Bearer => request.bearer_auth(credential),
-                AuthScheme::XApiKey => request
-                    .header("x-api-key", credential)
-                    .header("anthropic-version", "2023-06-01"),
-                AuthScheme::XGoogApiKey => request.header("x-goog-api-key", credential),
-                AuthScheme::OpenAiSubscription => request
-                    .bearer_auth(credential)
-                    .header("originator", "local_ai_router")
-                    .header("OpenAI-Beta", "responses=experimental"),
-            };
-        }
-        if let Some(account_id) = account_id {
-            request = request.header("ChatGPT-Account-Id", account_id);
-        }
-        if target.wire_protocol == WireProtocol::AnthropicMessages {
-            request = request.header("anthropic-version", "2023-06-01");
-        }
-        let is_openrouter = provider
-            .as_ref()
-            .is_some_and(|provider| provider.preset_id == "openrouter");
-        if target.kind == crate::domain::TargetKind::Mlx {
-            request = request.header("x-local-ai-cache-namespace", &api_key_id);
-            if let Some(session_id) = session_id.as_deref() {
-                request = request.header("x-local-ai-session", session_id);
+                .is_some_and(|provider| provider.preset_id == "openrouter");
+            if target.kind == crate::domain::TargetKind::Mlx {
+                request = request.header("x-local-ai-cache-namespace", &api_key_id);
+                if let Some(session_id) = session_id.as_deref() {
+                    request = request.header("x-local-ai-session", session_id);
+                }
             }
-        }
-        if is_openrouter {
-            request = request
-                .header("HTTP-Referer", "https://local-ai-router.app")
-                .header("X-Title", "Local AI Router");
-        }
-        let has_fallback = attempts < total_targets;
-        let attempt_timeout = Duration::from_millis(first_byte_timeout_ms(
-            evaluation.peer_latency_ms,
-            has_fallback,
-        ));
-        match wait_with_timeout_or_cancel(attempt_timeout, &cancel, request.send()).await {
-            WaitOutcome::Cancelled => {
-                return cancelled_proxy_response(
-                    &core,
-                    public_protocol,
-                    &request_id,
-                    &api_key_id,
-                    uri.path(),
-                    &alias,
-                    Some(&target.name),
-                    attempts,
-                    started,
-                )
-                .await;
+            if is_openrouter {
+                request = request
+                    .header("HTTP-Referer", "https://local-ai-router.app")
+                    .header("X-Title", "Local AI Router");
             }
-            WaitOutcome::Ready(Ok(upstream)) => {
-                let status = upstream.status();
-                let retry_after_until = rate_limit_until(upstream.headers(), status.as_u16());
-                if status.is_redirection() {
-                    log_request(
+            let attempt_timeout = Duration::from_millis(first_byte_timeout_ms(
+                evaluation.peer_latency_ms,
+                tighten_first_byte,
+            ));
+            match wait_with_timeout_or_cancel(attempt_timeout, &cancel, request.send()).await {
+                WaitOutcome::Cancelled => {
+                    return cancelled_proxy_response(
                         &core,
-                        LogMetadata {
-                            id: &request_id,
-                            api_key_id: &api_key_id,
-                            endpoint: uri.path(),
-                            alias: Some(&alias),
-                            target: Some(&target.name),
-                            attempts,
-                            status: 502,
-                            latency_ms: started.elapsed().as_millis() as i64,
-                            usage: TokenUsage::default(),
-                            error_code: Some("credential_redirect_rejected"),
-                            error_message: Some("The upstream attempted an unexpected redirect"),
-                        },
+                        public_protocol,
+                        &request_id,
+                        &api_key_id,
+                        uri.path(),
+                        &alias,
+                        Some(&target.name),
+                        attempts,
+                        started,
                     )
                     .await;
-                    return protocol_error(
-                        public_protocol.unwrap_or(PublicProtocol::OpenAiChat),
-                        StatusCode::BAD_GATEWAY,
-                        "credential_redirect_rejected",
-                        "The upstream attempted an unexpected redirect",
-                    );
                 }
-                let mut usage = TokenUsage::default();
-                let mut error_code = None;
-                let mut error_message = None;
-                let mut attempt_ttft = None;
-                let response = if is_stream && !buffer_emulation && status.is_success() {
-                    let translated_stream = public_protocol
-                        .filter(|protocol| !protocol_matches(*protocol, target.wire_protocol));
-                    let content_type = if translated_stream.is_some() {
-                        Some(HeaderValue::from_static("text/event-stream"))
-                    } else {
-                        upstream.headers().get(header::CONTENT_TYPE).cloned()
-                    };
-                    let mut upstream_stream = upstream.bytes_stream();
-                    let first_chunk = match wait_with_timeout_or_cancel(
-                        attempt_timeout,
-                        &cancel,
-                        upstream_stream.next(),
-                    )
-                    .await
-                    {
-                        WaitOutcome::Cancelled => {
-                            return cancelled_proxy_response(
-                                &core,
-                                public_protocol,
-                                &request_id,
-                                &api_key_id,
-                                uri.path(),
-                                &alias,
-                                Some(&target.name),
+                WaitOutcome::Ready(Ok(upstream)) => {
+                    let status = upstream.status();
+                    let retry_after_until = rate_limit_until(upstream.headers(), status.as_u16());
+                    if status.is_redirection() {
+                        log_request(
+                            &core,
+                            LogMetadata {
+                                id: &request_id,
+                                api_key_id: &api_key_id,
+                                endpoint: uri.path(),
+                                alias: Some(&alias),
+                                target: Some(&target.name),
                                 attempts,
-                                started,
-                            )
-                            .await;
-                        }
-                        WaitOutcome::Ready(Some(Ok(chunk))) => chunk,
-                        WaitOutcome::Ready(Some(Err(_)))
-                        | WaitOutcome::Ready(None)
-                        | WaitOutcome::Timeout
-                            if has_fallback =>
-                        {
-                            let mut outcome = RoutingAttemptOutcome::from_previous(
-                                504,
-                                attempt_started.elapsed(),
-                                true,
-                                previous_failure.as_ref(),
-                            );
-                            outcome.retry_after_until =
-                                Some(Utc::now() + chrono::Duration::seconds(SLOW_WINDOW_SECS));
-                            outcome.error_code = Some("timeout".into());
-                            outcome.error_message =
-                                Some("The upstream stream ended before producing data".into());
-                            record_routing_attempt(
-                                &core,
-                                &evaluation,
-                                &request_id,
-                                &target.id,
-                                outcome,
-                            )
-                            .await;
-                            previous_failure = Some((504, Some("timeout".into())));
-                            continue;
-                        }
-                        WaitOutcome::Ready(Some(Err(_)))
-                        | WaitOutcome::Ready(None)
-                        | WaitOutcome::Timeout => {
-                            let outcome = RoutingAttemptOutcome {
-                                error_code: Some("upstream_stream_error".into()),
+                                status: 502,
+                                latency_ms: started.elapsed().as_millis() as i64,
+                                usage: TokenUsage::default(),
+                                error_code: Some("credential_redirect_rejected"),
                                 error_message: Some(
-                                    "The upstream stream ended before producing data".into(),
+                                    "The upstream attempted an unexpected redirect",
                                 ),
-                                ..RoutingAttemptOutcome::from_previous(
-                                    502,
+                            },
+                        )
+                        .await;
+                        return protocol_error(
+                            public_protocol.unwrap_or(PublicProtocol::OpenAiChat),
+                            StatusCode::BAD_GATEWAY,
+                            "credential_redirect_rejected",
+                            "The upstream attempted an unexpected redirect",
+                        );
+                    }
+                    let mut usage = TokenUsage::default();
+                    let mut error_code = None;
+                    let mut error_message = None;
+                    let mut attempt_ttft = None;
+                    let response = if is_stream && !buffer_emulation && status.is_success() {
+                        let translated_stream = public_protocol
+                            .filter(|protocol| !protocol_matches(*protocol, target.wire_protocol));
+                        let content_type = if translated_stream.is_some() {
+                            Some(HeaderValue::from_static("text/event-stream"))
+                        } else {
+                            upstream.headers().get(header::CONTENT_TYPE).cloned()
+                        };
+                        let mut upstream_stream = upstream.bytes_stream();
+                        let first_chunk = match wait_with_timeout_or_cancel(
+                            attempt_timeout,
+                            &cancel,
+                            upstream_stream.next(),
+                        )
+                        .await
+                        {
+                            WaitOutcome::Cancelled => {
+                                return cancelled_proxy_response(
+                                    &core,
+                                    public_protocol,
+                                    &request_id,
+                                    &api_key_id,
+                                    uri.path(),
+                                    &alias,
+                                    Some(&target.name),
+                                    attempts,
+                                    started,
+                                )
+                                .await;
+                            }
+                            WaitOutcome::Ready(Some(Ok(chunk))) => chunk,
+                            WaitOutcome::Ready(Some(Err(_)))
+                            | WaitOutcome::Ready(None)
+                            | WaitOutcome::Timeout => {
+                                let (status, error_code, client_code) = if has_later_hop {
+                                    (504, "timeout", "timeout")
+                                } else {
+                                    (502, "upstream_stream_error", "upstream_stream_error")
+                                };
+                                let message = "The upstream stream ended before producing data";
+                                let mut outcome = RoutingAttemptOutcome::from_previous(
+                                    status,
                                     attempt_started.elapsed(),
                                     true,
                                     previous_failure.as_ref(),
                                 )
-                            };
-                            record_routing_attempt(
-                                &core,
-                                &evaluation,
-                                &request_id,
-                                &target.id,
-                                outcome,
-                            )
-                            .await;
-                            last_error = Some(request_error(
-                                public_protocol,
-                                StatusCode::BAD_GATEWAY,
-                                "upstream_stream_error",
-                                "The upstream stream ended before producing data",
-                            ));
-                            last_error_target_id = Some(target.id.clone());
-                            last_error_target_name = Some(target.name.clone());
-                            last_error_detail = Some((
-                                502,
-                                Some("upstream_stream_error".into()),
-                                Some("The upstream stream ended before producing data".into()),
-                            ));
-                            continue;
-                        }
-                    };
-                    attempt_ttft = Some(attempt_started.elapsed());
-                    inflight.as_ref().expect("in-flight guard").update(
-                        &target.id,
-                        &target.name,
-                        "streaming",
-                    );
-                    let stream_guard = inflight.take().expect("in-flight guard");
-                    let stream_core = core.clone();
-                    let stream_request_id = request_id.clone();
-                    let stream_model = alias.clone();
-                    let stream_wire_protocol = target.wire_protocol;
-                    let stream_kv = kv_context.clone();
-                    let stream_runtimes = runtimes.clone();
-                    let stream_evaluation = evaluation.clone();
-                    let stream_target_id = target.id.clone();
-                    let stream_attempt_started = attempt_started;
-                    let stream_ttft = attempt_ttft;
-                    let stream_previous = previous_failure.clone();
-                    let stream_cancel = cancel.clone();
-                    let stream = async_stream::stream! {
-                        let _inflight = stream_guard;
-                        let _permit = local_permit;
-                        let mut stream_ok = true;
-                        let mut usage_buffer = Vec::new();
-                        let mut translator = translated_stream.map(|protocol| StreamTranslator::new(stream_wire_protocol, protocol, &stream_model));
-                        if let Some(usage) = extract_sse_usage(&mut usage_buffer, &first_chunk) {
-                            let _ = stream_core.store.update_log_usage(&stream_request_id, usage).await;
-                        }
-                        let first_output = translator.as_mut().map(|translator| Bytes::from(translator.push(&first_chunk))).unwrap_or(first_chunk);
-                        if !first_output.is_empty() { yield Ok::<_, std::io::Error>(first_output); }
-                        loop {
-                            let chunk = tokio::select! {
-                                chunk = upstream_stream.next() => chunk,
-                                _ = stream_cancel.cancelled() => {
-                                    stream_ok = false;
-                                    break;
+                                .with_same_target_attempt(same_target_attempt);
+                                if !can_retry_same_target(status, same_target_attempt) {
+                                    outcome.retry_after_until =
+                                        slow_skip_until(is_fallback_hop, has_later_hop);
                                 }
-                            };
-                            match chunk {
-                                Some(Ok(chunk)) => {
-                                    if let Some(usage) = extract_sse_usage(&mut usage_buffer, &chunk) {
-                                        let _ = stream_core.store.update_log_usage(&stream_request_id, usage).await;
+                                outcome.error_code = Some(error_code.into());
+                                outcome.error_message = Some(message.into());
+                                record_routing_attempt(
+                                    &core,
+                                    &evaluation,
+                                    &request_id,
+                                    &target.id,
+                                    outcome,
+                                )
+                                .await;
+                                last_error = Some(request_error(
+                                    public_protocol,
+                                    StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY),
+                                    client_code,
+                                    message,
+                                ));
+                                last_error_target_id = Some(target.id.clone());
+                                last_error_target_name = Some(target.name.clone());
+                                last_error_detail =
+                                    Some((status, Some(error_code.into()), Some(message.into())));
+                                previous_failure = Some((status, Some(error_code.into())));
+                                match recover_failed_hop(
+                                    &cancel,
+                                    FailedHop {
+                                        inflight: inflight.as_ref(),
+                                        target_id: &target.id,
+                                        target_name: &target.name,
+                                        status,
+                                        error_code: Some(error_code),
+                                        error_message: Some(message),
+                                        same_target_attempt,
+                                        has_later_hop,
+                                        retry_after_until: None,
+                                    },
+                                )
+                                .await
+                                {
+                                    HopRecovery::RetrySame => continue 'retry,
+                                    HopRecovery::NextHop | HopRecovery::Exhausted => continue 'hops,
+                                    HopRecovery::Cancelled => {
+                                        return cancelled_proxy_response(
+                                            &core,
+                                            public_protocol,
+                                            &request_id,
+                                            &api_key_id,
+                                            uri.path(),
+                                            &alias,
+                                            Some(&target.name),
+                                            attempts,
+                                            started,
+                                        )
+                                        .await;
                                     }
-                                    let output = translator.as_mut().map(|translator| Bytes::from(translator.push(&chunk))).unwrap_or(chunk);
-                                    if !output.is_empty() { yield Ok(output); }
-                                }
-                                Some(Err(error)) => {
-                                    stream_ok = false;
-                                    let mut outcome = RoutingAttemptOutcome::from_previous(
-                                        502,
-                                        stream_attempt_started.elapsed(),
-                                        true,
-                                        stream_previous.as_ref(),
-                                    );
-                                    outcome.ttft = stream_ttft;
-                                    outcome.error_code = Some("upstream_stream_error".into());
-                                    outcome.error_message = Some("The upstream stream failed after the first chunk".into());
-                                    record_routing_attempt(
-                                        &stream_core,
-                                        &stream_evaluation,
-                                        &stream_request_id,
-                                        &stream_target_id,
-                                        outcome,
-                                    ).await;
-                                    yield Err(std::io::Error::other(error));
-                                    break;
-                                }
-                                None => break,
-                            }
-                        }
-                        if stream_ok {
-                            if let Some((runtimes, target, api_key_id, session_id)) = stream_kv {
-                                if let Err(error) = runtimes.save_kv(&target, &api_key_id, &session_id).await {
-                                    tracing::warn!(target = %target.id, %error, "KV snapshot save failed");
                                 }
                             }
-                            let mut outcome = RoutingAttemptOutcome::from_previous(
-                                status.as_u16(),
-                                stream_attempt_started.elapsed(),
-                                true,
-                                stream_previous.as_ref(),
-                            );
-                            outcome.ttft = stream_ttft;
-                            record_routing_attempt(
-                                &stream_core,
-                                &stream_evaluation,
-                                &stream_request_id,
-                                &stream_target_id,
-                                outcome,
-                            ).await;
+                        };
+                        attempt_ttft = Some(attempt_started.elapsed());
+                        inflight.as_ref().expect("in-flight guard").apply(
+                            InFlightProgress::new(&target.id, &target.name, "streaming")
+                                .with_attempt(same_target_attempt)
+                                .with_error(
+                                    live_error_code.as_deref(),
+                                    live_error_message.as_deref(),
+                                ),
+                        );
+                        let stream_guard = inflight.take().expect("in-flight guard");
+                        let stream_core = core.clone();
+                        let stream_request_id = request_id.clone();
+                        let stream_model = alias.clone();
+                        let stream_wire_protocol = target.wire_protocol;
+                        let stream_kv = kv_context.clone();
+                        let stream_runtimes = runtimes.clone();
+                        let stream_evaluation = evaluation.clone();
+                        let stream_target_id = target.id.clone();
+                        let stream_attempt_started = attempt_started;
+                        let stream_ttft = attempt_ttft;
+                        let stream_previous = previous_failure.clone();
+                        let stream_cancel = cancel.clone();
+                        let stream = async_stream::stream! {
+                            let _inflight = stream_guard;
+                            let _permit = local_permit;
+                            let mut stream_ok = true;
+                            let mut usage_buffer = Vec::new();
+                            let mut translator = translated_stream.map(|protocol| StreamTranslator::new(stream_wire_protocol, protocol, &stream_model));
+                            if let Some(usage) = extract_sse_usage(&mut usage_buffer, &first_chunk) {
+                                let _ = stream_core.store.update_log_usage(&stream_request_id, usage).await;
+                            }
+                            let first_output = translator.as_mut().map(|translator| Bytes::from(translator.push(&first_chunk))).unwrap_or(first_chunk);
+                            if !first_output.is_empty() { yield Ok::<_, std::io::Error>(first_output); }
+                            loop {
+                                let chunk = tokio::select! {
+                                    chunk = upstream_stream.next() => chunk,
+                                    _ = stream_cancel.cancelled() => {
+                                        stream_ok = false;
+                                        break;
+                                    }
+                                };
+                                match chunk {
+                                    Some(Ok(chunk)) => {
+                                        if let Some(usage) = extract_sse_usage(&mut usage_buffer, &chunk) {
+                                            let _ = stream_core.store.update_log_usage(&stream_request_id, usage).await;
+                                        }
+                                        let output = translator.as_mut().map(|translator| Bytes::from(translator.push(&chunk))).unwrap_or(chunk);
+                                        if !output.is_empty() { yield Ok(output); }
+                                    }
+                                    Some(Err(error)) => {
+                                        stream_ok = false;
+                                        let mut outcome = RoutingAttemptOutcome::from_previous(
+                                            502,
+                                            stream_attempt_started.elapsed(),
+                                            true,
+                                            stream_previous.as_ref(),
+                                        );
+                                        outcome.ttft = stream_ttft;
+                                        outcome.error_code = Some("upstream_stream_error".into());
+                                        outcome.error_message = Some("The upstream stream failed after the first chunk".into());
+                                        record_routing_attempt(
+                                            &stream_core,
+                                            &stream_evaluation,
+                                            &stream_request_id,
+                                            &stream_target_id,
+                                            outcome,
+                                        ).await;
+                                        yield Err(std::io::Error::other(error));
+                                        break;
+                                    }
+                                    None => break,
+                                }
+                            }
+                            if stream_ok {
+                                if let Some((runtimes, target, api_key_id, session_id)) = stream_kv {
+                                    if let Err(error) = runtimes.save_kv(&target, &api_key_id, &session_id).await {
+                                        tracing::warn!(target = %target.id, %error, "KV snapshot save failed");
+                                    }
+                                }
+                                let mut outcome = RoutingAttemptOutcome::from_previous(
+                                    status.as_u16(),
+                                    stream_attempt_started.elapsed(),
+                                    true,
+                                    stream_previous.as_ref(),
+                                );
+                                outcome.ttft = stream_ttft;
+                                record_routing_attempt(
+                                    &stream_core,
+                                    &stream_evaluation,
+                                    &stream_request_id,
+                                    &stream_target_id,
+                                    outcome,
+                                ).await;
+                            }
+                            drop(_permit);
+                            if let Some(runtimes) = stream_runtimes.as_ref() {
+                                runtimes.reap_over_budget().await;
+                                sync_runtime_states(&stream_core, runtimes).await;
+                            }
+                        };
+                        response_from_body(
+                            status,
+                            content_type,
+                            Body::from_stream(stream),
+                            &request_id,
+                        )
+                    } else {
+                        let mut content_type =
+                            upstream.headers().get(header::CONTENT_TYPE).cloned();
+                        let bytes = match wait_with_timeout_or_cancel(
+                            attempt_timeout,
+                            &cancel,
+                            upstream.bytes(),
+                        )
+                        .await
+                        {
+                            WaitOutcome::Cancelled => {
+                                return cancelled_proxy_response(
+                                    &core,
+                                    public_protocol,
+                                    &request_id,
+                                    &api_key_id,
+                                    uri.path(),
+                                    &alias,
+                                    Some(&target.name),
+                                    attempts,
+                                    started,
+                                )
+                                .await;
+                            }
+                            WaitOutcome::Ready(Ok(bytes)) => bytes,
+                            WaitOutcome::Ready(Err(_)) | WaitOutcome::Timeout => {
+                                let message = "The upstream response body did not complete";
+                                let mut outcome = RoutingAttemptOutcome::from_previous(
+                                    504,
+                                    attempt_started.elapsed(),
+                                    false,
+                                    previous_failure.as_ref(),
+                                )
+                                .with_same_target_attempt(same_target_attempt);
+                                if !can_retry_same_target(504, same_target_attempt) {
+                                    outcome.retry_after_until =
+                                        slow_skip_until(is_fallback_hop, has_later_hop);
+                                }
+                                outcome.error_code = Some("timeout".into());
+                                outcome.error_message = Some(message.into());
+                                record_routing_attempt(
+                                    &core,
+                                    &evaluation,
+                                    &request_id,
+                                    &target.id,
+                                    outcome,
+                                )
+                                .await;
+                                last_error = Some(request_error(
+                                    public_protocol,
+                                    StatusCode::GATEWAY_TIMEOUT,
+                                    "upstream_body_timeout",
+                                    message,
+                                ));
+                                last_error_target_id = Some(target.id.clone());
+                                last_error_target_name = Some(target.name.clone());
+                                last_error_detail =
+                                    Some((504, Some("timeout".into()), Some(message.into())));
+                                previous_failure = Some((504, Some("timeout".into())));
+                                match recover_failed_hop(
+                                    &cancel,
+                                    FailedHop {
+                                        inflight: inflight.as_ref(),
+                                        target_id: &target.id,
+                                        target_name: &target.name,
+                                        status: 504,
+                                        error_code: Some("timeout"),
+                                        error_message: Some(message),
+                                        same_target_attempt,
+                                        has_later_hop,
+                                        retry_after_until: None,
+                                    },
+                                )
+                                .await
+                                {
+                                    HopRecovery::RetrySame => continue 'retry,
+                                    HopRecovery::NextHop | HopRecovery::Exhausted => continue 'hops,
+                                    HopRecovery::Cancelled => {
+                                        return cancelled_proxy_response(
+                                            &core,
+                                            public_protocol,
+                                            &request_id,
+                                            &api_key_id,
+                                            uri.path(),
+                                            &alias,
+                                            Some(&target.name),
+                                            attempts,
+                                            started,
+                                        )
+                                        .await;
+                                    }
+                                }
+                            }
+                        };
+                        let mut response_bytes = bytes;
+                        let extracted = extract_upstream_error(&response_bytes);
+                        if !status.is_success() {
+                            error_code = extracted.0;
+                            error_message = extracted.1;
                         }
-                        drop(_permit);
-                        if let Some(runtimes) = stream_runtimes.as_ref() {
-                            runtimes.reap_over_budget().await;
-                            sync_runtime_states(&stream_core, runtimes).await;
-                        }
-                    };
-                    response_from_body(status, content_type, Body::from_stream(stream), &request_id)
-                } else {
-                    let mut content_type = upstream.headers().get(header::CONTENT_TYPE).cloned();
-                    let bytes = match wait_with_timeout_or_cancel(
-                        attempt_timeout,
-                        &cancel,
-                        upstream.bytes(),
-                    )
-                    .await
-                    {
-                        WaitOutcome::Cancelled => {
-                            return cancelled_proxy_response(
-                                &core,
-                                public_protocol,
-                                &request_id,
-                                &api_key_id,
-                                uri.path(),
-                                &alias,
-                                Some(&target.name),
-                                attempts,
-                                started,
-                            )
-                            .await;
-                        }
-                        WaitOutcome::Ready(Ok(bytes)) => bytes,
-                        WaitOutcome::Ready(Err(_)) | WaitOutcome::Timeout if has_fallback => {
-                            let mut outcome = RoutingAttemptOutcome::from_previous(
-                                504,
-                                attempt_started.elapsed(),
-                                false,
-                                previous_failure.as_ref(),
-                            );
-                            outcome.retry_after_until =
-                                Some(Utc::now() + chrono::Duration::seconds(SLOW_WINDOW_SECS));
-                            outcome.error_code = Some("timeout".into());
-                            outcome.error_message =
-                                Some("The upstream response body did not complete".into());
-                            record_routing_attempt(
-                                &core,
-                                &evaluation,
-                                &request_id,
-                                &target.id,
-                                outcome,
-                            )
-                            .await;
-                            previous_failure = Some((504, Some("timeout".into())));
-                            continue;
-                        }
-                        WaitOutcome::Ready(Err(_)) | WaitOutcome::Timeout => {
-                            record_routing_attempt(
-                                &core,
-                                &evaluation,
-                                &request_id,
-                                &target.id,
-                                RoutingAttemptOutcome {
-                                    error_code: Some("timeout".into()),
-                                    error_message: Some(
-                                        "The upstream response body did not complete".into(),
-                                    ),
-                                    ..RoutingAttemptOutcome::from_previous(
-                                        504,
-                                        attempt_started.elapsed(),
-                                        false,
-                                        previous_failure.as_ref(),
-                                    )
-                                },
-                            )
-                            .await;
-                            last_error = Some(request_error(
-                                public_protocol,
-                                StatusCode::GATEWAY_TIMEOUT,
-                                "upstream_body_timeout",
-                                "The upstream response body did not complete",
-                            ));
-                            last_error_target_id = Some(target.id.clone());
-                            last_error_target_name = Some(target.name.clone());
-                            last_error_detail = Some((
-                                504,
-                                Some("timeout".into()),
-                                Some("The upstream response body did not complete".into()),
-                            ));
-                            continue;
-                        }
-                    };
-                    let mut response_bytes = bytes;
-                    let extracted = extract_upstream_error(&response_bytes);
-                    if !status.is_success() {
-                        error_code = extracted.0;
-                        error_message = extracted.1;
-                    }
-                    if let Ok(value) = serde_json::from_slice::<Value>(&response_bytes) {
-                        usage = usage_from_value(&value);
-                        if status.is_success() {
-                            if let Some(protocol) = public_protocol {
-                                let translate = !protocol_matches(protocol, target.wire_protocol)
-                                    || !matches!(
-                                        emulation,
-                                        crate::tool_emulation::ToolEmulation::None
-                                    );
-                                if translate {
-                                    match decode_response(target.wire_protocol, &value) {
-                                        Ok(mut canonical_response) => {
-                                            if !matches!(
+                        if let Ok(value) = serde_json::from_slice::<Value>(&response_bytes) {
+                            usage = usage_from_value(&value);
+                            if status.is_success() {
+                                if let Some(protocol) = public_protocol {
+                                    let translate =
+                                        !protocol_matches(protocol, target.wire_protocol)
+                                            || !matches!(
                                                 emulation,
                                                 crate::tool_emulation::ToolEmulation::None
-                                            ) {
-                                                crate::tool_emulation::salvage_tool_calls(
-                                                    &mut canonical_response,
-                                                    &tools_for_salvage,
-                                                );
-                                            }
-                                            if is_stream {
-                                                content_type = Some(HeaderValue::from_static(
-                                                    "text/event-stream",
-                                                ));
-                                                let mut translator = StreamTranslator::new(
-                                                    target.wire_protocol,
-                                                    protocol,
-                                                    &alias,
-                                                );
-                                                response_bytes = translator
-                                                    .encode_canonical(&canonical_response)
+                                            );
+                                    if translate {
+                                        match decode_response(target.wire_protocol, &value) {
+                                            Ok(mut canonical_response) => {
+                                                if !matches!(
+                                                    emulation,
+                                                    crate::tool_emulation::ToolEmulation::None
+                                                ) {
+                                                    crate::tool_emulation::salvage_tool_calls(
+                                                        &mut canonical_response,
+                                                        &tools_for_salvage,
+                                                    );
+                                                }
+                                                if is_stream {
+                                                    content_type = Some(HeaderValue::from_static(
+                                                        "text/event-stream",
+                                                    ));
+                                                    let mut translator = StreamTranslator::new(
+                                                        target.wire_protocol,
+                                                        protocol,
+                                                        &alias,
+                                                    );
+                                                    response_bytes = translator
+                                                        .encode_canonical(&canonical_response)
+                                                        .into();
+                                                } else {
+                                                    response_bytes = encode_response(
+                                                        protocol,
+                                                        &canonical_response,
+                                                        &alias,
+                                                    )
+                                                    .to_string()
                                                     .into();
-                                            } else {
-                                                response_bytes = encode_response(
-                                                    protocol,
-                                                    &canonical_response,
-                                                    &alias,
-                                                )
-                                                .to_string()
-                                                .into();
+                                                }
                                             }
-                                        }
-                                        Err(error) => {
-                                            return protocol_error(
-                                                protocol,
-                                                StatusCode::BAD_GATEWAY,
-                                                "invalid_upstream_response",
-                                                &error.to_string(),
-                                            )
+                                            Err(error) => {
+                                                return protocol_error(
+                                                    protocol,
+                                                    StatusCode::BAD_GATEWAY,
+                                                    "invalid_upstream_response",
+                                                    &error.to_string(),
+                                                )
+                                            }
                                         }
                                     }
                                 }
+                            } else if let Some(protocol) = public_protocol {
+                                if !protocol_matches(protocol, target.wire_protocol) {
+                                    response_bytes = protocol_error_value(
+                                        protocol,
+                                        status,
+                                        error_code.as_deref().unwrap_or("upstream_error"),
+                                        error_message
+                                            .as_deref()
+                                            .unwrap_or("The upstream rejected the request"),
+                                    )
+                                    .to_string()
+                                    .into();
+                                }
                             }
-                        } else if let Some(protocol) = public_protocol {
-                            if !protocol_matches(protocol, target.wire_protocol) {
-                                response_bytes = protocol_error_value(
-                                    protocol,
-                                    status,
-                                    error_code.as_deref().unwrap_or("upstream_error"),
-                                    error_message
-                                        .as_deref()
-                                        .unwrap_or("The upstream rejected the request"),
-                                )
-                                .to_string()
-                                .into();
-                            }
-                        }
-                    } else if status.is_success()
-                        && public_protocol.is_some_and(|protocol| {
-                            !protocol_matches(protocol, target.wire_protocol)
-                        })
-                    {
-                        log_request(
+                        } else if status.is_success()
+                            && public_protocol.is_some_and(|protocol| {
+                                !protocol_matches(protocol, target.wire_protocol)
+                            })
+                        {
+                            log_request(
                             &core,
                             LogMetadata {
                                 id: &request_id,
@@ -1221,222 +1484,341 @@ async fn proxy(
                             },
                         )
                         .await;
-                        return protocol_error(
+                            return protocol_error(
                             public_protocol.unwrap(),
                             StatusCode::BAD_GATEWAY,
                             "invalid_upstream_response",
                             "The upstream returned a non-JSON response that cannot be translated",
                         );
-                    }
-                    if status.is_success() {
-                        if let Some((runtimes, target, api_key_id, session_id)) =
-                            kv_context.as_ref()
-                        {
-                            if let Err(error) =
-                                runtimes.save_kv(target, api_key_id, session_id).await
+                        }
+                        if status.is_success() {
+                            if let Some((runtimes, target, api_key_id, session_id)) =
+                                kv_context.as_ref()
                             {
-                                tracing::warn!(target = %target.id, %error, "KV snapshot save failed");
+                                if let Err(error) =
+                                    runtimes.save_kv(target, api_key_id, session_id).await
+                                {
+                                    tracing::warn!(target = %target.id, %error, "KV snapshot save failed");
+                                }
                             }
                         }
+                        drop(local_permit);
+                        if let Some(runtimes) = runtimes.as_ref() {
+                            runtimes.reap_over_budget().await;
+                            sync_runtime_states(&core, runtimes).await;
+                        }
+                        response_from_body(
+                            status,
+                            content_type,
+                            Body::from(response_bytes),
+                            &request_id,
+                        )
+                    };
+                    let hop_outcome = RoutingAttemptOutcome {
+                        status: status.as_u16(),
+                        transient_failure: is_transient_status(status.as_u16()),
+                        retry_after_until,
+                        latency: attempt_started.elapsed(),
+                        ttft: attempt_ttft,
+                        streaming: is_stream,
+                        error_code: error_code.clone(),
+                        error_message: error_message.clone(),
+                        previous_status: previous_failure.as_ref().map(|(status, _)| *status),
+                        previous_error_code: previous_failure
+                            .as_ref()
+                            .and_then(|(_, code)| code.clone()),
+                        same_target_attempt,
+                    };
+                    if !status.is_success() && is_fallback_status(status.as_u16()) {
+                        last_error_detail =
+                            Some((status.as_u16(), error_code.clone(), error_message.clone()));
+                        previous_failure = Some((status.as_u16(), error_code.clone()));
+                        match recover_failed_hop(
+                            &cancel,
+                            FailedHop {
+                                inflight: inflight.as_ref(),
+                                target_id: &target.id,
+                                target_name: &target.name,
+                                status: status.as_u16(),
+                                error_code: error_code.as_deref(),
+                                error_message: error_message.as_deref(),
+                                same_target_attempt,
+                                has_later_hop,
+                                retry_after_until,
+                            },
+                        )
+                        .await
+                        {
+                            HopRecovery::RetrySame => {
+                                record_routing_attempt(
+                                    &core,
+                                    &evaluation,
+                                    &request_id,
+                                    &target.id,
+                                    hop_outcome,
+                                )
+                                .await;
+                                last_error = Some(response);
+                                last_error_target_id = Some(target.id.clone());
+                                last_error_target_name = Some(target.name.clone());
+                                continue 'retry;
+                            }
+                            HopRecovery::NextHop => {
+                                record_routing_attempt(
+                                    &core,
+                                    &evaluation,
+                                    &request_id,
+                                    &target.id,
+                                    hop_outcome,
+                                )
+                                .await;
+                                last_error = Some(response);
+                                last_error_target_id = Some(target.id.clone());
+                                last_error_target_name = Some(target.name.clone());
+                                continue 'hops;
+                            }
+                            HopRecovery::Cancelled => {
+                                return cancelled_proxy_response(
+                                    &core,
+                                    public_protocol,
+                                    &request_id,
+                                    &api_key_id,
+                                    uri.path(),
+                                    &alias,
+                                    Some(&target.name),
+                                    attempts,
+                                    started,
+                                )
+                                .await;
+                            }
+                            HopRecovery::Exhausted => {}
+                        }
                     }
-                    drop(local_permit);
-                    if let Some(runtimes) = runtimes.as_ref() {
-                        runtimes.reap_over_budget().await;
-                        sync_runtime_states(&core, runtimes).await;
-                    }
-                    response_from_body(
-                        status,
-                        content_type,
-                        Body::from(response_bytes),
-                        &request_id,
-                    )
-                };
-                let hop_outcome = RoutingAttemptOutcome {
-                    status: status.as_u16(),
-                    transient_failure: is_transient_status(status.as_u16()),
-                    retry_after_until,
-                    latency: attempt_started.elapsed(),
-                    ttft: attempt_ttft,
-                    streaming: is_stream,
-                    error_code: error_code.clone(),
-                    error_message: error_message.clone(),
-                    previous_status: previous_failure.as_ref().map(|(status, _)| *status),
-                    previous_error_code: previous_failure
-                        .as_ref()
-                        .and_then(|(_, code)| code.clone()),
-                };
-                if !status.is_success() && is_fallback_status(status.as_u16()) && has_fallback {
-                    tracing::warn!(
-                        target = %target.id,
-                        status = status.as_u16(),
-                        code = error_code.as_deref().unwrap_or("-"),
-                        message = error_message.as_deref().unwrap_or("-"),
-                        "upstream error; trying fallback"
-                    );
-                    record_routing_attempt(
+                    log_request(
                         &core,
-                        &evaluation,
-                        &request_id,
-                        &target.id,
-                        hop_outcome,
+                        LogMetadata {
+                            id: &request_id,
+                            api_key_id: &api_key_id,
+                            endpoint: uri.path(),
+                            alias: Some(&alias),
+                            target: Some(&target.name),
+                            attempts,
+                            status: status.as_u16(),
+                            latency_ms: started.elapsed().as_millis() as i64,
+                            usage,
+                            error_code: error_code.as_deref(),
+                            error_message: error_message.as_deref(),
+                        },
                     )
                     .await;
-                    last_error = Some(response);
+                    if !is_stream {
+                        record_routing_attempt(
+                            &core,
+                            &evaluation,
+                            &request_id,
+                            &target.id,
+                            hop_outcome.clone(),
+                        )
+                        .await;
+                    }
+                    return with_routing_headers(response, &evaluation, &target.id, &hop_outcome);
+                }
+                WaitOutcome::Ready(Err(error)) => {
+                    last_error = Some(request_error(
+                        public_protocol,
+                        StatusCode::BAD_GATEWAY,
+                        "upstream_unavailable",
+                        "The selected backend could not be reached",
+                    ));
                     last_error_target_id = Some(target.id.clone());
                     last_error_target_name = Some(target.name.clone());
-                    last_error_detail =
-                        Some((status.as_u16(), error_code.clone(), error_message.clone()));
-                    previous_failure = Some((status.as_u16(), error_code.clone()));
-                    continue;
-                }
-                log_request(
-                    &core,
-                    LogMetadata {
-                        id: &request_id,
-                        api_key_id: &api_key_id,
-                        endpoint: uri.path(),
-                        alias: Some(&alias),
-                        target: Some(&target.name),
-                        attempts,
-                        status: status.as_u16(),
-                        latency_ms: started.elapsed().as_millis() as i64,
-                        usage,
-                        error_code: error_code.as_deref(),
-                        error_message: error_message.as_deref(),
-                    },
-                )
-                .await;
-                if !is_stream {
+                    let network_code = if error.is_timeout() {
+                        "timeout"
+                    } else {
+                        "network_error"
+                    };
+                    last_error_detail = Some((
+                        502,
+                        Some(network_code.into()),
+                        Some("The selected backend could not be reached".into()),
+                    ));
                     record_routing_attempt(
                         &core,
                         &evaluation,
                         &request_id,
                         &target.id,
-                        hop_outcome.clone(),
+                        RoutingAttemptOutcome {
+                            status: 502,
+                            transient_failure: true,
+                            retry_after_until: None,
+                            latency: attempt_started.elapsed(),
+                            ttft: None,
+                            streaming: is_stream,
+                            error_code: Some(network_code.into()),
+                            error_message: Some("The selected backend could not be reached".into()),
+                            previous_status: previous_failure.as_ref().map(|(status, _)| *status),
+                            previous_error_code: previous_failure
+                                .as_ref()
+                                .and_then(|(_, code)| code.clone()),
+                            same_target_attempt,
+                        },
                     )
                     .await;
-                }
-                return with_routing_headers(response, &evaluation, &target.id, &hop_outcome);
-            }
-            WaitOutcome::Ready(Err(error)) => {
-                last_error = Some(request_error(
-                    public_protocol,
-                    StatusCode::BAD_GATEWAY,
-                    "upstream_unavailable",
-                    "The selected backend could not be reached",
-                ));
-                last_error_target_id = Some(target.id.clone());
-                last_error_target_name = Some(target.name.clone());
-                let network_code = if error.is_timeout() {
-                    "timeout"
-                } else {
-                    "network_error"
-                };
-                last_error_detail = Some((
-                    502,
-                    Some(network_code.into()),
-                    Some("The selected backend could not be reached".into()),
-                ));
-                if attempts >= total_targets {
-                    request_logged = true;
-                    log_request(
-                        &core,
-                        LogMetadata {
-                            id: &request_id,
-                            api_key_id: &api_key_id,
-                            endpoint: uri.path(),
-                            alias: Some(&alias),
-                            target: Some(&target.name),
-                            attempts,
+                    previous_failure = Some((502, Some(network_code.into())));
+                    match recover_failed_hop(
+                        &cancel,
+                        FailedHop {
+                            inflight: inflight.as_ref(),
+                            target_id: &target.id,
+                            target_name: &target.name,
                             status: 502,
-                            latency_ms: started.elapsed().as_millis() as i64,
-                            usage: TokenUsage::default(),
                             error_code: Some(network_code),
                             error_message: Some("The selected backend could not be reached"),
+                            same_target_attempt,
+                            has_later_hop,
+                            retry_after_until: None,
+                        },
+                    )
+                    .await
+                    {
+                        HopRecovery::RetrySame => continue 'retry,
+                        HopRecovery::NextHop => continue 'hops,
+                        HopRecovery::Cancelled => {
+                            return cancelled_proxy_response(
+                                &core,
+                                public_protocol,
+                                &request_id,
+                                &api_key_id,
+                                uri.path(),
+                                &alias,
+                                Some(&target.name),
+                                attempts,
+                                started,
+                            )
+                            .await;
+                        }
+                        HopRecovery::Exhausted => {
+                            request_logged = true;
+                            log_request(
+                                &core,
+                                LogMetadata {
+                                    id: &request_id,
+                                    api_key_id: &api_key_id,
+                                    endpoint: uri.path(),
+                                    alias: Some(&alias),
+                                    target: Some(&target.name),
+                                    attempts,
+                                    status: 502,
+                                    latency_ms: started.elapsed().as_millis() as i64,
+                                    usage: TokenUsage::default(),
+                                    error_code: Some(network_code),
+                                    error_message: Some(
+                                        "The selected backend could not be reached",
+                                    ),
+                                },
+                            )
+                            .await;
+                            continue 'hops;
+                        }
+                    }
+                }
+                WaitOutcome::Timeout => {
+                    last_error = Some(request_error(
+                        public_protocol,
+                        StatusCode::GATEWAY_TIMEOUT,
+                        "timeout",
+                        "The selected backend timed out",
+                    ));
+                    last_error_target_id = Some(target.id.clone());
+                    last_error_target_name = Some(target.name.clone());
+                    last_error_detail = Some((
+                        504,
+                        Some("timeout".into()),
+                        Some("The selected backend timed out".into()),
+                    ));
+                    let retrying = can_retry_same_target(504, same_target_attempt);
+                    record_routing_attempt(
+                        &core,
+                        &evaluation,
+                        &request_id,
+                        &target.id,
+                        RoutingAttemptOutcome {
+                            status: 504,
+                            transient_failure: true,
+                            retry_after_until: if retrying {
+                                None
+                            } else {
+                                slow_skip_until(is_fallback_hop, has_later_hop)
+                            },
+                            latency: attempt_started.elapsed(),
+                            ttft: None,
+                            streaming: is_stream,
+                            error_code: Some("timeout".into()),
+                            error_message: Some("The selected backend timed out".into()),
+                            previous_status: previous_failure.as_ref().map(|(status, _)| *status),
+                            previous_error_code: previous_failure
+                                .as_ref()
+                                .and_then(|(_, code)| code.clone()),
+                            same_target_attempt,
                         },
                     )
                     .await;
-                }
-                record_routing_attempt(
-                    &core,
-                    &evaluation,
-                    &request_id,
-                    &target.id,
-                    RoutingAttemptOutcome {
-                        status: 502,
-                        transient_failure: true,
-                        retry_after_until: None,
-                        latency: attempt_started.elapsed(),
-                        ttft: None,
-                        streaming: is_stream,
-                        error_code: Some(network_code.into()),
-                        error_message: Some("The selected backend could not be reached".into()),
-                        previous_status: previous_failure.as_ref().map(|(status, _)| *status),
-                        previous_error_code: previous_failure
-                            .as_ref()
-                            .and_then(|(_, code)| code.clone()),
-                    },
-                )
-                .await;
-                previous_failure = Some((502, Some(network_code.into())));
-            }
-            WaitOutcome::Timeout => {
-                last_error = Some(request_error(
-                    public_protocol,
-                    StatusCode::GATEWAY_TIMEOUT,
-                    "timeout",
-                    "The selected backend timed out",
-                ));
-                last_error_target_id = Some(target.id.clone());
-                last_error_target_name = Some(target.name.clone());
-                last_error_detail = Some((
-                    504,
-                    Some("timeout".into()),
-                    Some("The selected backend timed out".into()),
-                ));
-                if attempts >= total_targets {
-                    request_logged = true;
-                    log_request(
-                        &core,
-                        LogMetadata {
-                            id: &request_id,
-                            api_key_id: &api_key_id,
-                            endpoint: uri.path(),
-                            alias: Some(&alias),
-                            target: Some(&target.name),
-                            attempts,
+                    previous_failure = Some((504, Some("timeout".into())));
+                    match recover_failed_hop(
+                        &cancel,
+                        FailedHop {
+                            inflight: inflight.as_ref(),
+                            target_id: &target.id,
+                            target_name: &target.name,
                             status: 504,
-                            latency_ms: started.elapsed().as_millis() as i64,
-                            usage: TokenUsage::default(),
                             error_code: Some("timeout"),
                             error_message: Some("The selected backend timed out"),
+                            same_target_attempt,
+                            has_later_hop,
+                            retry_after_until: None,
                         },
                     )
-                    .await;
+                    .await
+                    {
+                        HopRecovery::RetrySame => continue 'retry,
+                        HopRecovery::NextHop => continue 'hops,
+                        HopRecovery::Cancelled => {
+                            return cancelled_proxy_response(
+                                &core,
+                                public_protocol,
+                                &request_id,
+                                &api_key_id,
+                                uri.path(),
+                                &alias,
+                                Some(&target.name),
+                                attempts,
+                                started,
+                            )
+                            .await;
+                        }
+                        HopRecovery::Exhausted => {
+                            request_logged = true;
+                            log_request(
+                                &core,
+                                LogMetadata {
+                                    id: &request_id,
+                                    api_key_id: &api_key_id,
+                                    endpoint: uri.path(),
+                                    alias: Some(&alias),
+                                    target: Some(&target.name),
+                                    attempts,
+                                    status: 504,
+                                    latency_ms: started.elapsed().as_millis() as i64,
+                                    usage: TokenUsage::default(),
+                                    error_code: Some("timeout"),
+                                    error_message: Some("The selected backend timed out"),
+                                },
+                            )
+                            .await;
+                            continue 'hops;
+                        }
+                    }
                 }
-                record_routing_attempt(
-                    &core,
-                    &evaluation,
-                    &request_id,
-                    &target.id,
-                    RoutingAttemptOutcome {
-                        status: 504,
-                        transient_failure: true,
-                        retry_after_until: has_fallback
-                            .then(|| Utc::now() + chrono::Duration::seconds(SLOW_WINDOW_SECS)),
-                        latency: attempt_started.elapsed(),
-                        ttft: None,
-                        streaming: is_stream,
-                        error_code: Some("timeout".into()),
-                        error_message: Some("The selected backend timed out".into()),
-                        previous_status: previous_failure.as_ref().map(|(status, _)| *status),
-                        previous_error_code: previous_failure
-                            .as_ref()
-                            .and_then(|(_, code)| code.clone()),
-                    },
-                )
-                .await;
-                previous_failure = Some((504, Some("timeout".into())));
             }
         }
     }
@@ -1521,6 +1903,7 @@ struct RoutingAttemptOutcome {
     error_message: Option<String>,
     previous_status: Option<u16>,
     previous_error_code: Option<String>,
+    same_target_attempt: u32,
 }
 
 impl RoutingAttemptOutcome {
@@ -1541,8 +1924,134 @@ impl RoutingAttemptOutcome {
             error_message: None,
             previous_status: previous.map(|(status, _)| *status),
             previous_error_code: previous.and_then(|(_, code)| code.clone()),
+            same_target_attempt: 1,
         }
     }
+
+    fn with_same_target_attempt(mut self, attempt: u32) -> Self {
+        self.same_target_attempt = attempt;
+        self
+    }
+}
+
+enum HopRecovery {
+    RetrySame,
+    NextHop,
+    Exhausted,
+    Cancelled,
+}
+
+fn same_target_retry_delay(retry_after_until: Option<chrono::DateTime<Utc>>) -> Duration {
+    let default = Duration::from_millis(SAME_TARGET_RETRY_DELAY_MS);
+    let max = Duration::from_millis(SAME_TARGET_RETRY_MAX_WAIT_MS);
+    let Some(until) = retry_after_until else {
+        return default;
+    };
+    let Ok(wait) = (until - Utc::now()).to_std() else {
+        return default;
+    };
+    if wait.is_zero() || wait > max {
+        default
+    } else {
+        wait
+    }
+}
+
+async fn wait_for_same_target_retry(
+    cancel: &CancellationToken,
+    retry_after_until: Option<chrono::DateTime<Utc>>,
+) -> bool {
+    let delay = same_target_retry_delay(retry_after_until);
+    tokio::select! {
+        _ = cancel.cancelled() => false,
+        _ = tokio::time::sleep(delay) => true,
+    }
+}
+
+struct FailedHop<'a> {
+    inflight: Option<&'a InFlightGuard>,
+    target_id: &'a str,
+    target_name: &'a str,
+    status: u16,
+    error_code: Option<&'a str>,
+    error_message: Option<&'a str>,
+    same_target_attempt: u32,
+    has_later_hop: bool,
+    retry_after_until: Option<chrono::DateTime<Utc>>,
+}
+
+async fn recover_failed_hop(cancel: &CancellationToken, hop: FailedHop<'_>) -> HopRecovery {
+    if can_retry_same_target(hop.status, hop.same_target_attempt) {
+        tracing::warn!(
+            target = %hop.target_id,
+            status = hop.status,
+            code = hop.error_code.unwrap_or("-"),
+            message = hop.error_message.unwrap_or("-"),
+            attempt = hop.same_target_attempt,
+            "upstream error; retrying same target"
+        );
+        if let Some(inflight) = hop.inflight {
+            inflight.apply(
+                InFlightProgress::new(hop.target_id, hop.target_name, "retrying")
+                    .with_attempt(hop.same_target_attempt + 1)
+                    .with_error(hop.error_code, hop.error_message),
+            );
+        }
+        if !wait_for_same_target_retry(cancel, hop.retry_after_until).await {
+            return HopRecovery::Cancelled;
+        }
+        return HopRecovery::RetrySame;
+    }
+    if hop.has_later_hop {
+        tracing::warn!(
+            target = %hop.target_id,
+            status = hop.status,
+            code = hop.error_code.unwrap_or("-"),
+            message = hop.error_message.unwrap_or("-"),
+            "upstream error; trying fallback"
+        );
+        if let Some(inflight) = hop.inflight {
+            inflight.apply(
+                InFlightProgress::new(hop.target_id, hop.target_name, "rerouting")
+                    .with_attempt(hop.same_target_attempt)
+                    .with_error(hop.error_code, hop.error_message),
+            );
+        }
+        return HopRecovery::NextHop;
+    }
+    HopRecovery::Exhausted
+}
+
+fn slow_skip_until(is_fallback_hop: bool, has_later_hop: bool) -> Option<chrono::DateTime<Utc>> {
+    (!is_fallback_hop && has_later_hop)
+        .then(|| Utc::now() + chrono::Duration::seconds(SLOW_WINDOW_SECS))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn record_skipped_hop(
+    core: &AppCore,
+    evaluation: &RoutingEvaluation,
+    request_id: &str,
+    target_id: &str,
+    attempt_started: Instant,
+    streaming: bool,
+    previous_failure: &mut Option<(u16, Option<String>)>,
+    status: u16,
+    error_code: &str,
+    error_message: String,
+    same_target_attempt: u32,
+) {
+    let mut outcome = RoutingAttemptOutcome::from_previous(
+        status,
+        attempt_started.elapsed(),
+        streaming,
+        previous_failure.as_ref(),
+    )
+    .with_same_target_attempt(same_target_attempt);
+    outcome.error_code = Some(error_code.into());
+    outcome.error_message = Some(truncate_error_message(&error_message));
+    record_routing_attempt(core, evaluation, request_id, target_id, outcome).await;
+    *previous_failure = Some((status, Some(error_code.into())));
 }
 
 async fn record_routing_attempt(
@@ -1591,7 +2100,18 @@ fn routing_attempt_reason(
     outcome: &RoutingAttemptOutcome,
 ) -> String {
     let mut parts = Vec::new();
-    if let Some(status) = outcome.previous_status {
+    if outcome.same_target_attempt > 1 {
+        let total = SAME_TARGET_RETRY_LIMIT.saturating_add(1);
+        let mut retry = format!("retry {}/{total} same target", outcome.same_target_attempt);
+        if let Some(status) = outcome.previous_status {
+            retry.push_str(&format!(" after {status}"));
+            if let Some(code) = outcome.previous_error_code.as_deref() {
+                retry.push(' ');
+                retry.push_str(code);
+            }
+        }
+        parts.push(retry);
+    } else if let Some(status) = outcome.previous_status {
         let mut fallback = format!("fallback after {status}");
         if let Some(code) = outcome.previous_error_code.as_deref() {
             fallback.push(' ');
@@ -1670,6 +2190,9 @@ fn selection_reason(evaluation: &RoutingEvaluation, target_id: &str) -> String {
             );
         }
         return format!("adaptive fallback hop {hop}/{total}");
+    }
+    if evaluation.is_fallback_hop(target_id) {
+        return format!("failover hop {hop}/{total}");
     }
     format!("performance hop {hop}/{total}")
 }
@@ -2346,7 +2869,11 @@ mod tests {
         secrets::{MemorySecrets, SecretStore, LOCAL_API_KEY},
         storage::{ModelTarget, Provider, Store},
     };
-    use axum::{body::Body, http::{HeaderMap, HeaderValue, Request}, Json};
+    use axum::{
+        body::Body,
+        http::{HeaderMap, HeaderValue, Request},
+        Json,
+    };
     use http_body_util::BodyExt;
     use std::{path::PathBuf, sync::Arc};
     use tower::ServiceExt;
@@ -2769,16 +3296,36 @@ mod tests {
     }
 
     async fn upstream(status: StatusCode, payload: Value) -> String {
-        let app = Router::new().fallback(move || {
-            let payload = payload.clone();
-            async move { (status, Json(payload)) }
+        sequence_upstream(vec![(status, payload)]).await.0
+    }
+
+    async fn sequence_upstream(
+        responses: Vec<(StatusCode, Value)>,
+    ) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let responses = Arc::new(responses);
+        let app = Router::new().fallback({
+            let calls = calls.clone();
+            let responses = responses.clone();
+            move || {
+                let calls = calls.clone();
+                let responses = responses.clone();
+                async move {
+                    let index = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let (status, payload) = responses
+                        .get(index)
+                        .cloned()
+                        .unwrap_or_else(|| responses.last().cloned().expect("responses"));
+                    (status, Json(payload))
+                }
+            }
         });
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();
         });
-        format!("http://{address}/v1")
+        (format!("http://{address}/v1"), calls)
     }
 
     async fn authenticated_upstream(expected: Vec<(&'static str, &'static str)>) -> String {
@@ -3111,7 +3658,7 @@ mod tests {
         let logs = store.logs(10).await.unwrap();
         assert_eq!(logs[0].api_key_id.as_deref(), Some("default"));
         assert_eq!(logs[0].api_key_name.as_deref(), Some("Default"));
-        assert_eq!(logs[0].attempts, 2);
+        assert_eq!(logs[0].attempts, 3);
         assert_eq!(logs[0].target.as_deref(), Some("fallback"));
         assert_eq!(
             (logs[0].input_tokens, logs[0].output_tokens),
@@ -3120,6 +3667,102 @@ mod tests {
         assert!(!serde_json::to_string(&logs)
             .unwrap()
             .contains("private marker"));
+    }
+
+    #[tokio::test]
+    async fn transient_overloaded_retries_the_same_singleton_target() {
+        let (url, calls) = sequence_upstream(vec![
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                json!({ "error": { "code": "overloaded", "message": "Service temporarily overloaded" } }),
+            ),
+            (
+                StatusCode::OK,
+                json!({ "id": "ok", "choices": [{"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}] }),
+            ),
+        ])
+        .await;
+        let store = assistant_store(vec![("nvidia", url)]).await;
+        let app = app_from_store(store.clone()).await;
+        let response = app.oneshot(chat_request(false)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+        let logs = store.logs(10).await.unwrap();
+        assert_eq!(logs[0].status, 200);
+        assert_eq!(logs[0].attempts, 2);
+        assert_eq!(logs[0].target.as_deref(), Some("nvidia"));
+        let attempts = store.routing_attempts(None, 20).await.unwrap();
+        assert_eq!(attempts.len(), 2);
+        assert!(attempts.iter().any(|attempt| {
+            attempt.reason.contains("retry 2/2 same target after 503")
+                && attempt.reason.contains("overloaded")
+        }));
+    }
+
+    #[tokio::test]
+    async fn singleton_stays_on_the_pinned_target_after_retry_exhausts() {
+        let (url, calls) = sequence_upstream(vec![(
+            StatusCode::SERVICE_UNAVAILABLE,
+            json!({ "error": { "code": "overloaded", "message": "Service temporarily overloaded" } }),
+        )])
+        .await;
+        let store = assistant_store(vec![("nvidia", url)]).await;
+        let app = app_from_store(store.clone()).await;
+        let response = app.oneshot(chat_request(false)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+        let logs = store.logs(10).await.unwrap();
+        assert_eq!(logs[0].attempts, 2);
+        assert_eq!(logs[0].target.as_deref(), Some("nvidia"));
+        assert_eq!(store.routing_attempts(None, 20).await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn transient_retry_then_failsover_to_the_next_hop() {
+        let (first, first_calls) = sequence_upstream(vec![(
+            StatusCode::SERVICE_UNAVAILABLE,
+            json!({ "error": { "code": "overloaded", "message": "Service temporarily overloaded" } }),
+        )])
+        .await;
+        let second = upstream(
+            StatusCode::OK,
+            json!({ "id": "ok", "choices": [{"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}] }),
+        )
+        .await;
+        let store = assistant_store(vec![("nvidia", first), ("backup", second)]).await;
+        let app = app_from_store(store.clone()).await;
+        let response = app.oneshot(chat_request(false)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(first_calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(
+            response.headers().get("x-local-ai-target").unwrap(),
+            "backup"
+        );
+        let logs = store.logs(10).await.unwrap();
+        assert_eq!(logs[0].attempts, 3);
+        assert_eq!(logs[0].target.as_deref(), Some("backup"));
+    }
+
+    #[tokio::test]
+    async fn client_errors_do_not_retry_the_same_target() {
+        let started = Instant::now();
+        let (first, first_calls) = sequence_upstream(vec![(
+            StatusCode::BAD_REQUEST,
+            json!({ "error": { "code": "bad_request", "message": "nope" } }),
+        )])
+        .await;
+        let second = upstream(
+            StatusCode::OK,
+            json!({ "id": "ok", "choices": [{"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}] }),
+        )
+        .await;
+        let store = assistant_store(vec![("primary", first), ("backup", second)]).await;
+        let app = app_from_store(store.clone()).await;
+        let response = app.oneshot(chat_request(false)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(first_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(started.elapsed() < Duration::from_millis(300));
+        assert_eq!(store.logs(10).await.unwrap()[0].attempts, 2);
     }
 
     #[tokio::test]
@@ -3380,11 +4023,287 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
-        assert!(started.elapsed() < Duration::from_secs(15));
+        assert!(started.elapsed() < Duration::from_secs(25));
         assert_eq!(
             store.logs(10).await.unwrap()[0].target.as_deref(),
             Some("fast")
         );
+    }
+
+    fn hop(id: &str, priority: i64, role: RouteRole) -> RouteTarget {
+        RouteTarget {
+            id: id.into(),
+            kind: TargetKind::Gguf,
+            model: id.into(),
+            priority,
+            enabled: true,
+            role,
+        }
+    }
+
+    async fn assistant_store(targets: Vec<(&str, String)>) -> Store {
+        let store = Store::memory().await.unwrap();
+        let mut hops = Vec::new();
+        for (index, (id, url)) in targets.into_iter().enumerate() {
+            store
+                .upsert_target(&sample_target(id, id, Some(url)))
+                .await
+                .unwrap();
+            hops.push(hop(id, ((index as i64) + 1) * 10, RouteRole::Primary));
+        }
+        store
+            .upsert_route(&ModelRoute {
+                alias: "assistant".into(),
+                enabled: true,
+                capabilities: vec!["chat".into()],
+                targets: hops,
+            })
+            .await
+            .unwrap();
+        store
+    }
+
+    async fn seed_fast_latency(store: &Store, target_id: &str) {
+        store
+            .insert_routing_attempt(&crate::routing::RoutingAttemptRecord {
+                id: format!("hist-{target_id}"),
+                request_id: "seed".into(),
+                created_at: Utc::now(),
+                alias: "assistant".into(),
+                task: "general".into(),
+                task_source: "default".into(),
+                target_id: target_id.into(),
+                routing_mode: "fixed".into(),
+                status: 200,
+                transient_failure: false,
+                retry_after_until: None,
+                latency_ms: 1_000,
+                ttft_ms: Some(1_000),
+                streaming: false,
+                input_tokens: Some(1),
+                output_tokens: None,
+                estimated_cost_usd: None,
+                cost_verified: false,
+                score: None,
+                reason: "default".into(),
+            })
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_primary_walks_the_rest_of_the_pool_before_fallbacks() {
+        let first = upstream(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            json!({ "error": { "code": "unavailable" } }),
+        )
+        .await;
+        let second = upstream(
+            StatusCode::OK,
+            json!({ "id": "ok", "choices": [{"message":{"role":"assistant","content":"pool"},"finish_reason":"stop"}] }),
+        )
+        .await;
+        let local = upstream(
+            StatusCode::OK,
+            json!({ "id": "ok", "choices": [{"message":{"role":"assistant","content":"local"},"finish_reason":"stop"}] }),
+        )
+        .await;
+        let deepseek = upstream(
+            StatusCode::OK,
+            json!({ "id": "ok", "choices": [{"message":{"role":"assistant","content":"deepseek"},"finish_reason":"stop"}] }),
+        )
+        .await;
+        let store = Store::memory().await.unwrap();
+        for (id, url) in [
+            ("first", first),
+            ("second", second),
+            ("local", local),
+            ("deepseek", deepseek),
+        ] {
+            store
+                .upsert_target(&sample_target(id, id, Some(url)))
+                .await
+                .unwrap();
+        }
+        store
+            .upsert_route(&ModelRoute {
+                alias: "assistant".into(),
+                enabled: true,
+                capabilities: vec!["chat".into()],
+                targets: vec![
+                    hop("first", 10, RouteRole::Primary),
+                    hop("second", 20, RouteRole::Primary),
+                    hop("local", 10, RouteRole::Fallback),
+                    hop("deepseek", 20, RouteRole::Fallback),
+                ],
+            })
+            .await
+            .unwrap();
+        let app = app_from_store(store.clone()).await;
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("authorization", "Bearer test-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"model":"assistant","messages":[{"role":"user","content":"hi"}]}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get("x-local-ai-target").unwrap(),
+            "second"
+        );
+        let attempted: Vec<_> = store
+            .routing_attempts(None, 20)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|attempt| attempt.target_id)
+            .collect();
+        assert!(attempted.contains(&"first".to_string()));
+        assert!(attempted.contains(&"second".to_string()));
+        assert!(!attempted.contains(&"local".to_string()));
+        assert!(!attempted.contains(&"deepseek".to_string()));
+    }
+
+    #[tokio::test]
+    async fn fallback_failover_does_not_use_primary_first_byte_timeout() {
+        let first = upstream(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            json!({ "error": { "code": "unavailable" } }),
+        )
+        .await;
+        let second = upstream(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            json!({ "error": { "code": "unavailable" } }),
+        )
+        .await;
+        let local = hanging_upstream(Duration::from_millis(9_500)).await;
+        let deepseek = upstream(
+            StatusCode::OK,
+            json!({ "id": "ok", "choices": [{"message":{"role":"assistant","content":"deepseek"},"finish_reason":"stop"}] }),
+        )
+        .await;
+        let store = Store::memory().await.unwrap();
+        for (id, url) in [
+            ("first", first),
+            ("second", second),
+            ("local", local),
+            ("deepseek", deepseek),
+        ] {
+            store
+                .upsert_target(&sample_target(id, id, Some(url)))
+                .await
+                .unwrap();
+        }
+        for id in ["first", "second", "deepseek"] {
+            seed_fast_latency(&store, id).await;
+        }
+        store
+            .upsert_route(&ModelRoute {
+                alias: "assistant".into(),
+                enabled: true,
+                capabilities: vec!["chat".into()],
+                targets: vec![
+                    hop("first", 10, RouteRole::Primary),
+                    hop("second", 20, RouteRole::Primary),
+                    hop("local", 10, RouteRole::Fallback),
+                    hop("deepseek", 20, RouteRole::Fallback),
+                ],
+            })
+            .await
+            .unwrap();
+        let app = app_from_store(store.clone()).await;
+        let started = Instant::now();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("authorization", "Bearer test-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"model":"assistant","messages":[{"role":"user","content":"hi"}]}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(started.elapsed() >= Duration::from_millis(9_000));
+        assert!(started.elapsed() < Duration::from_secs(20));
+        assert_eq!(
+            response.headers().get("x-local-ai-target").unwrap(),
+            "local"
+        );
+        let attempts = store.routing_attempts(None, 20).await.unwrap();
+        assert!(attempts.iter().any(|attempt| attempt.target_id == "local"));
+        assert!(!attempts
+            .iter()
+            .any(|attempt| { attempt.target_id == "deepseek" && attempt.request_id != "seed" }));
+    }
+
+    #[tokio::test]
+    async fn local_load_failure_is_recorded_then_failsover() {
+        let deepseek = upstream(
+            StatusCode::OK,
+            json!({ "id": "ok", "choices": [{"message":{"role":"assistant","content":"deepseek"},"finish_reason":"stop"}] }),
+        )
+        .await;
+        let store = Store::memory().await.unwrap();
+        store
+            .upsert_target(&sample_target("local", "local", None))
+            .await
+            .unwrap();
+        store
+            .upsert_target(&sample_target("deepseek", "deepseek", Some(deepseek)))
+            .await
+            .unwrap();
+        store
+            .upsert_route(&ModelRoute {
+                alias: "assistant".into(),
+                enabled: true,
+                capabilities: vec!["chat".into()],
+                targets: vec![
+                    hop("local", 10, RouteRole::Fallback),
+                    hop("deepseek", 20, RouteRole::Fallback),
+                ],
+            })
+            .await
+            .unwrap();
+        let app = app_from_store(store.clone()).await;
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("authorization", "Bearer test-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"model":"assistant","messages":[{"role":"user","content":"hi"}]}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get("x-local-ai-target").unwrap(),
+            "deepseek"
+        );
+        let attempts = store.routing_attempts(None, 20).await.unwrap();
+        assert!(attempts.iter().any(|attempt| {
+            attempt.target_id == "local" && attempt.reason.contains("local_load_failed")
+        }));
+        assert!(attempts
+            .iter()
+            .any(|attempt| { attempt.target_id == "deepseek" && attempt.status == 200 }));
     }
 
     #[test]
@@ -3401,6 +4320,22 @@ mod tests {
         let until = rate_limit_until(&headers, 429).unwrap();
         let delta = (until - Utc::now()).num_seconds();
         assert!((11..=13).contains(&delta));
+    }
+
+    #[test]
+    fn same_target_retry_waits_short_retry_after_only() {
+        assert_eq!(
+            same_target_retry_delay(None),
+            Duration::from_millis(SAME_TARGET_RETRY_DELAY_MS)
+        );
+        let long = Utc::now() + chrono::Duration::seconds(30);
+        assert_eq!(
+            same_target_retry_delay(Some(long)),
+            Duration::from_millis(SAME_TARGET_RETRY_DELAY_MS)
+        );
+        let short = Utc::now() + chrono::Duration::milliseconds(800);
+        let wait = same_target_retry_delay(Some(short));
+        assert!(wait >= Duration::from_millis(500) && wait <= Duration::from_millis(900));
     }
 
     async fn hanging_upstream(delay: Duration) -> String {
@@ -3443,9 +4378,25 @@ mod tests {
     }
 
     async fn wait_for_inflight(core: &AppCore) -> crate::core::InFlightRequest {
+        wait_for_inflight_matching(core, |_| true).await
+    }
+
+    async fn wait_for_inflight_phase(core: &AppCore, phase: &str) -> crate::core::InFlightRequest {
+        wait_for_inflight_matching(core, |request| request.phase == phase).await
+    }
+
+    async fn wait_for_inflight_matching(
+        core: &AppCore,
+        predicate: impl Fn(&crate::core::InFlightRequest) -> bool,
+    ) -> crate::core::InFlightRequest {
         let deadline = Instant::now() + Duration::from_secs(2);
         loop {
-            if let Some(request) = core.traffic.snapshot().into_iter().next() {
+            if let Some(request) = core
+                .traffic
+                .snapshot()
+                .into_iter()
+                .find(|request| predicate(request))
+            {
                 return request;
             }
             if Instant::now() > deadline {
@@ -3559,6 +4510,28 @@ mod tests {
         assert_eq!(response.status().as_u16(), 499);
         let body = response.into_body().collect().await.unwrap().to_bytes();
         assert!(String::from_utf8_lossy(&body).contains("cancelled"));
+    }
+
+    #[tokio::test]
+    async fn cancel_during_same_target_retry_pause_returns_499() {
+        let (url, _) = sequence_upstream(vec![(
+            StatusCode::SERVICE_UNAVAILABLE,
+            json!({ "error": { "code": "overloaded", "message": "Service temporarily overloaded" } }),
+        )])
+        .await;
+        let (core, app) = inflight_test_core(url).await;
+        let pending = tokio::spawn(async move { app.oneshot(chat_request(false)).await });
+        let request = wait_for_inflight_phase(&core, "retrying").await;
+        assert_eq!(request.last_error_code.as_deref(), Some("overloaded"));
+        assert!(request
+            .last_error_message
+            .as_deref()
+            .unwrap_or("")
+            .contains("overloaded"));
+        assert!(core.traffic.cancel(&request.id));
+        wait_until_idle(&core).await;
+        let response = pending.await.unwrap().unwrap();
+        assert_eq!(response.status().as_u16(), 499);
     }
 
     #[tokio::test]
@@ -4358,7 +5331,7 @@ mod tests {
         assert!(served
             .reason
             .contains("fallback after 400 context_length_exceeded"));
-        assert!(served.reason.contains("performance hop 2/2"));
+        assert!(served.reason.contains("failover hop 2/2"));
         assert!(served.reason.contains("task=general via default"));
     }
 
@@ -4407,6 +5380,8 @@ mod tests {
                 }],
             },
             ordered_target_ids: vec!["first".into(), "second".into()],
+            primary_target_ids: vec!["first".into(), "second".into()],
+            fallback_target_ids: vec![],
             shadow_target_id: None,
             half_open_target_ids: vec![],
             estimated_input_tokens: 10,
@@ -4432,6 +5407,20 @@ mod tests {
         let follow_reason = routing_attempt_reason(&evaluation, "second", &follow);
         assert!(follow_reason.contains("fallback after 400 context_length_exceeded"));
         assert!(follow_reason.contains("performance hop 2/2"));
+
+        let retry = RoutingAttemptOutcome {
+            same_target_attempt: 2,
+            error_code: Some("overloaded".into()),
+            error_message: Some("Service temporarily overloaded".into()),
+            ..RoutingAttemptOutcome::from_previous(
+                503,
+                Duration::from_millis(5),
+                false,
+                Some(&(503, Some("overloaded".into()))),
+            )
+        };
+        let retry_reason = routing_attempt_reason(&evaluation, "first", &retry);
+        assert!(retry_reason.contains("retry 2/2 same target after 503 overloaded"));
     }
 
     #[test]
@@ -4449,7 +5438,10 @@ mod tests {
     #[tokio::test]
     async fn mlx_named_kv_hits_slots_only_with_a_session_header() {
         let slot_calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
-        let chat_headers = std::sync::Arc::new(std::sync::Mutex::new(Vec::<(Option<String>, Option<String>)>::new()));
+        let chat_headers = std::sync::Arc::new(std::sync::Mutex::new(Vec::<(
+            Option<String>,
+            Option<String>,
+        )>::new()));
         let slot_for_server = slot_calls.clone();
         let headers_for_server = chat_headers.clone();
         let app = Router::new()

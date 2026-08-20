@@ -1,4 +1,5 @@
 import { lazy, Suspense, useCallback, useEffect, useMemo, useState, type FormEvent, type ReactNode } from "react";
+import { keepPreviousData, QueryClientProvider, useQuery, useQueryClient } from "@tanstack/react-query";
 import { save } from "@tauri-apps/plugin-dialog";
 import { enable, disable, isEnabled } from "@tauri-apps/plugin-autostart";
 import { openUrl } from "@tauri-apps/plugin-opener";
@@ -9,11 +10,13 @@ import {
   Trash2, Wallet, X, Zap,
 } from "lucide-react";
 import { command, appVersion, errorMessage, isTauri, listenDesktopNavigate, listenGatewayTraffic } from "./api";
-import type { DashboardData, InFlightRequest, LocalApiKey, LogFacets, LogQuery, LogResult, ModelMetadata, ModelRoute, ModelTarget, Provider, ProviderModel, ProviderPreset, PublicModel, RequestLog, ResourcePolicy, ResourceProfile, RouteRole, RouteTarget, RoutingAttempt, RoutingConfigExport, RoutingEvaluation, RoutingPolicy, RoutingTaskDefinition, TargetKind, TargetRoutingProfile, UsageData, WireProtocol } from "./types";
+import type { DashboardData, InFlightRequest, LocalApiKey, LogQuery, ModelRoute, ModelTarget, Provider, ProviderModel, ProviderPreset, PublicModel, ResourcePolicy, ResourceProfile, RouteRole, RouteTarget, RoutingConfigExport, RoutingEvaluation, RoutingPolicy, RoutingTaskDefinition, TargetKind, TargetRoutingProfile, WireProtocol } from "./types";
 import { ApiKeysPage } from "./ApiKeysPage";
 import { CandleLineChart } from "./CandleLineChart";
 import { LocalPage } from "./LocalPage";
 import { TypeaheadSelect } from "./TypeaheadSelect";
+import { createQueryClient, defaultResourcePolicy, emptyDashboard, emptyUsage, fetchers, invalidateAppQueries, queryKeys } from "./queries";
+import { useDebouncedValue } from "./useDebouncedValue";
 
 type Page = "overview" | "chat" | "keys" | "usage" | "providers" | "cloud" | "local" | "routes" | "logs" | "routing" | "settings";
 
@@ -31,55 +34,63 @@ const nav: Array<{ page: Page; label: string; icon: typeof Activity }> = [
   { page: "settings", label: "Settings", icon: Settings },
 ];
 
-const emptyDashboard: DashboardData = { running: false, base_url: "http://127.0.0.1:11435/v1", provider_count: 0, target_count: 0, route_count: 0, recent_requests: 0, inflight: [], runtimes: [] };
-const defaultResourcePolicy: ResourcePolicy = { version: 1, profile: "stealth", memory_budget_percent: 50, memory_budget_mib: null, auto_load: true, idle_unload_minutes: 5, compute_duty_percent: 25, cpu_threads: Math.max(1, Math.floor((navigator.hardwareConcurrency || 4) / 2)), max_parallel_prompts: 1, process_priority: -1, gguf_gpu_layers: -1, disk_kv_enabled: true, disk_kv_max_bytes: 10 * 1024 ** 3 };
 const ChatPage = lazy(() => import("./ChatPage").then(module => ({ default: module.ChatPage })));
 
 export default function App() {
+  const [queryClient] = useState(createQueryClient);
+  return <QueryClientProvider client={queryClient}><AppShell /></QueryClientProvider>;
+}
+
+function AppShell() {
+  const queryClient = useQueryClient();
+  const enabled = isTauri();
   const [page, setPage] = useState<Page>("overview");
-  const [dashboard, setDashboard] = useState(emptyDashboard);
-  const [providers, setProviders] = useState<Provider[]>([]);
-  const [providerPresets, setProviderPresets] = useState<ProviderPreset[]>([]);
-  const [targets, setTargets] = useState<ModelTarget[]>([]);
-  const [routes, setRoutes] = useState<ModelRoute[]>([]);
-  const [publicModels, setPublicModels] = useState<PublicModel[]>([]);
-  const [routingPolicies, setRoutingPolicies] = useState<RoutingPolicy[]>([]);
-  const [routingProfiles, setRoutingProfiles] = useState<TargetRoutingProfile[]>([]);
-  const [routingTasks, setRoutingTasks] = useState<RoutingTaskDefinition[]>([]);
-  const [logs, setLogs] = useState<RequestLog[]>([]);
-  const [localKeys, setLocalKeys] = useState<LocalApiKey[]>([]);
-  const [settings, setSettings] = useState<Record<string, string>>({});
-  const [resourcePolicy, setResourcePolicy] = useState<ResourcePolicy>(defaultResourcePolicy);
   const [inflight, setInflight] = useState<InFlightRequest[]>([]);
   const [notice, setNotice] = useState<{ type: "error" | "success"; text: string } | null>(null);
-  const [loading, setLoading] = useState(true);
   const [sidebar, setSidebar] = useState(true);
   const [version, setVersion] = useState("");
 
-  const refresh = useCallback(async () => {
-    if (!isTauri()) { setLoading(false); return; }
-    try {
-      const [dash, p, presets, t, r, models, l, s, k, policy, routePolicies, targetProfiles, tasks] = await Promise.all([
-        command<DashboardData>("dashboard"), command<Provider[]>("list_providers"), command<ProviderPreset[]>("list_provider_presets"),
-        command<ModelTarget[]>("list_targets"), command<ModelRoute[]>("list_routes"), command<PublicModel[]>("list_public_models"), command<LogResult>("list_logs", { query: { legacy_only: false, limit: 100 } }), command<Record<string, string>>("get_settings"), command<LocalApiKey[]>("list_local_api_keys"), command<ResourcePolicy>("get_resource_policy"),
-        command<RoutingPolicy[]>("list_routing_policies"), command<TargetRoutingProfile[]>("list_target_routing_profiles"), command<RoutingTaskDefinition[]>("list_routing_tasks"),
-      ]);
-      setDashboard(dash); setProviders(p); setProviderPresets(presets); setTargets(t); setRoutes(r); setPublicModels(models); setLogs(l.items); setSettings(s); setLocalKeys(k); setResourcePolicy(policy);
-      setRoutingPolicies(routePolicies); setRoutingProfiles(targetProfiles); setRoutingTasks(tasks);
-      setInflight(dash.inflight ?? []);
-    } catch (error) { setNotice({ type: "error", text: errorMessage(error) }); }
-    finally { setLoading(false); }
-  }, []);
+  const dashboardQuery = useQuery({ queryKey: queryKeys.dashboard, queryFn: fetchers.dashboard, enabled, refetchInterval: page === "overview" ? 10_000 : false });
+  const providersQuery = useQuery({ queryKey: queryKeys.providers, queryFn: fetchers.providers, enabled });
+  const presetsQuery = useQuery({ queryKey: queryKeys.providerPresets, queryFn: fetchers.providerPresets, enabled });
+  const targetsQuery = useQuery({ queryKey: queryKeys.targets, queryFn: fetchers.targets, enabled });
+  const routesQuery = useQuery({ queryKey: queryKeys.routes, queryFn: fetchers.routes, enabled });
+  const publicModelsQuery = useQuery({ queryKey: queryKeys.publicModels, queryFn: fetchers.publicModels, enabled });
+  const settingsQuery = useQuery({ queryKey: queryKeys.settings, queryFn: fetchers.settings, enabled });
+  const localKeysQuery = useQuery({ queryKey: queryKeys.localKeys, queryFn: fetchers.localKeys, enabled });
+  const resourcePolicyQuery = useQuery({ queryKey: queryKeys.resourcePolicy, queryFn: fetchers.resourcePolicy, enabled });
+  const routingPoliciesQuery = useQuery({ queryKey: queryKeys.routingPolicies, queryFn: fetchers.routingPolicies, enabled });
+  const routingProfilesQuery = useQuery({ queryKey: queryKeys.routingProfiles, queryFn: fetchers.routingProfiles, enabled });
+  const routingTasksQuery = useQuery({ queryKey: queryKeys.routingTasks, queryFn: fetchers.routingTasks, enabled });
+  const snapshotQueries = [dashboardQuery, providersQuery, presetsQuery, targetsQuery, routesQuery, publicModelsQuery, settingsQuery, localKeysQuery, resourcePolicyQuery, routingPoliciesQuery, routingProfilesQuery, routingTasksQuery];
+  const dashboard = dashboardQuery.data ?? emptyDashboard;
+  const providers = providersQuery.data ?? [];
+  const providerPresets = presetsQuery.data ?? [];
+  const targets = targetsQuery.data ?? [];
+  const routes = routesQuery.data ?? [];
+  const publicModels = publicModelsQuery.data ?? [];
+  const settings = settingsQuery.data ?? {};
+  const localKeys = localKeysQuery.data ?? [];
+  const resourcePolicy = resourcePolicyQuery.data ?? defaultResourcePolicy;
+  const routingPolicies = routingPoliciesQuery.data ?? [];
+  const routingProfiles = routingProfilesQuery.data ?? [];
+  const routingTasks = routingTasksQuery.data ?? [];
+  const loading = enabled && snapshotQueries.some(query => query.isPending);
+  const snapshotError = snapshotQueries.find(query => query.error)?.error;
 
+  const refresh = useCallback(async () => { await invalidateAppQueries(queryClient); }, [queryClient]);
   useEffect(() => { void appVersion().then(setVersion).catch(() => undefined); }, []);
-  useEffect(() => { void refresh(); const timer = window.setInterval(() => { if (page === "overview" || page === "keys" || page === "usage" || page === "logs" || page === "routing") void refresh(); }, 10_000); return () => clearInterval(timer); }, [refresh, page]);
-
+  useEffect(() => { if (dashboardQuery.data?.inflight) setInflight(dashboardQuery.data.inflight); }, [dashboardQuery.data]);
   useEffect(() => {
     let unlisten: (() => void) | undefined;
-    void listenGatewayTraffic(next => setInflight(next)).then(fn => { unlisten = fn; }).catch(() => undefined);
+    void listenGatewayTraffic(next => {
+      setInflight(next);
+      void queryClient.invalidateQueries({ queryKey: queryKeys.logFacets });
+      void queryClient.invalidateQueries({ queryKey: queryKeys.routingAttempts });
+      void queryClient.invalidateQueries({ queryKey: ["logs"] });
+    }).then(fn => { unlisten = fn; }).catch(() => undefined);
     return () => unlisten?.();
-  }, []);
-
+  }, [queryClient]);
   useEffect(() => {
     let unlisten: (() => void) | undefined;
     void listenDesktopNavigate(next => {
@@ -88,11 +99,12 @@ export default function App() {
     return () => unlisten?.();
   }, []);
 
-  const success = (text: string) => { setNotice({ type: "success", text }); window.setTimeout(() => setNotice(null), 3500); };
-  const fail = (error: unknown) => setNotice({ type: "error", text: errorMessage(error) });
+  const success = useCallback((text: string) => { setNotice({ type: "success", text }); window.setTimeout(() => setNotice(null), 3500); }, []);
+  const fail = useCallback((error: unknown) => setNotice({ type: "error", text: errorMessage(error) }), []);
+  useEffect(() => { if (snapshotError) fail(snapshotError); }, [snapshotError, fail]);
   const stopRequest = (id: string) => { void command("cancel_inflight_request", { id }).then(() => setInflight(current => current.filter(item => item.id !== id))).catch(fail); };
   const stopAll = () => { void command("cancel_all_inflight_requests").then(() => setInflight([])).catch(fail); };
-  const common = { providers, providerPresets, targets, routes, routingPolicies, routingProfiles, routingTasks, logs, localKeys, settings, resourcePolicy, refresh, success, fail };
+  const common = { providers, providerPresets, targets, routes, routingPolicies, routingProfiles, routingTasks, localKeys, settings, resourcePolicy, refresh, success, fail };
 
   return <div className="shell">
     <aside className={sidebar ? "sidebar" : "sidebar collapsed"}>
@@ -124,7 +136,7 @@ export default function App() {
   </div>;
 }
 
-type Common = { providers: Provider[]; providerPresets: ProviderPreset[]; targets: ModelTarget[]; routes: ModelRoute[]; routingPolicies: RoutingPolicy[]; routingProfiles: TargetRoutingProfile[]; routingTasks: RoutingTaskDefinition[]; logs: RequestLog[]; localKeys: LocalApiKey[]; settings: Record<string, string>; resourcePolicy: ResourcePolicy; refresh: () => Promise<void>; success: (text: string) => void; fail: (error: unknown) => void };
+type Common = { providers: Provider[]; providerPresets: ProviderPreset[]; targets: ModelTarget[]; routes: ModelRoute[]; routingPolicies: RoutingPolicy[]; routingProfiles: TargetRoutingProfile[]; routingTasks: RoutingTaskDefinition[]; localKeys: LocalApiKey[]; settings: Record<string, string>; resourcePolicy: ResourcePolicy; refresh: () => Promise<void>; success: (text: string) => void; fail: (error: unknown) => void };
 
 function PageHead({ eyebrow, title, description, action }: { eyebrow: string; title: string; description: string; action?: ReactNode }) {
   return <div className="page-head"><div><span className="eyebrow">{eyebrow}</span><h1>{title}</h1><p>{description}</p></div>{action}</div>;
@@ -156,7 +168,7 @@ function Overview({ dashboard, inflight, targets, publicModels, onNavigate, onSt
     </div>
     <section className="panel">
       <div className="panel-title"><div><h3>Active requests</h3><p>{inflight.length ? `${inflight.length} in flight` : "Live view of gateway traffic."}</p></div><div className="button-row">{inflight.length > 0 && <button className="text-button" onClick={onStopAll}>Stop all</button>}<button className="text-button" onClick={() => onNavigate("logs")}>Logs <ChevronRight size={15} /></button></div></div>
-      {inflight.length ? <div className="inflight-list">{inflight.map(request => <div className="inflight-row" key={request.id}><Timer size={15} /><div><strong>{request.alias}</strong><small>{request.target_name ?? request.target_id ?? "Selecting model"} · {request.phase}</small></div><code>{request.endpoint.replace("/v1/", "")}</code><Elapsed since={request.started_at} /><button type="button" className="icon-button" aria-label="Stop request" onClick={() => onStop(request.id)}><X size={15} /></button></div>)}</div> : <Empty icon={<Timer />} title="No running requests" text="Authenticated inference shows the alias and selected model here." />}
+      {inflight.length ? <div className="inflight-list">{inflight.map(request => <div className="inflight-row" key={request.id}><Timer size={15} /><div><strong>{request.alias}</strong><small>{inflightDetail(request)}</small></div><code>{request.endpoint.replace("/v1/", "")}</code><Elapsed since={request.started_at} /><button type="button" className="icon-button" aria-label="Stop request" onClick={() => onStop(request.id)}><X size={15} /></button></div>)}</div> : <Empty icon={<Timer />} title="No running requests" text="Authenticated inference shows the alias and selected model here." />}
     </section>
   </>;
 }
@@ -168,19 +180,17 @@ function Elapsed({ since }: { since: string }) {
   return <span>{ms < 1000 ? `${ms} ms` : `${(ms / 1000).toFixed(1)} s`}</span>;
 }
 
-const emptyUsage: UsageData = { request_count: 0, success_count: 0, average_latency_ms: 0, input_tokens: 0, output_tokens: 0, cache_read_tokens: 0, cache_write_tokens: 0, unknown_usage_count: 0, tokens_per_second: null, estimated_cost_usd: null, buckets: [], by_key: [], by_model: [], throughput_candles: [], cost_candles: [] };
-
 function UsagePage() {
   const [period, setPeriod] = useState<"24h" | "7d" | "30d" | "all">("7d");
   const [target, setTarget] = useState<string | null>(null);
-  const [usage, setUsage] = useState<UsageData>(emptyUsage);
-  const [loading, setLoading] = useState(true);
-  useEffect(() => {
-    if (!isTauri()) { setLoading(false); return; }
-    let active = true;
-    const load = async () => { try { const data = await command<UsageData>("get_usage", target ? { period, target } : { period }); if (active) setUsage(data); } finally { if (active) setLoading(false); } };
-    void load(); const timer = window.setInterval(() => void load(), 10_000); return () => { active = false; clearInterval(timer); };
-  }, [period, target]);
+  const usageQuery = useQuery({
+    queryKey: queryKeys.usage(period, target),
+    queryFn: () => fetchers.usage(period, target),
+    enabled: isTauri(),
+    refetchInterval: 10_000,
+  });
+  const usage = usageQuery.data ?? emptyUsage;
+  const loading = usageQuery.isPending;
   const successRate = usage.request_count ? `${Math.round(usage.success_count / usage.request_count * 100)}%` : "—";
   const models = usage.by_model ?? [];
   return <>
@@ -280,24 +290,25 @@ function tokenPrice(input?: number | null, output?: number | null) {
 
 function CloudPage({ providers, targets, routingProfiles, refresh, success, fail }: Common) {
   const cloud = targets.filter(target => target.kind === "cloud");
-  const [providerId, setProviderId] = useState(providers[0]?.id ?? ""); const [models, setModels] = useState<ProviderModel[]>([]); const [model, setModel] = useState(""); const [protocol, setProtocol] = useState<WireProtocol>("open_ai_chat"); const [capabilities, setCapabilities] = useState(["chat", "streaming"]); const [busy, setBusy] = useState(false);
+  const [providerId, setProviderId] = useState(providers[0]?.id ?? ""); const [model, setModel] = useState(""); const [protocol, setProtocol] = useState<WireProtocol>("open_ai_chat"); const [capabilities, setCapabilities] = useState(["chat", "streaming"]); const [busy, setBusy] = useState(false);
+  const queryClient = useQueryClient();
+  const modelsQuery = useQuery({ queryKey: queryKeys.providerModels(providerId), queryFn: () => fetchers.providerModels(providerId), enabled: isTauri() && !!providerId });
+  const models = modelsQuery.data ?? [];
   const selected = models.find(item => item.id === model);
-  useEffect(() => { if (providerId) void command<ProviderModel[]>("cached_provider_models", { id: providerId }).then(setModels).catch(() => setModels([])); }, [providerId]);
+  const metadataQuery = useQuery({
+    queryKey: queryKeys.modelMetadata(model),
+    queryFn: () => fetchers.modelMetadata(model),
+    enabled: isTauri() && !!model.trim() && !selected,
+  });
   useEffect(() => {
     if (selected) {
       setProtocol(selected.wire_protocol);
       setCapabilities(selected.capabilities);
       return;
     }
-    if (!model.trim()) return;
-    let active = true;
-    void command<ModelMetadata>("lookup_model_metadata", { model }).then(meta => {
-      if (!active || meta.source === "fallback") return;
-      setCapabilities(meta.capabilities);
-    }).catch(() => undefined);
-    return () => { active = false; };
-  }, [model, selected]);
-  const sync = async () => { if (!providerId) return; setBusy(true); try { const found = await command<ProviderModel[]>("sync_provider_models", { id: providerId }); setModels(found); success(`${found.length} models discovered`); } catch (e) { fail(e); } finally { setBusy(false); } };
+    if (metadataQuery.data && metadataQuery.data.source !== "fallback") setCapabilities(metadataQuery.data.capabilities);
+  }, [model, selected, metadataQuery.data]);
+  const sync = async () => { if (!providerId) return; setBusy(true); try { const found = await command<ProviderModel[]>("sync_provider_models", { id: providerId }); queryClient.setQueryData(queryKeys.providerModels(providerId), found); success(`${found.length} models discovered`); } catch (e) { fail(e); } finally { setBusy(false); } };
   const add = async () => { const provider = providers.find(item => item.id === providerId); if (!provider || !model) return; try { await command("save_target", { target: { id: crypto.randomUUID(), provider_id: provider.id, name: model, kind: "cloud", wire_protocol: protocol, provider_model: model, local_path: null, runtime_url: null, capabilities, enabled: true, state: "ready", size_bytes: null } }); setModel(""); await refresh(); success("Cloud model added"); } catch (e) { fail(e); } };
   const selectedPrice = tokenPrice(selected?.input_price_per_million, selected?.output_price_per_million);
   return <><PageHead eyebrow="Catalog" title="Cloud models" description="Features and list prices come from the provider API when available, otherwise from known-model defaults." />
@@ -320,7 +331,7 @@ function RoutesPage({ providers, targets, routes, publicModels, routingPolicies,
       success(adaptive ? "Adaptive routing enabled for this alias" : "Performance routing enabled for this alias");
     } catch (error) { fail(error); }
   };
-  return <><PageHead eyebrow="Routing" title="Custom routes" description="Optional named stacks with a primary pool and reserve fallbacks. Performance keeps primary order; Adaptive ranks the primaries by quality, price, and task." action={<div className="button-row"><button className="secondary" onClick={() => setShowConfig(true)}><FileDown size={16} />Import / export</button><button className="primary" onClick={() => setEditing(null)} disabled={!targets.length}><Plus size={17} />Create route</button></div>} />
+  return <><PageHead eyebrow="Routing" title="Custom routes" description="Optional named stacks with a primary pool and reserve fallbacks. Performance walks the pool in listed order; Adaptive ranks the primaries. Fallbacks are sequential failover after the pool is exhausted." action={<div className="button-row"><button className="secondary" onClick={() => setShowConfig(true)}><FileDown size={16} />Import / export</button><button className="primary" onClick={() => setEditing(null)} disabled={!targets.length}><Plus size={17} />Create route</button></div>} />
     <div className="route-list">
       <article className="route-card builtin-route-card">
         <div className="route-main"><div className="route-icon"><Sparkles /></div><div><div className="row"><h3>adaptive-routing</h3><Badge tone="good">Built-in</Badge></div><p>Always-on ranking across every enabled model by task quality, price, and the inferred task.</p></div></div>
@@ -417,7 +428,7 @@ function RoutingPolicyModal({ route, policy, tasks, targets, profiles, onEditPro
   const deleteTask = async (id: string) => { try { await command("delete_routing_task", { id }); await onTasksChanged(); } catch (error) { fail(error); } };
   return <Modal title={`Routing · ${route.alias}`} wide action={<div className="segmented small" role="group" aria-label="Editor mode"><button type="button" className={!expert ? "selected" : ""} aria-pressed={!expert} onClick={() => setExpert(false)}>Easy</button><button type="button" className={expert ? "selected" : ""} aria-pressed={expert} onClick={() => setExpert(true)}>Expert</button></div>} close={close}><form className="form wide-form" onSubmit={savePolicy}>
     <RoutingModeSwitch adaptive={adaptiveEnabled(value)} onChange={enabled => setValue(withAdaptiveEnabled(route, value, enabled))} />
-    <div className="security-note"><Gauge size={17} /><span>{adaptiveEnabled(value) ? "Adaptive ranks this alias's primary models by quality, price, and the inferred task. Fallbacks stay in reserve." : "Performance keeps the primary pool in listed order and skips slow, rate-limited, or failing models. Fallbacks run only after that."}</span></div>
+        <div className="security-note"><Gauge size={17} /><span>{adaptiveEnabled(value) ? "Adaptive ranks this alias's primary models by quality, price, and the inferred task. Fallbacks stay in reserve and run one by one after the pool is exhausted." : "Performance keeps the primary pool in listed order and skips slow, rate-limited, or failing primaries. Fallbacks run only after that, one by one, with a full timeout."}</span></div>
     <Field label="Privacy"><select aria-label="Privacy" value={value.privacy} onChange={event => setValue({ ...value, privacy: event.target.value as RoutingPolicy["privacy"] })}><option value="local_only">Local only</option><option value="local_preferred">Local preferred</option><option value="cloud_allowed">Cloud allowed</option></select></Field>
     {expert && <>
     <div className="three-fields"><Field label="Serving"><select aria-label="Adaptive serving" value={value.status === "shadow" ? "shadow" : "active"} disabled={!adaptiveEnabled(value)} onChange={event => setValue({ ...value, mode: "adaptive", status: event.target.value as RoutingPolicy["status"] })}><option value="active">Active · ranked models serve</option><option value="shadow">Shadow · fallbacks serve, adaptive logs</option></select></Field><Field label="Default task"><select aria-label="Default task" value={value.default_task} onChange={event => setValue({ ...value, default_task: event.target.value })}>{tasks.map(task => <option value={task.id} key={task.id}>{task.label}</option>)}</select></Field></div>
@@ -429,7 +440,7 @@ function RoutingPolicyModal({ route, policy, tasks, targets, profiles, onEditPro
     <div><span className="field-label">Simulator request metadata</span><div className="simulator-meta"><input aria-label="Simulator endpoint" value={simEndpoint} onChange={event => setSimEndpoint(event.target.value)} /><label><input type="checkbox" checked={simTools} onChange={event => setSimTools(event.target.checked)} />Tools</label><label><input type="checkbox" checked={simReasoning} onChange={event => setSimReasoning(event.target.checked)} />Reasoning</label><input aria-label="Simulator modalities" placeholder="vision,audio" value={simModalities} onChange={event => setSimModalities(event.target.value)} /><input aria-label="Simulator max output" type="number" min="1" value={simMaxOutput} onChange={event => setSimMaxOutput(Number(event.target.value))} /></div></div>
     <div><div className="panel-title"><div><h3>Ordered task rules</h3><p>All populated conditions must match. First match wins.</p></div><button type="button" className="text-button" onClick={addRule}><Plus size={14} />Rule</button></div>{value.rules.map((rule, index) => <div className="rule-card" key={rule.id}><div className="rule-row"><input type="number" aria-label={`Rule ${index + 1} priority`} value={rule.priority} onChange={event => updateRule(rule.id, { priority: Number(event.target.value) })} /><select value={rule.task} onChange={event => updateRule(rule.id, { task: event.target.value })}>{tasks.map(task => <option value={task.id} key={task.id}>{task.label}</option>)}</select><input placeholder="Text regex (optional)" value={rule.text_pattern ?? ""} onChange={event => updateRule(rule.id, { text_pattern: event.target.value || null })} /><button type="button" className="icon-button" onClick={() => setValue({ ...value, rules: value.rules.filter(item => item.id !== rule.id) })}><X size={14} /></button></div><div className="rule-conditions"><input placeholder="Endpoint contains" value={rule.endpoint_contains ?? ""} onChange={event => updateRule(rule.id, { endpoint_contains: event.target.value || null })} /><select value={rule.has_tools == null ? "" : String(rule.has_tools)} onChange={event => updateRule(rule.id, { has_tools: event.target.value === "" ? null : event.target.value === "true" })}><option value="">Any tools state</option><option value="true">Has tools</option><option value="false">No tools</option></select><select value={rule.reasoning == null ? "" : String(rule.reasoning)} onChange={event => updateRule(rule.id, { reasoning: event.target.value === "" ? null : event.target.value === "true" })}><option value="">Any reasoning state</option><option value="true">Reasoning requested</option><option value="false">No reasoning</option></select><input placeholder="Modalities: vision,audio" value={rule.modalities_any.join(",")} onChange={event => updateRule(rule.id, { modalities_any: event.target.value.split(",").map(item => item.trim()).filter(Boolean) })} /><input type="number" min="0" placeholder="Min tokens" value={rule.min_input_tokens ?? ""} onChange={event => updateRule(rule.id, { min_input_tokens: event.target.value ? Number(event.target.value) : null })} /><input type="number" min="0" placeholder="Max tokens" value={rule.max_input_tokens ?? ""} onChange={event => updateRule(rule.id, { max_input_tokens: event.target.value ? Number(event.target.value) : null })} /></div></div>)}</div>
     <section className="routing-simulator"><div><h3>Decision preview</h3><p>Example content stays in memory and is never logged.</p></div><div className="simulator-inputs"><select aria-label="Task hint" value={hint} onChange={event => setHint(event.target.value)}><option value="">No explicit task hint</option>{tasks.map(task => <option value={task.id} key={task.id}>{task.label}</option>)}</select><textarea aria-label="Routing sample" value={sample} onChange={event => setSample(event.target.value)} placeholder="Optional example prompt" /><button type="button" className="secondary" onClick={() => void simulate()}><Eye size={15} />Preview</button></div>{preview && <div className="decision-preview"><strong>{preview.mode} · {preview.task} via {preview.task_source}</strong>{preview.decision.ranked.map((candidate, index) => <span key={candidate.target_id}>{index + 1}. {targets.find(target => target.id === candidate.target_id)?.name ?? candidate.target_id} · {(candidate.score.total * 100).toFixed(1)} · {candidate.cost_verified ? `$${candidate.estimated_cost_usd?.toFixed(5)}` : "price unknown"}</span>)}{preview.decision.excluded.map(candidate => <span className="excluded" key={candidate.target_id}>{candidate.target_id}: {candidate.reason}</span>)}</div>}</section>
-    <div className="security-note"><ShieldCheck size={17} /><span>Capabilities, privacy, context and known cost limits filter primaries before scoring. Fallbacks stay available for errors, outages, and missing features.</span></div>
+    <div className="security-note"><ShieldCheck size={17} /><span>Capabilities, privacy, context and known cost limits filter primaries before scoring. Fallbacks stay available for errors, outages, and missing features, and run in listed order with a full timeout.</span></div>
     </>}
     <ModalActions close={close} busy={busy} label="Save policy" />
   </form></Modal>;
@@ -444,7 +455,9 @@ function TargetProfileModal({ target, profile, tasks, close, done, fail }: { tar
 
 function RoutingConfigModal({ close, refresh, success, fail }: { close: () => void; refresh: () => Promise<void>; success: (text: string) => void; fail: (error: unknown) => void }) {
   const [json, setJson] = useState(""); const [preview, setPreview] = useState<string[]>([]); const [busy, setBusy] = useState(false);
-  useEffect(() => { void command<RoutingConfigExport>("export_routing_config").then(value => setJson(JSON.stringify(value, null, 2))).catch(fail); }, []);
+  const exportQuery = useQuery({ queryKey: queryKeys.routingConfig, queryFn: fetchers.routingConfig, enabled: isTauri() });
+  useEffect(() => { if (exportQuery.data) setJson(JSON.stringify(exportQuery.data, null, 2)); }, [exportQuery.data]);
+  useEffect(() => { if (exportQuery.error) fail(exportQuery.error); }, [exportQuery.error, fail]);
   const run = async (apply: boolean) => { setBusy(true); try { const config = JSON.parse(json) as RoutingConfigExport; const result = await command<{ valid: boolean; task_count: number; profile_count: number; policy_count: number; warnings: string[] }>("import_routing_config", { config, apply }); setPreview([`${result.task_count} tasks · ${result.profile_count} profiles · ${result.policy_count} policies`, ...result.warnings]); if (apply) { await refresh(); success("Routing configuration imported atomically"); close(); } } catch (error) { fail(error); } finally { setBusy(false); } };
   return <Modal title="Routing policy JSON" close={close}><div className="form"><textarea className="config-json" aria-label="Routing configuration JSON" value={json} onChange={event => setJson(event.target.value)} />{preview.map(item => <small className="config-warning" key={item}>{item}</small>)}<div className="security-note"><ShieldCheck size={17} /><span>Exports exclude credentials, request history, prompts and responses. Preview validates every reference before changes are applied.</span></div><div className="modal-actions"><button className="secondary" onClick={close}>Cancel</button><button className="secondary" disabled={busy} onClick={() => void run(false)}>Validate preview</button><button className="primary" disabled={busy} onClick={() => void run(true)}>Apply import</button></div></div></Modal>;
 }
@@ -505,27 +518,27 @@ function RouteModal({ route, providers, targets, publicModels, close, done, fail
 }
 
 function LogsPage({ localKeys, refresh, success, fail }: Common) {
-  const [items, setItems] = useState<RequestLog[]>([]); const [total, setTotal] = useState(0); const [page, setPage] = useState(0); const [reload, setReload] = useState(0);
-  const [facets, setFacets] = useState<LogFacets>({ aliases: [], targets: [], endpoints: [] });
+  const queryClient = useQueryClient();
+  const [page, setPage] = useState(0);
   const [text, setText] = useState(""); const [keyFilter, setKeyFilter] = useState(""); const [alias, setAlias] = useState(""); const [target, setTarget] = useState(""); const [endpoint, setEndpoint] = useState(""); const [status, setStatus] = useState(""); const [from, setFrom] = useState(""); const [to, setTo] = useState("");
+  const debouncedText = useDebouncedValue(text, 180);
   const logQuery = (withPage = true): LogQuery => ({
-    query: text || null, api_key_id: keyFilter && keyFilter !== "legacy" ? keyFilter : null, legacy_only: keyFilter === "legacy",
+    query: debouncedText || null, api_key_id: keyFilter && keyFilter !== "legacy" ? keyFilter : null, legacy_only: keyFilter === "legacy",
     alias: alias || null, target: target || null, endpoint: endpoint || null, status_class: (status || null) as LogQuery["status_class"],
     from: from ? new Date(from).toISOString() : null, to: to ? new Date(to).toISOString() : null,
     ...(withPage ? { limit: 50, offset: page * 50 } : {}),
   });
-  useEffect(() => {
-    if (!isTauri()) return;
-    let unlisten: (() => void) | undefined;
-    void listenGatewayTraffic(() => setReload(value => value + 1)).then(fn => { unlisten = fn; }).catch(() => undefined);
-    const timer = window.setInterval(() => setReload(value => value + 1), 2000);
-    return () => { unlisten?.(); window.clearInterval(timer); };
-  }, []);
-  useEffect(() => { if (!isTauri()) return; void command<LogFacets>("get_log_facets").then(setFacets).catch(fail); }, [reload]);
-  useEffect(() => { if (!isTauri()) return; const timer = window.setTimeout(() => { void command<LogResult>("list_logs", { query: logQuery() }).then(result => { setItems(result.items); setTotal(result.total); }).catch(fail); }, 180); return () => clearTimeout(timer); }, [text, keyFilter, alias, target, endpoint, status, from, to, page, reload]);
+  const query = logQuery();
+  const facetsQuery = useQuery({ queryKey: queryKeys.logFacets, queryFn: fetchers.logFacets, enabled: isTauri() });
+  const logsQuery = useQuery({ queryKey: queryKeys.logs(query), queryFn: () => fetchers.logs(query), enabled: isTauri(), placeholderData: keepPreviousData });
+  const facets = facetsQuery.data ?? { aliases: [], targets: [], endpoints: [] };
+  const items = logsQuery.data?.items ?? [];
+  const total = logsQuery.data?.total ?? 0;
+  useEffect(() => { if (facetsQuery.error) fail(facetsQuery.error); }, [facetsQuery.error, fail]);
+  useEffect(() => { if (logsQuery.error) fail(logsQuery.error); }, [logsQuery.error, fail]);
   const updateFilter = (setter: (value: string) => void, value: string) => { setter(value); setPage(0); };
   const reset = () => { setText(""); setKeyFilter(""); setAlias(""); setTarget(""); setEndpoint(""); setStatus(""); setFrom(""); setTo(""); setPage(0); };
-  const clear = async () => { if (!confirm("Delete all request metadata?")) return; try { await command("clear_logs"); setReload(value => value + 1); await refresh(); success("Logs cleared"); } catch (e) { fail(e); } };
+  const clear = async () => { if (!confirm("Delete all request metadata?")) return; try { await command("clear_logs"); await queryClient.invalidateQueries({ queryKey: ["logs"] }); await queryClient.invalidateQueries({ queryKey: queryKeys.logFacets }); await refresh(); success("Logs cleared"); } catch (e) { fail(e); } };
   const exportCsv = async () => { const path = await save({ defaultPath: "local-ai-router-logs.csv", filters: [{ name: "CSV", extensions: ["csv"] }] }); if (!path) return; try { await command("export_logs_csv", { path, query: logQuery(false) }); success(`${total} matching logs exported`); } catch (e) { fail(e); } };
   return <><PageHead eyebrow="Observability" title="Request logs" description="Metadata only. Prompt and response content is never stored." action={<div className="button-row"><button className="secondary" onClick={() => void exportCsv()}><FileDown size={16} />Export filtered CSV</button><button className="secondary danger-text" onClick={() => void clear()}><Trash2 size={16} />Clear</button></div>} />
     <section className="panel log-filters"><div className="search"><Search size={17} /><input value={text} onChange={e => updateFilter(setText, e.target.value)} placeholder="Search endpoint, key, alias, target, status or error…" /></div><div className="filter-grid">
@@ -537,33 +550,23 @@ function LogsPage({ localKeys, refresh, success, fail }: Common) {
       <label className="date-filter"><span>From</span><input type="datetime-local" value={from} onChange={e => updateFilter(setFrom, e.target.value)} /></label><label className="date-filter"><span>To</span><input type="datetime-local" value={to} onChange={e => updateFilter(setTo, e.target.value)} /></label><button className="secondary" onClick={reset}><X size={15} />Reset</button>
     </div></section>
     <div className="result-meta"><span>{total} matching request{total === 1 ? "" : "s"}</span><span>Page {page + 1} of {Math.max(1, Math.ceil(total / 50))}</span></div>
-    <div className="log-table"><div className="log-head"><span>Time</span><span>API key</span><span>Endpoint</span><span>Route</span><span>Status</span><span>Latency</span><span>Tokens</span><span>Attempts</span></div>{items.map(log => <div className="log-row" key={log.id}><span>{new Date(log.created_at).toLocaleString()}</span><strong>{log.api_key_name ?? "Unknown / Legacy"}</strong><code>{log.endpoint.replace("/v1/", "")}</code><span><strong>{log.alias ?? "—"}</strong><small>{log.target ?? "No target"}</small></span><span><Badge tone={statusTone(log.status)}>{log.status}</Badge>{(log.error_code || log.error_message) && <small>{[log.error_code, log.error_message].filter(Boolean).join(" · ")}</small>}</span><span>{log.latency_ms} ms</span><span>{log.input_tokens == null || log.output_tokens == null ? "—" : formatNumber(log.input_tokens + log.output_tokens)}</span><span>{log.attempts}</span></div>)}</div>{!items.length && <Empty icon={<Activity />} title="No matching requests" text="Adjust the filters or make an authenticated request." />}
+    <div className="log-table"><div className="log-head"><span>Time</span><span>API key</span><span>Endpoint</span><span>Route</span><span>Status</span><span>Latency</span><span>Tokens</span><span>Attempts</span></div>{items.map(log => <div className="log-row" key={log.id}><span>{new Date(log.created_at).toLocaleString()}</span><strong>{log.api_key_name ?? "Unknown / Legacy"}</strong><code>{log.endpoint.replace("/v1/", "")}</code><span><strong>{log.alias ?? "—"}</strong><small>{log.target ?? "No target"}</small></span><span><Badge tone={statusTone(log.status)}>{log.status}</Badge>{(log.error_code || log.error_message) && <small>{[log.error_code, log.error_message].filter(Boolean).join(" · ")}</small>}</span><span>{log.latency_ms} ms</span><span>{log.input_tokens == null || log.output_tokens == null ? "—" : formatNumber(log.input_tokens + log.output_tokens)}</span><span>{log.attempts}{recoveryLabel(log.attempts, log.status) && <small>{recoveryLabel(log.attempts, log.status)}</small>}</span></div>)}</div>{!items.length && <Empty icon={<Activity />} title="No matching requests" text="Adjust the filters or make an authenticated request." />}
     {total > 50 && <div className="pagination"><button className="secondary" disabled={page === 0} onClick={() => setPage(page - 1)}>Previous</button><button className="secondary" disabled={(page + 1) * 50 >= total} onClick={() => setPage(page + 1)}>Next</button></div>}
   </>;
 }
 
 function RoutingLogsPage({ fail }: { fail: (error: unknown) => void }) {
-  const [items, setItems] = useState<RoutingAttempt[]>([]);
   const [alias, setAlias] = useState("");
-  const [reload, setReload] = useState(0);
-  useEffect(() => {
-    if (!isTauri()) return;
-    let unlisten: (() => void) | undefined;
-    void listenGatewayTraffic(() => setReload(value => value + 1)).then(fn => { unlisten = fn; }).catch(() => undefined);
-    const timer = window.setInterval(() => setReload(value => value + 1), 2000);
-    return () => { unlisten?.(); window.clearInterval(timer); };
-  }, []);
-  useEffect(() => {
-    if (!isTauri()) return;
-    void command<RoutingAttempt[]>("list_routing_attempts", { requestId: null, limit: 200 }).then(setItems).catch(fail);
-  }, [reload]);
+  const attemptsQuery = useQuery({ queryKey: queryKeys.routingAttempts, queryFn: fetchers.routingAttempts, enabled: isTauri() });
+  useEffect(() => { if (attemptsQuery.error) fail(attemptsQuery.error); }, [attemptsQuery.error, fail]);
+  const items = attemptsQuery.data ?? [];
   const aliases = [...new Set(items.map(item => item.alias))];
   const visible = items.filter(item => !alias || item.alias === alias);
   return <><PageHead eyebrow="Observability" title="Routing" description="Decision metadata for adaptive ranking, fallbacks, rate limits and slow-model avoidance. Prompt and response content is never stored." />
     <section className="panel log-filters"><div className="filter-grid"><select aria-label="Alias" value={alias} onChange={e => setAlias(e.target.value)}><option value="">All aliases</option>{aliases.map(value => <option key={value}>{value}</option>)}</select></div></section>
     <div className="result-meta"><span>{visible.length} attempt{visible.length === 1 ? "" : "s"}</span></div>
     <div className="log-table routing-table"><div className="log-head routing-head"><span>Time</span><span>Alias / task</span><span>Target</span><span>Mode</span><span>Status</span><span>Latency</span><span>Score</span><span>Reason</span></div>
-      {visible.map(attempt => <div className="log-row routing-row" key={attempt.id}><span>{new Date(attempt.created_at).toLocaleString()}</span><span><strong>{attempt.alias}</strong><small>{attempt.task} · {attempt.task_source}</small></span><span><strong>{attempt.target_id}</strong><small>{attempt.retry_after_until ? `limited until ${new Date(attempt.retry_after_until).toLocaleTimeString()}` : attempt.transient_failure ? "fallback" : "served"}</small></span><code>{attempt.routing_mode}</code><Badge tone={attempt.status < 400 ? "good" : attempt.status === 404 || attempt.status === 429 ? "warn" : "bad"}>{attempt.status}</Badge><span>{attempt.ttft_ms != null ? `${attempt.ttft_ms} ms TTFT` : `${attempt.latency_ms} ms`}</span><span>{attempt.score ? (attempt.score.total * 100).toFixed(1) : "—"}</span><small className="routing-reason">{attempt.reason}</small></div>)}
+      {visible.map(attempt => <div className="log-row routing-row" key={attempt.id}><span>{new Date(attempt.created_at).toLocaleString()}</span><span><strong>{attempt.alias}</strong><small>{attempt.task} · {attempt.task_source}</small></span><span><strong>{attempt.target_id}</strong><small>{routingAttemptLabel(attempt)}</small></span><code>{attempt.routing_mode}</code><Badge tone={attempt.status < 400 ? "good" : attempt.status === 404 || attempt.status === 429 ? "warn" : "bad"}>{attempt.status}</Badge><span>{attempt.ttft_ms != null ? `${attempt.ttft_ms} ms TTFT` : `${attempt.latency_ms} ms`}</span><span>{attempt.score ? (attempt.score.total * 100).toFixed(1) : "—"}</span><small className="routing-reason">{attempt.reason}</small></div>)}
     </div>
     {!visible.length && <Empty icon={<Sparkles />} title="No routing attempts" text="Call adaptive-routing or a custom alias to record ranking and fallback decisions." />}
   </>;
@@ -623,5 +626,29 @@ function formatUsd(value?: number | null) {
   return `$${value.toFixed(2)}`;
 }
 function statusTone(status: number): "good" | "warn" | "bad" | "neutral" { if (status >= 200 && status < 300) return "good"; if (status >= 400 && status < 500) return "warn"; if (status >= 500) return "bad"; return "neutral"; }
+function inflightPhase(request: InFlightRequest): string {
+  const error = request.last_error_message || request.last_error_code;
+  if (request.phase === "streaming") return "Streaming";
+  if (request.phase === "retrying") return error ? `Retrying after ${error}` : "Retrying";
+  if (request.phase === "rerouting") return error ? `Rerouting after ${error}` : "Rerouting";
+  return "Trying";
+}
+function inflightDetail(request: InFlightRequest): string {
+  const target = request.target_name ?? request.target_id ?? "Selecting model";
+  const phase = inflightPhase(request);
+  const attempt = request.attempt && request.attempt > 1 ? ` · attempt ${request.attempt}` : "";
+  const error = request.phase !== "retrying" && request.phase !== "rerouting" && (request.last_error_message || request.last_error_code);
+  return `${target} · ${phase}${attempt}${error ? ` · ${error}` : ""}`;
+}
+function recoveryLabel(attempts: number, status: number): string | null {
+  if (attempts <= 1) return null;
+  return status < 400 ? "rerouted" : "retried";
+}
+function routingAttemptLabel(attempt: { retry_after_until: string | null; transient_failure: boolean; reason: string }): string {
+  if (attempt.retry_after_until) return `limited until ${new Date(attempt.retry_after_until).toLocaleTimeString()}`;
+  if (attempt.reason.includes("same target")) return "retry";
+  if (attempt.transient_failure) return "fallback";
+  return "served";
+}
 function accessLabel(tier?: ProviderPreset["access_tier"]) { return ({ free_tier: "Free tier", starter_credits: "Starter credits", paid: "Paid", subscription: "Subscription", experimental: "Experimental" } as const)[tier ?? "paid"]; }
 function protocolLabel(protocol: WireProtocol) { return ({ open_ai_chat: "OpenAI Chat", open_ai_responses: "OpenAI Responses", anthropic_messages: "Anthropic Messages", gemini_generate_content: "Gemini GenerateContent" } as const)[protocol]; }

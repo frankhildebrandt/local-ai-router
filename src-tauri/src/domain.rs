@@ -7,6 +7,9 @@ pub const NOT_FOUND_TRIP: usize = 3;
 pub const NOT_FOUND_COOLDOWN_SECS: i64 = 120;
 pub const RATE_LIMIT_DEFAULT_SECS: i64 = 30;
 pub const UPSTREAM_TIMEOUT_MS: u64 = 120_000;
+pub const SAME_TARGET_RETRY_LIMIT: u32 = 1;
+pub const SAME_TARGET_RETRY_DELAY_MS: u64 = 400;
+pub const SAME_TARGET_RETRY_MAX_WAIT_MS: u64 = 2_000;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
@@ -135,6 +138,10 @@ pub fn is_fallback_status(status: u16) -> bool {
     status >= 400
 }
 
+pub fn can_retry_same_target(status: u16, same_target_attempt: u32) -> bool {
+    is_transient_status(status) && same_target_attempt <= SAME_TARGET_RETRY_LIMIT
+}
+
 pub fn is_slow_outlier(latency_ms: u64, peer_median_ms: u64) -> bool {
     latency_ms >= SLOW_MIN_LATENCY_MS
         && latency_ms >= peer_median_ms.saturating_mul(SLOW_OUTLIER_FACTOR)
@@ -242,6 +249,16 @@ mod tests {
         assert!(is_fallback_status(503));
         assert!(!is_fallback_status(200));
         assert!(!is_fallback_status(399));
+    }
+
+    #[test]
+    fn same_target_retry_covers_one_transient_replay() {
+        assert!(can_retry_same_target(503, 1));
+        assert!(can_retry_same_target(429, 1));
+        assert!(can_retry_same_target(502, 1));
+        assert!(!can_retry_same_target(503, 2));
+        assert!(!can_retry_same_target(400, 1));
+        assert!(!can_retry_same_target(404, 1));
     }
 
     #[test]

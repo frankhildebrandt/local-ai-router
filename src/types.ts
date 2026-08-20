@@ -324,6 +324,8 @@ export interface ModelUsage extends UsageSummary {
 export interface KeyUsageData extends LocalApiKey, UsageSummary {
   buckets: Array<{ start: string; request_count: number; input_tokens: number; output_tokens: number }>;
   by_model: ModelUsage[];
+  throughput_candles?: UsageCandle[];
+  cost_candles?: UsageCandle[];
 }
 
 export interface DashboardData {
@@ -344,7 +346,10 @@ export interface InFlightRequest {
   alias: string;
   target_id: string | null;
   target_name: string | null;
-  phase: "trying" | "streaming" | string;
+  phase: "trying" | "retrying" | "rerouting" | "streaming" | string;
+  attempt?: number;
+  last_error_code?: string | null;
+  last_error_message?: string | null;
 }
 
 export type CatalogCategory = "chat_vision" | "image" | "speech";

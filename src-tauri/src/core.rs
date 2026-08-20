@@ -20,7 +20,8 @@ use crate::{
     oauth::OAuthManager,
     providers::{provider_preset, validate_cloud_base_url, AuthMode, AuthScheme},
     secrets::{
-        generate_local_token, local_api_key_account, provider_account, SecretStore, LOCAL_API_KEY,
+        generate_local_token, local_api_key_account, provider_account, SecretStore,
+        CIVITAI_ACCOUNT, HF_ACCOUNT, LOCAL_API_KEY,
     },
     storage::{LocalApiKey, ModelTarget, Provider, Store},
 };
@@ -44,6 +45,50 @@ pub struct InFlightRequest {
     pub target_id: Option<String>,
     pub target_name: Option<String>,
     pub phase: String,
+    #[serde(default)]
+    pub attempt: u32,
+    #[serde(default)]
+    pub last_error_code: Option<String>,
+    #[serde(default)]
+    pub last_error_message: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct InFlightProgress {
+    pub target_id: String,
+    pub target_name: String,
+    pub phase: String,
+    pub attempt: u32,
+    pub last_error_code: Option<String>,
+    pub last_error_message: Option<String>,
+}
+
+impl InFlightProgress {
+    pub fn new(
+        target_id: impl Into<String>,
+        target_name: impl Into<String>,
+        phase: impl Into<String>,
+    ) -> Self {
+        Self {
+            target_id: target_id.into(),
+            target_name: target_name.into(),
+            phase: phase.into(),
+            attempt: 1,
+            last_error_code: None,
+            last_error_message: None,
+        }
+    }
+
+    pub fn with_attempt(mut self, attempt: u32) -> Self {
+        self.attempt = attempt;
+        self
+    }
+
+    pub fn with_error(mut self, code: Option<&str>, message: Option<&str>) -> Self {
+        self.last_error_code = code.map(str::to_owned);
+        self.last_error_message = message.map(str::to_owned);
+        self
+    }
 }
 
 struct LiveRequest {
@@ -107,11 +152,18 @@ impl TrafficHub {
         target_name: impl Into<String>,
         phase: &str,
     ) {
+        self.apply(id, InFlightProgress::new(target_id, target_name, phase));
+    }
+
+    pub fn apply(&self, id: &str, progress: InFlightProgress) {
         let mut inflight = self.inflight.lock();
         if let Some(live) = inflight.get_mut(id) {
-            live.info.target_id = Some(target_id.into());
-            live.info.target_name = Some(target_name.into());
-            live.info.phase = phase.into();
+            live.info.target_id = Some(progress.target_id);
+            live.info.target_name = Some(progress.target_name);
+            live.info.phase = progress.phase;
+            live.info.attempt = progress.attempt;
+            live.info.last_error_code = progress.last_error_code;
+            live.info.last_error_message = progress.last_error_message;
         }
         drop(inflight);
         self.publish();
@@ -160,7 +212,11 @@ impl InFlightGuard {
     }
 
     pub fn update(&self, target_id: &str, target_name: &str, phase: &str) {
-        self.hub.update(&self.id, target_id, target_name, phase);
+        self.apply(InFlightProgress::new(target_id, target_name, phase));
+    }
+
+    pub fn apply(&self, progress: InFlightProgress) {
+        self.hub.apply(&self.id, progress);
     }
 
     pub fn cancellation(&self) -> CancellationToken {
@@ -312,6 +368,7 @@ pub struct ServerStatus {
 impl AppCore {
     pub async fn open(path: &Path, secrets: Arc<dyn SecretStore>) -> anyhow::Result<Self> {
         let store = Store::open(path).await?;
+        secrets.migrate_legacy_accounts(&legacy_secret_accounts(&store).await?)?;
         let core = Self::new(store, secrets)?;
         core.migrate_legacy_local_api_key().await?;
         if core.store.local_api_keys().await?.is_empty() {
@@ -670,6 +727,21 @@ impl AppCore {
     }
 }
 
+async fn legacy_secret_accounts(store: &Store) -> anyhow::Result<Vec<String>> {
+    let mut accounts = vec![
+        LOCAL_API_KEY.to_string(),
+        HF_ACCOUNT.to_string(),
+        CIVITAI_ACCOUNT.to_string(),
+    ];
+    for provider in store.providers().await? {
+        accounts.push(provider_account(&provider.id));
+    }
+    for key in store.local_api_keys().await? {
+        accounts.push(local_api_key_account(&key.id));
+    }
+    Ok(accounts)
+}
+
 fn token_hash(token: &str) -> Vec<u8> {
     Sha256::digest(token.as_bytes()).to_vec()
 }
@@ -690,7 +762,10 @@ mod tests {
     use super::*;
     use crate::{
         domain::TargetKind,
-        secrets::{local_api_key_account, MemorySecrets, SecretStore, LOCAL_API_KEY},
+        secrets::{
+            local_api_key_account, MemorySecrets, SecretStore, CIVITAI_ACCOUNT, HF_ACCOUNT,
+            LOCAL_API_KEY,
+        },
     };
 
     fn local_target() -> ModelTarget {
@@ -725,6 +800,9 @@ mod tests {
                 target_id: None,
                 target_name: None,
                 phase: "trying".into(),
+                attempt: 0,
+                last_error_code: None,
+                last_error_message: None,
             },
         );
         assert_eq!(hub.snapshot()[0].alias, "assistant");
@@ -732,6 +810,22 @@ mod tests {
         guard.update("primary", "Primary", "streaming");
         assert_eq!(hub.snapshot()[0].target_id.as_deref(), Some("primary"));
         assert_eq!(hub.snapshot()[0].phase, "streaming");
+        guard.apply(InFlightProgress {
+            target_id: "primary".into(),
+            target_name: "Primary".into(),
+            phase: "retrying".into(),
+            attempt: 2,
+            last_error_code: Some("overloaded".into()),
+            last_error_message: Some("Service temporarily overloaded".into()),
+        });
+        let live = &hub.snapshot()[0];
+        assert_eq!(live.phase, "retrying");
+        assert_eq!(live.attempt, 2);
+        assert_eq!(live.last_error_code.as_deref(), Some("overloaded"));
+        assert_eq!(
+            live.last_error_message.as_deref(),
+            Some("Service temporarily overloaded")
+        );
         drop(guard);
         assert!(hub.snapshot().is_empty());
     }
@@ -749,6 +843,9 @@ mod tests {
                 target_id: None,
                 target_name: None,
                 phase: "trying".into(),
+                attempt: 0,
+                last_error_code: None,
+                last_error_message: None,
             },
         );
         let cancel = guard.cancellation();
@@ -774,6 +871,9 @@ mod tests {
                 target_id: None,
                 target_name: None,
                 phase: "trying".into(),
+                attempt: 0,
+                last_error_code: None,
+                last_error_message: None,
             },
         );
         let second = InFlightGuard::new(
@@ -786,6 +886,9 @@ mod tests {
                 target_id: None,
                 target_name: None,
                 phase: "streaming".into(),
+                attempt: 1,
+                last_error_code: None,
+                last_error_message: None,
             },
         );
         hub.cancel_all();
@@ -809,6 +912,9 @@ mod tests {
                 target_id: None,
                 target_name: None,
                 phase: "streaming".into(),
+                attempt: 1,
+                last_error_code: None,
+                last_error_message: None,
             },
         );
         let mut stream = Box::pin(async_stream::stream! {
@@ -949,6 +1055,42 @@ mod tests {
         assert!(activity.try_reserve_for_unload(&target.id).is_none());
         drop(request);
         assert!(activity.try_reserve_for_unload(&target.id).is_some());
+    }
+
+    #[tokio::test]
+    async fn legacy_secret_accounts_include_providers_and_local_keys() {
+        let store = Store::memory().await.unwrap();
+        store
+            .upsert_provider(&Provider {
+                id: "openai".into(),
+                name: "OpenAI".into(),
+                preset_id: "openai".into(),
+                auth_mode: AuthMode::ApiKey,
+                base_url: "https://api.openai.com/v1".into(),
+                enabled: true,
+                has_credential: false,
+            })
+            .await
+            .unwrap();
+        store
+            .insert_local_api_key(
+                &LocalApiKey {
+                    id: "default".into(),
+                    name: "Default".into(),
+                    created_at: chrono::Utc::now(),
+                    last_used_at: None,
+                    revoked_at: None,
+                },
+                &[0u8; 32],
+            )
+            .await
+            .unwrap();
+        let accounts = legacy_secret_accounts(&store).await.unwrap();
+        assert!(accounts.contains(&LOCAL_API_KEY.to_string()));
+        assert!(accounts.contains(&HF_ACCOUNT.to_string()));
+        assert!(accounts.contains(&CIVITAI_ACCOUNT.to_string()));
+        assert!(accounts.contains(&provider_account("openai")));
+        assert!(accounts.contains(&local_api_key_account("default")));
     }
 
     #[tokio::test]

@@ -2,8 +2,23 @@ import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/re
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import App from "./App";
 
-const command = vi.fn();
-vi.mock("./api", () => ({ command: (...args: unknown[]) => command(...args), appVersion: async () => "0.2.1", listenInstallJobs: async () => () => undefined, listenDesktopNavigate: async () => () => undefined, listenGatewayTraffic: async () => () => undefined, errorMessage: (error: unknown) => String(error), isTauri: () => true }));
+const { command, traffic } = vi.hoisted(() => ({
+  command: vi.fn(),
+  traffic: { handler: null as ((inflight: unknown[]) => void) | null },
+}));
+
+vi.mock("./api", () => ({
+  command: (...args: unknown[]) => command(...args),
+  appVersion: async () => "0.2.1",
+  listenInstallJobs: async () => () => undefined,
+  listenDesktopNavigate: async () => () => undefined,
+  listenGatewayTraffic: async (handler: (inflight: unknown[]) => void) => {
+    traffic.handler = handler;
+    return () => { traffic.handler = null; };
+  },
+  errorMessage: (error: unknown) => String(error),
+  isTauri: () => true,
+}));
 
 beforeEach(() => {
   command.mockImplementation((name: string, args?: unknown) => {
@@ -37,9 +52,11 @@ beforeEach(() => {
     if (name === "create_local_api_key") return Promise.resolve({ id: "new-key", name: "Automation", created_at: "2026-08-17T11:00:00Z", last_used_at: null, revoked_at: null, token: "lar_new" });
     if (name === "get_key_usage") return Promise.resolve({
       id: "default", name: "Default", created_at: "2026-08-17T10:00:00Z", last_used_at: null, revoked_at: null,
-      request_count: 17, success_count: 16, average_latency_ms: 12, input_tokens: 128, output_tokens: 256, unknown_usage_count: 0,
+      request_count: 17, success_count: 16, average_latency_ms: 12, input_tokens: 128, output_tokens: 256, cache_read_tokens: 16, cache_write_tokens: 0, unknown_usage_count: 0, tokens_per_second: 21.3, estimated_cost_usd: 0.012,
       buckets: [{ start: "2026-08-17T10:00:00Z", request_count: 17, input_tokens: 128, output_tokens: 256 }],
-      by_model: [{ alias: "assistant", target: "coding", request_count: 17, success_count: 16, average_latency_ms: 12, input_tokens: 32, output_tokens: 64, unknown_usage_count: 0 }],
+      by_model: [{ alias: "assistant", target: "coding", request_count: 17, success_count: 16, average_latency_ms: 12, input_tokens: 32, output_tokens: 64, unknown_usage_count: 0, tokens_per_second: 21.3, estimated_cost_usd: 0.012 }],
+      throughput_candles: [{ start: "2026-08-17T10:00:00Z", open: 18, high: 24, low: 12, close: 21.3, avg: 20 }],
+      cost_candles: [{ start: "2026-08-17T10:00:00Z", open: 0.01, high: 0.02, low: 0.008, close: 0.012, avg: 0.012 }],
     });
     if (name === "client_chat") return Promise.resolve({ model: "assistant", content: "Hello from the router" });
     if (name === "list_local_catalog") return Promise.resolve({
@@ -90,7 +107,7 @@ describe("Local AI Router shell", () => {
     expect(screen.getAllByText("http://127.0.0.1:11435/v1").length).toBeGreaterThan(0);
     expect(screen.getByRole("heading", { name: "Active requests" })).toBeInTheDocument();
     expect(screen.getByText("No running requests")).toBeInTheDocument();
-    expect(command).toHaveBeenCalledWith("list_logs", { query: { legacy_only: false, limit: 100 } });
+    expect(command).toHaveBeenCalledWith("dashboard");
   });
 
   it("lets the user stop in-flight requests from overview", async () => {
@@ -137,6 +154,100 @@ describe("Local AI Router shell", () => {
     await waitFor(() => expect(command).toHaveBeenCalledWith("cancel_inflight_request", { id: "req-1" }));
     fireEvent.click(screen.getByRole("button", { name: "Stop all" }));
     await waitFor(() => expect(command).toHaveBeenCalledWith("cancel_all_inflight_requests"));
+  });
+
+  it("shows retrying in-flight requests with the upstream error", async () => {
+    const previous = command.getMockImplementation();
+    command.mockImplementation((name: string, args?: unknown) => {
+      if (name === "dashboard") {
+        return Promise.resolve({
+          running: true,
+          base_url: "http://127.0.0.1:11435/v1",
+          provider_count: 0,
+          target_count: 0,
+          route_count: 0,
+          recent_requests: 1,
+          inflight: [
+            {
+              id: "req-1",
+              started_at: "2026-08-20T10:00:00Z",
+              endpoint: "/v1/chat/completions",
+              alias: "assistant",
+              target_id: "nvidia",
+              target_name: "NVIDIA NIM",
+              phase: "retrying",
+              attempt: 2,
+              last_error_code: "overloaded",
+              last_error_message: "Service temporarily overloaded",
+            },
+          ],
+          runtimes: [],
+        });
+      }
+      return previous?.(name, args);
+    });
+    render(<App />);
+    expect(await screen.findByText("assistant")).toBeInTheDocument();
+    expect(screen.getByText(/Retrying after Service temporarily overloaded/)).toBeInTheDocument();
+    expect(screen.getByText(/attempt 2/)).toBeInTheDocument();
+  });
+
+  it("marks recovered request logs as rerouted", async () => {
+    const previous = command.getMockImplementation();
+    command.mockImplementation((name: string, args?: unknown) => {
+      if (name === "list_logs") {
+        return Promise.resolve({
+          total: 1,
+          items: [{
+            id: "request",
+            created_at: "2026-08-20T10:00:00Z",
+            endpoint: "/v1/chat/completions",
+            alias: "assistant",
+            target: "backup",
+            attempts: 3,
+            status: 200,
+            latency_ms: 40,
+            input_tokens: 3,
+            output_tokens: 5,
+            error_code: null,
+            error_message: null,
+            api_key_id: "default",
+            api_key_name: "Default",
+          }],
+        });
+      }
+      if (name === "list_routing_attempts") {
+        return Promise.resolve([{
+          id: "attempt",
+          request_id: "request",
+          created_at: "2026-08-20T10:00:00Z",
+          alias: "assistant",
+          task: "general",
+          task_source: "default",
+          target_id: "nvidia",
+          routing_mode: "fixed",
+          status: 503,
+          transient_failure: true,
+          retry_after_until: null,
+          latency_ms: 12,
+          ttft_ms: null,
+          streaming: false,
+          estimated_cost_usd: null,
+          cost_verified: false,
+          input_tokens: 3,
+          output_tokens: null,
+          score: null,
+          reason: "retry 2/2 same target after 503 overloaded",
+        }]);
+      }
+      return previous?.(name, args);
+    });
+    render(<App />);
+    await screen.findByText("Your models, one local endpoint.");
+    fireEvent.click(screen.getByRole("button", { name: "Request logs" }));
+    expect(await screen.findByText("rerouted")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Routing" }));
+    expect(await screen.findByText("retry")).toBeInTheDocument();
   });
 
   it("shows loaded local runtimes with token throughput on overview", async () => {
@@ -207,7 +318,7 @@ describe("Local AI Router shell", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "API keys" }));
     expect(await screen.findByRole("heading", { name: "API keys" })).toBeInTheDocument();
-    expect(screen.getByText("Default")).toBeInTheDocument();
+    expect(screen.getAllByText("Default").length).toBeGreaterThan(0);
     fireEvent.change(screen.getByPlaceholderText("New key name"), { target: { value: "Automation" } });
     fireEvent.click(screen.getByRole("button", { name: "Create key" }));
     await waitFor(() => expect(command).toHaveBeenCalledWith("create_local_api_key", { name: "Automation" }));
@@ -232,10 +343,12 @@ describe("Local AI Router shell", () => {
     fireEvent.click(screen.getByRole("button", { name: "API keys" }));
     expect(await screen.findByRole("heading", { name: "API keys" })).toBeInTheDocument();
     await waitFor(() => expect(command).toHaveBeenCalledWith("get_usage", { period: "7d" }));
+    expect(screen.getByText("Traffic share")).toBeInTheDocument();
+    expect(screen.getByText("Active keys")).toBeInTheDocument();
     const row = screen.getByRole("button", { name: /Default/ });
     expect(row).toHaveTextContent("17");
-    expect(row).toHaveTextContent("128");
-    expect(row).toHaveTextContent("256");
+    expect(row).toHaveTextContent("94%");
+    expect(row).toHaveTextContent("100%");
   });
 
   it("opens key details with per-model token usage", async () => {
@@ -249,6 +362,9 @@ describe("Local AI Router shell", () => {
     expect(screen.getByText("coding")).toBeInTheDocument();
     expect(screen.getByText("32")).toBeInTheDocument();
     expect(screen.getByText("64")).toBeInTheDocument();
+    expect(screen.getByText("Theoretical cost")).toBeInTheDocument();
+    expect(screen.getByLabelText("tok/s over time")).toBeInTheDocument();
+    expect(screen.getByLabelText("USD over time")).toBeInTheDocument();
   });
 
   it("shows curated catalog categories, RAM badges, locked models, and import paths", async () => {
@@ -282,11 +398,11 @@ describe("Local AI Router shell", () => {
     expect(screen.queryByRole("button", { name: "civitai.red" })).not.toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "CivitAI" }));
     fireEvent.change(screen.getByPlaceholderText("Search CivitAI checkpoints (SD and SDXL)"), { target: { value: "realistic" } });
-    expect(await screen.findByText("Realistic Vision")).toBeInTheDocument();
+    expect(await screen.findByText("Realistic Vision", {}, { timeout: 2000 })).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Speech" }));
     expect(await screen.findByText("Kokoro 82M")).toBeInTheDocument();
     fireEvent.change(screen.getByPlaceholderText("Search curated models or every Hugging Face MLX repository"), { target: { value: "mystery" } });
-    expect(await screen.findByText("Untested Hugging Face matches")).toBeInTheDocument();
+    expect(await screen.findByText("Untested Hugging Face matches", {}, { timeout: 2000 })).toBeInTheDocument();
     expect(screen.getByText("Untested MLX")).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Import" }));
     expect(screen.getByRole("button", { name: "Download" })).toBeInTheDocument();
@@ -295,6 +411,19 @@ describe("Local AI Router shell", () => {
     expect(screen.getByRole("button", { name: "CivitAI" })).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "civitai.red" })).not.toBeInTheDocument();
     expect(screen.getByText("GGUF · llama.cpp")).toBeInTheDocument();
+  });
+
+  it("does not re-search Hugging Face when gateway traffic updates", async () => {
+    render(<App />);
+    await screen.findByText("Your models, one local endpoint.");
+    fireEvent.click(screen.getByRole("button", { name: "Local models" }));
+    fireEvent.change(screen.getByPlaceholderText("Search curated models or every Hugging Face MLX repository"), { target: { value: "mystery" } });
+    expect(await screen.findByText("Untested Hugging Face matches", {}, { timeout: 2000 })).toBeInTheDocument();
+    const searches = command.mock.calls.filter(call => call[0] === "search_mlx_catalog").length;
+    expect(searches).toBeGreaterThan(0);
+    traffic.handler?.([]);
+    await new Promise(resolve => setTimeout(resolve, 300));
+    expect(command.mock.calls.filter(call => call[0] === "search_mlx_catalog").length).toBe(searches);
   });
 
   it("shows persistent KV controls for an installed MLX chat model", async () => {
