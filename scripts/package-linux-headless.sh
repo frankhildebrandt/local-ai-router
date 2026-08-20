@@ -56,8 +56,9 @@ This archive is meant to be extracted to /opt/local-ai-router:
   sudo ln -sf /opt/local-ai-router/local-ai-router /usr/bin/local-ai-router
 
 Then install the systemd unit from this directory (or from a .deb, which
-already places the binary and resources under /usr). The unit binds
-127.0.0.1 only; open http://127.0.0.1:11435/ on that host.
+already places the binary and resources under /usr). The unit defaults to
+127.0.0.1 HTTP; open http://127.0.0.1:11435/ on that host. LAN share is
+opt-in in Settings and requires HTTPS plus a directory login.
 
   sudo install -m 644 local-ai-router.service /etc/systemd/system/local-ai-router.service
   sudo useradd --system --home /var/lib/local-ai-router --shell /usr/sbin/nologin local-ai-router

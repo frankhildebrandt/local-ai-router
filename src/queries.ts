@@ -4,7 +4,7 @@ import type {
   DashboardData, InstallJob, KeyUsageData, LocalApiKey, LocalCatalog, LogFacets, LogQuery, LogResult,
   ModelMetadata, ModelRoute, ModelTarget, Provider, ProviderModel, ProviderPreset, PublicModel,
   ResourcePolicy, RoutingAttempt, RoutingConfigExport, RoutingPolicy, RoutingTaskDefinition,
-  SearchPage, TargetRoutingProfile, UsageData,
+  SearchPage, TargetRoutingProfile, UsageData, AuthStatus, DirectoryGroup, DirectoryUser, OidcAllowlistEntry,
 } from "./types";
 
 export function createQueryClient() {
@@ -43,6 +43,10 @@ export const queryKeys = {
   providerModels: (id: string) => ["provider-models", id] as const,
   modelMetadata: (model: string) => ["model-metadata", model] as const,
   routingConfig: ["routing-config"] as const,
+  auth: ["auth"] as const,
+  directoryUsers: ["directory-users"] as const,
+  directoryGroups: ["directory-groups"] as const,
+  oidcAllowlist: ["oidc-allowlist"] as const,
 };
 
 export function invalidateAppQueries(client: QueryClient) {
@@ -99,4 +103,8 @@ export const fetchers = {
   providerModels: (id: string) => command<ProviderModel[]>("cached_provider_models", { id }),
   modelMetadata: (model: string) => command<ModelMetadata>("lookup_model_metadata", { model }),
   routingConfig: () => command<RoutingConfigExport>("export_routing_config"),
+  auth: () => command<AuthStatus>("auth_status"),
+  directoryUsers: () => command<DirectoryUser[]>("list_directory_users"),
+  directoryGroups: () => command<DirectoryGroup[]>("list_directory_groups"),
+  oidcAllowlist: () => command<OidcAllowlistEntry[]>("list_oidc_allowlist"),
 };

@@ -1,5 +1,5 @@
 use std::{
-    net::{Ipv4Addr, SocketAddr},
+    net::{IpAddr, SocketAddr},
     path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
@@ -15,6 +15,7 @@ use crate::{
     core::AppCore,
     gateway, hub, install, resource, runtime,
     secrets::{file_secrets, shared_keychain, SecretStore},
+    tls,
 };
 
 #[cfg(test)]
@@ -35,6 +36,7 @@ pub struct ServeArgs {
 pub struct Engine {
     pub services: Arc<AppServices>,
     ui_dir: Option<PathBuf>,
+    tls: Option<Arc<rustls::ServerConfig>>,
 }
 
 pub struct EngineConfig {
@@ -79,21 +81,72 @@ impl Engine {
             "https://huggingface.co",
         ));
         install.interrupt_active().await?;
+        let bind_mode = core
+            .store
+            .setting("bind_mode")
+            .await?
+            .unwrap_or_else(|| "loopback".into());
+        let bind_address = core.store.setting("bind_address").await?;
+        let bind = tls::bind_config(&bind_mode, bind_address.as_deref())?;
+        let cert_path = core.store.setting("tls_cert_path").await?;
+        let key_path = core.store.setting("tls_key_path").await?;
+        let tls_material = if bind.tls_required {
+            let _ = rustls::crypto::ring::default_provider().install_default();
+            let paths = tls::user_cert_paths(cert_path.as_deref(), key_path.as_deref());
+            Some(
+                tls::resolve_tls_material_for(
+                    &config.data_dir,
+                    paths.as_ref().map(|(cert, _)| cert.as_path()),
+                    paths.as_ref().map(|(_, key)| key.as_path()),
+                    if bind.ip.is_unspecified() || bind.ip.is_loopback() {
+                        &[] as &[IpAddr]
+                    } else {
+                        std::slice::from_ref(&bind.ip)
+                    },
+                )
+                .context("non-loopback bind requires HTTPS certificate material")?,
+            )
+        } else {
+            None
+        };
+        let tls_fingerprint = tls_material.as_ref().map(|material| material.fingerprint.clone());
+        let tls = tls_material
+            .as_ref()
+            .map(tls::TlsMaterial::server_config)
+            .transpose()?
+            .map(Arc::new);
+        let oidc = Arc::new(crate::oidc::OidcManager::new(
+            core.client.clone(),
+            core.secrets.clone(),
+        ));
         Ok(Self {
             services: Arc::new(AppServices {
                 core,
                 runtimes,
                 model_library: models,
                 port,
+                bind_ip: bind.ip,
+                tls_required: bind.tls_required,
+                tls_fingerprint,
+                oidc,
                 install,
                 shutdown: CancellationToken::new(),
             }),
             ui_dir: config.ui_dir,
+            tls,
         })
     }
 
     pub fn port(&self) -> u16 {
         self.services.port
+    }
+
+    pub fn bind_ip(&self) -> IpAddr {
+        self.services.bind_ip
+    }
+
+    pub fn tls_config(&self) -> Option<Arc<rustls::ServerConfig>> {
+        self.tls.clone()
     }
 
     pub fn router(&self) -> Router {
@@ -316,7 +369,7 @@ Usage:
   local-ai-router serve [options]
 
 Options:
-  --port <port>            Loopback port (default: saved setting or 11435)
+  --port <port>            Listen port (default: saved setting or 11435)
   --data-dir <path>        SQLite, models and KV cache directory
   --ui-dir <path>          Built admin SPA directory (contains index.html)
   --secrets-file <path>    Store secrets in a 0600 JSON vault instead of the platform keyring
@@ -324,7 +377,7 @@ Options:
 
 Defaults match the desktop app:
   Data:  {data}
-  Bind:  127.0.0.1 (never LAN)
+  Bind:  127.0.0.1 HTTP (opt-in LAN HTTPS from Settings)
   Secrets: {secrets}
 "
     )
@@ -382,16 +435,23 @@ where
         })
         .await?;
         engine.spawn_maintenance();
-        let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, engine.port()));
+        let addr = SocketAddr::from((engine.bind_ip(), engine.port()));
         let listener = TcpListener::bind(addr)
             .await
             .with_context(|| format!("binding {addr}"))?;
         let bound = listener.local_addr()?;
-        tracing::info!(%bound, "headless gateway listening");
-        println!("Local AI Router (headless) http://{bound}");
-        println!("Admin UI http://{bound}/");
-        axum::serve(listener, engine.router())
-            .with_graceful_shutdown(shutdown_signal(engine.services.shutdown.clone()))
+        let scheme = if engine.services.tls_required {
+            "https"
+        } else {
+            "http"
+        };
+        tracing::info!(%bound, %scheme, "headless gateway listening");
+        println!("Local AI Router (headless) {scheme}://{bound}");
+        println!("Admin UI {scheme}://{bound}/");
+        if let Some(fingerprint) = &engine.services.tls_fingerprint {
+            println!("TLS fingerprint (SHA-256) {fingerprint}");
+        }
+        serve_gateway(listener, engine.tls_config(), engine.router(), engine.services.shutdown.clone())
             .await?;
         engine.services.runtimes.stop_all().await;
         Ok(())
@@ -404,6 +464,25 @@ async fn shutdown_signal(token: CancellationToken) {
         _ = ctrl_c => {}
         _ = token.cancelled() => {}
     }
+}
+
+pub async fn serve_gateway(
+    listener: TcpListener,
+    tls: Option<Arc<rustls::ServerConfig>>,
+    router: Router,
+    shutdown: CancellationToken,
+) -> anyhow::Result<()> {
+    let make_service = router.into_make_service();
+    if let Some(tls) = tls {
+        axum::serve(tls::TlsListener::new(listener, tls), make_service)
+            .with_graceful_shutdown(shutdown_signal(shutdown))
+            .await?;
+    } else {
+        axum::serve(listener, make_service)
+            .with_graceful_shutdown(shutdown_signal(shutdown))
+            .await?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -718,5 +797,182 @@ mod tests {
             .as_str()
             .unwrap()
             .starts_with("http://127.0.0.1:"));
+    }
+
+    #[tokio::test]
+    async fn loopback_admin_stays_unlocked_and_inference_still_needs_a_key() {
+        let root = tempfile::tempdir().unwrap();
+        let engine = test_engine(root.path(), None).await;
+        let dashboard = engine
+            .router()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/dashboard")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(dashboard.status(), StatusCode::OK);
+
+        let models = engine
+            .router()
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/models")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(models.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn off_loopback_admin_rejects_unauthenticated_browsers() {
+        let root = tempfile::tempdir().unwrap();
+        let data = root.path().join("lan");
+        std::fs::create_dir_all(&data).unwrap();
+        {
+            let store = crate::storage::Store::open(&data.join("router.sqlite3"))
+                .await
+                .unwrap();
+            store.set_setting("bind_mode", "lan").await.unwrap();
+        }
+        let engine = Engine::open(EngineConfig {
+            data_dir: data,
+            resource_dir: PathBuf::from(env!("CARGO_MANIFEST_DIR")),
+            ui_dir: None,
+            port: Some(0),
+            secrets: Arc::new(MemorySecrets::default()),
+        })
+        .await
+        .unwrap();
+        assert!(engine.services.tls_required);
+        let denied = engine
+            .router()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/dashboard")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(denied.status(), StatusCode::UNAUTHORIZED);
+
+        let password = engine
+            .services
+            .core
+            .secrets
+            .get(crate::identity::OPERATOR_BOOTSTRAP_ACCOUNT)
+            .unwrap()
+            .unwrap();
+        let login = engine
+            .router()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/login")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({"username":"operator","password":password}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(login.status(), StatusCode::OK);
+        let cookie = login
+            .headers()
+            .get(header::SET_COOKIE)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_owned();
+        let accepted = engine
+            .router()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/dashboard")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::COOKIE, cookie.split(';').next().unwrap())
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(accepted.status(), StatusCode::OK);
+
+        let models = engine
+            .router()
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/models")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(models.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn lan_bind_requires_https_material_and_fails_closed_on_bad_certs() {
+        let root = tempfile::tempdir().unwrap();
+        let data = root.path().join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        {
+            let store = crate::storage::Store::open(&data.join("router.sqlite3"))
+                .await
+                .unwrap();
+            store.set_setting("bind_mode", "lan").await.unwrap();
+            store
+                .set_setting("tls_cert_path", data.join("missing.crt").to_str().unwrap())
+                .await
+                .unwrap();
+            store
+                .set_setting("tls_key_path", data.join("missing.key").to_str().unwrap())
+                .await
+                .unwrap();
+        }
+        let error = Engine::open(EngineConfig {
+            data_dir: data.clone(),
+            resource_dir: PathBuf::from(env!("CARGO_MANIFEST_DIR")),
+            ui_dir: None,
+            port: Some(0),
+            secrets: Arc::new(MemorySecrets::default()),
+        })
+        .await
+        .err()
+        .expect("lan bind without certs must fail closed");
+        assert!(error.to_string().contains("HTTPS") || error.to_string().contains("TLS") || error.to_string().contains("certificate"));
+
+        let ok_dir = root.path().join("ok");
+        std::fs::create_dir_all(&ok_dir).unwrap();
+        {
+            let store = crate::storage::Store::open(&ok_dir.join("router.sqlite3"))
+                .await
+                .unwrap();
+            store.set_setting("bind_mode", "lan").await.unwrap();
+        }
+        let engine = Engine::open(EngineConfig {
+            data_dir: ok_dir,
+            resource_dir: PathBuf::from(env!("CARGO_MANIFEST_DIR")),
+            ui_dir: None,
+            port: Some(0),
+            secrets: Arc::new(MemorySecrets::default()),
+        })
+        .await
+        .unwrap();
+        assert!(engine.services.tls_required);
+        assert!(engine.tls_config().is_some());
+        assert!(engine.services.tls_fingerprint.as_ref().unwrap().contains(':'));
+        assert_eq!(engine.bind_ip().to_string(), "0.0.0.0");
     }
 }

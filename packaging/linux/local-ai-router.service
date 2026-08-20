@@ -18,7 +18,8 @@ ProtectSystem=strict
 ProtectHome=true
 ReadWritePaths=/var/lib/local-ai-router
 
-# The gateway binds 127.0.0.1 only. Browse the admin UI from this host.
+# The gateway defaults to 127.0.0.1 HTTP. Enable LAN share in the admin UI
+# (Settings → Network share); that bind is HTTPS and requires a directory login.
 # Create the service user and data directory before enabling:
 #   sudo useradd --system --home /var/lib/local-ai-router --shell /usr/sbin/nologin local-ai-router
 #   sudo mkdir -p /var/lib/local-ai-router

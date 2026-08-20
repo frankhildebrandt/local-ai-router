@@ -8,12 +8,14 @@ pub mod domain;
 pub mod engine;
 pub mod gateway;
 pub mod hub;
+pub mod identity;
 pub mod install;
 mod ipc;
 pub mod library;
 pub mod media;
 pub mod model_catalog;
 pub mod oauth;
+pub mod oidc;
 pub mod protocol;
 pub mod providers;
 pub mod public_models;
@@ -22,6 +24,7 @@ pub mod routing;
 pub mod runtime;
 pub mod secrets;
 pub mod speculative;
+pub mod tls;
 pub mod storage;
 pub mod tool_emulation;
 
@@ -98,14 +101,14 @@ pub fn run() {
                 }
             });
             let listener = tauri::async_runtime::block_on(tokio::net::TcpListener::bind((
-                "127.0.0.1",
+                engine.bind_ip(),
                 services.port,
             )))?;
             let shutdown_server = services.shutdown.clone();
             let router = engine.router();
+            let tls = engine.tls_config();
             tauri::async_runtime::spawn(async move {
-                if let Err(error) = axum::serve(listener, router)
-                    .with_graceful_shutdown(shutdown_server.cancelled_owned())
+                if let Err(error) = crate::engine::serve_gateway(listener, tls, router, shutdown_server)
                     .await
                 {
                     tracing::error!(%error, "gateway stopped");
@@ -191,7 +194,22 @@ pub fn run() {
             ipc::clear_kv_cache,
             ipc::save_hugging_face_token,
             ipc::save_civitai_token,
-            ipc::forget_all_credentials
+            ipc::forget_all_credentials,
+            ipc::auth_status,
+            ipc::login,
+            ipc::list_directory_users,
+            ipc::create_directory_user,
+            ipc::update_directory_user,
+            ipc::list_directory_groups,
+            ipc::save_directory_group,
+            ipc::delete_directory_group,
+            ipc::user_permissions,
+            ipc::reveal_operator_bootstrap,
+            ipc::list_oidc_allowlist,
+            ipc::invite_oidc_identity,
+            ipc::delete_oidc_allowlist,
+            ipc::save_oidc_client,
+            ipc::begin_oidc_login
         ])
         .build(tauri::generate_context!())
         .expect("error while running Local AI Router")

@@ -1,4 +1,4 @@
-use std::{collections::HashSet, path::PathBuf, sync::Arc};
+use std::{collections::HashSet, net::IpAddr, path::PathBuf, sync::Arc};
 
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
@@ -8,6 +8,10 @@ use uuid::Uuid;
 use crate::{
     core::{AppCore, InFlightRequest},
     domain::{ModelRoute, RouteRole, TargetKind},
+    identity::{
+        self, CreateUserInput, DirectoryGroup, DirectoryUser, EffectivePermissions, OidcAllowlistEntry,
+        UpdateUserInput, UpsertGroupInput, OPERATOR_BOOTSTRAP_ACCOUNT,
+    },
     library,
     providers::{
         provider_preset, provider_presets, validate_cloud_base_url, AuthMode, ProviderPreset,
@@ -35,6 +39,10 @@ pub struct AppServices {
     pub runtimes: Arc<RuntimeManager>,
     pub model_library: PathBuf,
     pub port: u16,
+    pub bind_ip: IpAddr,
+    pub tls_required: bool,
+    pub tls_fingerprint: Option<String>,
+    pub oidc: Arc<crate::oidc::OidcManager>,
     pub install: Arc<crate::install::InstallManager>,
     pub shutdown: CancellationToken,
 }
@@ -43,6 +51,9 @@ pub struct AppServices {
 pub struct Dashboard {
     pub running: bool,
     pub base_url: String,
+    pub bind_mode: String,
+    pub bind_address: String,
+    pub tls_fingerprint: Option<String>,
     pub provider_count: usize,
     pub target_count: usize,
     pub route_count: usize,
@@ -77,6 +88,25 @@ pub struct ClientChatInput {
 pub struct ClientChatResponse {
     pub content: String,
     pub model: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AuthStatus {
+    pub login_required: bool,
+    pub authenticated: bool,
+    pub user: Option<DirectoryUser>,
+    pub permissions: Option<EffectivePermissions>,
+    pub bind_mode: String,
+    pub bind_address: String,
+    pub tls_fingerprint: Option<String>,
+    pub oidc_providers: Vec<String>,
+    pub operator_bootstrap_pending: bool,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct LoginInput {
+    pub username: String,
+    pub password: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -160,7 +190,20 @@ pub async fn dashboard(state: &AppServices) -> Result<Dashboard, String> {
     }
     Ok(Dashboard {
         running: true,
-        base_url: format!("http://127.0.0.1:{}/v1", state.port),
+        base_url: format!(
+            "{}://127.0.0.1:{}/v1",
+            if state.tls_required { "https" } else { "http" },
+            state.port
+        ),
+        bind_mode: state
+            .core
+            .store
+            .setting("bind_mode")
+            .await
+            .map_err(err)?
+            .unwrap_or_else(|| "loopback".into()),
+        bind_address: state.bind_ip.to_string(),
+        tls_fingerprint: state.tls_fingerprint.clone(),
         provider_count: providers.len(),
         target_count: targets.len(),
         route_count: routes.len(),
@@ -1538,10 +1581,19 @@ pub async fn get_settings(
         "memory_budget_percent",
         "idle_unload_minutes",
         "log_retention_days",
+        "bind_mode",
+        "bind_address",
+        "tls_cert_path",
+        "tls_key_path",
     ] {
         if let Some(value) = state.core.store.setting(key).await.map_err(err)? {
             result.insert(key.into(), value);
         }
+    }
+    result.insert("bind_ip".into(), state.bind_ip.to_string());
+    result.insert("tls_required".into(), state.tls_required.to_string());
+    if let Some(fingerprint) = &state.tls_fingerprint {
+        result.insert("tls_fingerprint".into(), fingerprint.clone());
     }
     result.insert(
         "has_hf_token".into(),
@@ -1563,24 +1615,54 @@ pub async fn get_settings(
             .is_some()
             .to_string(),
     );
+    result.insert(
+        "has_github_oidc".into(),
+        state
+            .core
+            .secrets
+            .get(&identity::oidc_secret_account("github"))
+            .map_err(err)?
+            .is_some()
+            .to_string(),
+    );
+    result.insert(
+        "has_google_oidc".into(),
+        state
+            .core
+            .secrets
+            .get(&identity::oidc_secret_account("google"))
+            .map_err(err)?
+            .is_some()
+            .to_string(),
+    );
     Ok(result)
 }
 
 pub async fn save_setting(state: &AppServices, key: String, value: String) -> Result<(), String> {
-    if ![
-        "memory_budget_percent",
-        "idle_unload_minutes",
-        "log_retention_days",
-    ]
-    .contains(&key.as_str())
-    {
-        return Err("setting is not editable at runtime".into());
-    }
-    let parsed = value
-        .parse::<u64>()
-        .map_err(|_| "setting must be a positive integer")?;
-    if parsed == 0 {
-        return Err("setting must be greater than zero".into());
+    match key.as_str() {
+        "memory_budget_percent" | "idle_unload_minutes" | "log_retention_days" => {
+            let parsed = value
+                .parse::<u64>()
+                .map_err(|_| "setting must be a positive integer")?;
+            if parsed == 0 {
+                return Err("setting must be greater than zero".into());
+            }
+        }
+        "bind_mode" => {
+            crate::tls::bind_config(&value, Some("127.0.0.1")).map_err(err)?;
+            if value == "address" {
+                // address is validated when bind_address is saved; allow storing the mode
+            }
+        }
+        "bind_address" => {
+            if !value.trim().is_empty() {
+                value
+                    .parse::<IpAddr>()
+                    .map_err(|_| "bind address must be an IP address")?;
+            }
+        }
+        "tls_cert_path" | "tls_key_path" => {}
+        _ => return Err("setting is not editable at runtime".into()),
     }
     state
         .core
@@ -1782,7 +1864,209 @@ pub async fn forget_all_credentials(state: &AppServices) -> Result<(), String> {
     }
     state.core.secrets.delete(HF_ACCOUNT).map_err(err)?;
     state.core.secrets.delete(CIVITAI_ACCOUNT).map_err(err)?;
-    state.core.secrets.delete(LOCAL_API_KEY).map_err(err)
+    state.core.secrets.delete(LOCAL_API_KEY).map_err(err)?;
+    state.core.secrets.delete(OPERATOR_BOOTSTRAP_ACCOUNT).map_err(err)?;
+    state
+        .core
+        .secrets
+        .delete(&identity::oidc_secret_account("github"))
+        .map_err(err)?;
+    state
+        .core
+        .secrets
+        .delete(&identity::oidc_secret_account("google"))
+        .map_err(err)
+}
+
+pub async fn auth_status(
+    state: &AppServices,
+) -> Result<AuthStatus, String> {
+    auth_status_for(state, false, None).await
+}
+
+pub async fn auth_status_for(
+    state: &AppServices,
+    login_required: bool,
+    session_user: Option<DirectoryUser>,
+) -> Result<AuthStatus, String> {
+    let permissions = match &session_user {
+        Some(user) => Some(state.core.store.permissions_for(user).await.map_err(err)?),
+        None => None,
+    };
+    Ok(AuthStatus {
+        login_required,
+        authenticated: session_user.is_some(),
+        user: session_user,
+        permissions,
+        bind_mode: state
+            .core
+            .store
+            .setting("bind_mode")
+            .await
+            .map_err(err)?
+            .unwrap_or_else(|| "loopback".into()),
+        bind_address: state.bind_ip.to_string(),
+        tls_fingerprint: state.tls_fingerprint.clone(),
+        oidc_providers: state.oidc.configured_providers(),
+        operator_bootstrap_pending: state
+            .core
+            .secrets
+            .get(OPERATOR_BOOTSTRAP_ACCOUNT)
+            .map_err(err)?
+            .is_some(),
+    })
+}
+
+pub async fn login(
+    state: &AppServices,
+    username: String,
+    password: String,
+) -> Result<DirectoryUser, String> {
+    login_with_session(state, username, password)
+        .await
+        .map(|(user, _)| user)
+}
+
+pub async fn login_with_session(
+    state: &AppServices,
+    username: String,
+    password: String,
+) -> Result<(DirectoryUser, String), String> {
+    identity::login_with_password(&state.core.store, &username, &password)
+        .await
+        .map_err(err)
+}
+
+pub async fn logout(state: &AppServices, token: Option<&str>) -> Result<(), String> {
+    if let Some(token) = token {
+        identity::revoke_session(&state.core.store, token)
+            .await
+            .map_err(err)?;
+    }
+    Ok(())
+}
+
+pub async fn list_directory_users(state: &AppServices) -> Result<Vec<DirectoryUser>, String> {
+    state.core.store.directory_users().await.map_err(err)
+}
+
+pub async fn create_directory_user(
+    state: &AppServices,
+    input: CreateUserInput,
+) -> Result<DirectoryUser, String> {
+    identity::create_user(&state.core.store, input)
+        .await
+        .map_err(err)
+}
+
+pub async fn update_directory_user(
+    state: &AppServices,
+    id: String,
+    input: UpdateUserInput,
+) -> Result<DirectoryUser, String> {
+    identity::update_user(&state.core.store, state.core.secrets.as_ref(), &id, input)
+        .await
+        .map_err(err)
+}
+
+pub async fn list_directory_groups(state: &AppServices) -> Result<Vec<DirectoryGroup>, String> {
+    state.core.store.directory_groups().await.map_err(err)
+}
+
+pub async fn save_directory_group(
+    state: &AppServices,
+    id: Option<String>,
+    input: UpsertGroupInput,
+) -> Result<DirectoryGroup, String> {
+    identity::upsert_group(&state.core.store, id, input)
+        .await
+        .map_err(err)
+}
+
+pub async fn delete_directory_group(state: &AppServices, id: String) -> Result<(), String> {
+    if !state.core.store.delete_directory_group(&id).await.map_err(err)? {
+        return Err("group not found".into());
+    }
+    Ok(())
+}
+
+pub async fn user_permissions(
+    state: &AppServices,
+    id: String,
+) -> Result<EffectivePermissions, String> {
+    let user = state
+        .core
+        .store
+        .directory_user(&id)
+        .await
+        .map_err(err)?
+        .ok_or_else(|| "user not found".to_string())?;
+    state.core.store.permissions_for(&user).await.map_err(err)
+}
+
+pub async fn reveal_operator_bootstrap(state: &AppServices) -> Result<Option<String>, String> {
+    state
+        .core
+        .secrets
+        .get(OPERATOR_BOOTSTRAP_ACCOUNT)
+        .map_err(err)
+}
+
+pub async fn list_oidc_allowlist(state: &AppServices) -> Result<Vec<OidcAllowlistEntry>, String> {
+    state.core.store.oidc_allowlist().await.map_err(err)
+}
+
+pub async fn invite_oidc_identity(
+    state: &AppServices,
+    provider: String,
+    identifier: String,
+    user_id: Option<String>,
+) -> Result<OidcAllowlistEntry, String> {
+    identity::invite_oidc(&state.core.store, &provider, &identifier, user_id)
+        .await
+        .map_err(err)
+}
+
+pub async fn delete_oidc_allowlist(state: &AppServices, id: String) -> Result<(), String> {
+    if !state.core.store.delete_oidc_allowlist(&id).await.map_err(err)? {
+        return Err("allowlist entry not found".into());
+    }
+    Ok(())
+}
+
+pub async fn save_oidc_client(
+    state: &AppServices,
+    provider: String,
+    client_id: String,
+    client_secret: String,
+) -> Result<(), String> {
+    crate::oidc::save_oidc_client(
+        state.core.secrets.as_ref(),
+        &provider,
+        &client_id,
+        &client_secret,
+    )
+    .map_err(err)
+}
+
+pub async fn begin_oidc_login(
+    state: &AppServices,
+    provider: String,
+    redirect_uri: String,
+) -> Result<crate::oidc::OidcStart, String> {
+    state.oidc.begin(&provider, &redirect_uri).await.map_err(err)
+}
+
+pub async fn finish_oidc_login(
+    state: &AppServices,
+    code: String,
+    oidc_state: String,
+) -> Result<(DirectoryUser, String), String> {
+    state
+        .oidc
+        .finish(&state.core.store, &code, &oidc_state)
+        .await
+        .map_err(err)
 }
 
 #[cfg(test)]

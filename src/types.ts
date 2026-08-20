@@ -331,6 +331,9 @@ export interface KeyUsageData extends LocalApiKey, UsageSummary {
 export interface DashboardData {
   running: boolean;
   base_url: string;
+  bind_mode?: string;
+  bind_address?: string;
+  tls_fingerprint?: string | null;
   provider_count: number;
   target_count: number;
   route_count: number;
@@ -438,4 +441,53 @@ export interface InstallJobEvent {
   bytes_downloaded: number;
   bytes_total: number | null;
   progress: number;
+}
+
+export interface DirectoryUser {
+  id: string;
+  username: string;
+  display_name: string;
+  is_operator: boolean;
+  disabled_at: string | null;
+  created_at: string;
+  group_ids: string[];
+  allowed_model_ids: string[] | null;
+  may_publish: boolean | null;
+  may_admin: boolean | null;
+  has_password: boolean;
+}
+
+export interface DirectoryGroup {
+  id: string;
+  name: string;
+  created_at: string;
+  allowed_model_ids: string[];
+  may_publish: boolean;
+  may_admin: boolean;
+}
+
+export interface EffectivePermissions {
+  allowed_model_ids: string[] | null;
+  may_publish: boolean;
+  may_admin: boolean;
+}
+
+export interface OidcAllowlistEntry {
+  id: string;
+  provider: string;
+  identifier: string;
+  user_id: string | null;
+  created_at: string;
+}
+
+export interface AuthStatus {
+  login_required: boolean;
+  authenticated: boolean;
+  user: DirectoryUser | null;
+  permissions: EffectivePermissions | null;
+  bind_mode: string;
+  bind_address: string;
+  tls_fingerprint: string | null;
+  oidc_providers: string[];
+  operator_bootstrap_pending: boolean;
 }

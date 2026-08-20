@@ -15,6 +15,7 @@ export async function command<T>(name: string, args: Record<string, unknown> = {
   const response = await fetch(`/admin/${name}`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
+    credentials: "include",
     body: JSON.stringify(args),
   });
   if (!response.ok) throw new Error((await response.text()) || response.statusText);
