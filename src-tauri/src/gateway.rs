@@ -5073,8 +5073,7 @@ mod tests {
         let hang = hanging_sse_upstream().await;
         let (core, app) = inflight_test_core(hang).await;
         let pending = tokio::spawn(async move { app.oneshot(chat_request(true)).await });
-        let request = wait_for_inflight(&core).await;
-        assert_eq!(request.phase, "streaming");
+        let request = wait_for_inflight_phase(&core, "streaming").await;
         assert!(core.traffic.cancel(&request.id));
         wait_until_idle(&core).await;
         let response = pending.await.unwrap().unwrap();

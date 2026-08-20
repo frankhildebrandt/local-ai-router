@@ -443,6 +443,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn systemd_unit_uses_the_default_secrets_file_in_the_service_data_dir() {
         let unit = include_str!("../../packaging/linux/local-ai-router.service");
         let dir = PathBuf::from("/var/lib/local-ai-router");
