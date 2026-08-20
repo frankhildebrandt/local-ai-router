@@ -1,4 +1,4 @@
-export type TargetKind = "cloud" | "gguf" | "mlx" | "alias";
+export type TargetKind = "cloud" | "gguf" | "mlx" | "alias" | "uplink";
 export type AuthMode = "api_key" | "open_ai_subscription";
 export type WireProtocol = "open_ai_chat" | "open_ai_responses" | "anthropic_messages" | "gemini_generate_content";
 export type AccessTier = "paid" | "subscription" | "free_tier" | "starter_credits" | "experimental";
@@ -455,6 +455,9 @@ export interface DirectoryUser {
   may_publish: boolean | null;
   may_admin: boolean | null;
   has_password: boolean;
+  rpm?: number | null;
+  daily_token_budget?: number | null;
+  daily_usd_budget?: number | null;
 }
 
 export interface DirectoryGroup {
@@ -464,6 +467,9 @@ export interface DirectoryGroup {
   allowed_model_ids: string[];
   may_publish: boolean;
   may_admin: boolean;
+  rpm?: number | null;
+  daily_token_budget?: number | null;
+  daily_usd_budget?: number | null;
 }
 
 export interface EffectivePermissions {
@@ -478,6 +484,32 @@ export interface OidcAllowlistEntry {
   identifier: string;
   user_id: string | null;
   created_at: string;
+}
+
+export interface UplinkModel {
+  id: string;
+  capabilities: string[];
+}
+
+export interface QuotaStatus {
+  rpm: number | null;
+  rpm_used: number;
+  daily_token_budget: number | null;
+  daily_tokens_used: number;
+  daily_usd_budget: number | null;
+  daily_usd_used: number;
+}
+
+export interface UplinkParent {
+  base_url: string;
+  parent_node_id: string;
+  username: string;
+  user_id: string;
+  ancestor_node_ids: string[];
+  models: UplinkModel[];
+  quota: QuotaStatus | null;
+  joined_at: string;
+  tls_fingerprint?: string | null;
 }
 
 export interface AuthStatus {

@@ -12,6 +12,7 @@ A private, multi-protocol model gateway for Apple Silicon Macs, Linux, and Windo
 - Configured local and cloud models are published automatically as public model IDs
 - Custom aliases remain optional named stacks. Primaries form the routing pool; fallbacks are sequential failover after the pool is exhausted. Each alias can use Performance (listed primary order) or Adaptive ranking; Adaptive stays off by default
 - Built-in `adaptive-routing` ranks every enabled model by task quality, price and inferred task
+- Uplink federation: a node can join one parent as a directory user, mount granted public model IDs, stream chat and other protocols through the parent, and enforce per-user/group quotas without sharing credentials. Self-signed LAN parents require pinning the SHA-256 TLS fingerprint shown in Settings.
 - `/v1/chat/completions`, `/v1/responses`, Anthropic `/v1/messages`, and Gemini `/v1beta/models/*` with non-streaming, SSE, vision, audio/video input and tool translation
 - Local `/v1/images/generations` and `/v1/audio/speech` for installed MLX image and TTS models
 - Cloud proxying for Images, Audio and Moderations, including multipart uploads

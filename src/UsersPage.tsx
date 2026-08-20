@@ -5,6 +5,13 @@ import { command } from "./api";
 import type { AuthStatus, DirectoryGroup, DirectoryUser, PublicModel } from "./types";
 import { fetchers, queryKeys } from "./queries";
 
+function optionalLimit(value: string) {
+  const trimmed = value.trim();
+  if (!trimmed) return null;
+  const parsed = Number(trimmed);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
 export function LoginPage({ auth, onDone, fail }: { auth: AuthStatus; onDone: () => void; fail: (error: unknown) => void }) {
   const [username, setUsername] = useState("operator");
   const [password, setPassword] = useState("");
@@ -58,7 +65,7 @@ export function UsersPage({ publicModels, refresh, success, fail }: { publicMode
   const allowlist = allowQuery.data ?? [];
   const [bootstrap, setBootstrap] = useState<string | null>(null);
   const [creating, setCreating] = useState(false);
-  const [groupOpen, setGroupOpen] = useState(false);
+  const [groupEdit, setGroupEdit] = useState<DirectoryGroup | true | null>(null);
   const [inviteOpen, setInviteOpen] = useState(false);
 
   useEffect(() => {
@@ -71,7 +78,7 @@ export function UsersPage({ publicModels, refresh, success, fail }: { publicMode
   };
 
   return <>
-    <div className="page-head"><div><span className="eyebrow">Identity</span><h1>Users</h1><p>Single-tenant directory for this node. Local API keys stay on this machine and are not user passwords.</p></div><div className="button-row"><button className="secondary" onClick={() => setGroupOpen(true)}><Plus size={16} />Group</button><button className="secondary" onClick={() => setInviteOpen(true)}><Plus size={16} />Invite OpenID</button><button className="primary" onClick={() => setCreating(true)}><Plus size={16} />User</button></div></div>
+    <div className="page-head"><div><span className="eyebrow">Identity</span><h1>Users</h1><p>Single-tenant directory for this node. Local API keys stay on this machine and are not user passwords.</p></div><div className="button-row"><button className="secondary" onClick={() => setGroupEdit(true)}><Plus size={16} />Group</button><button className="secondary" onClick={() => setInviteOpen(true)}><Plus size={16} />Invite OpenID</button><button className="primary" onClick={() => setCreating(true)}><Plus size={16} />User</button></div></div>
     {bootstrap && <div className="security-note"><KeyRound size={17} /><span>First-run operator password: <code>{bootstrap}</code> Change it after signing in. It is stored only in this node’s secret vault.</span></div>}
     <div className="two-col">
       <div className="panel"><div className="panel-title"><h3>Directory</h3></div>
@@ -80,7 +87,7 @@ export function UsersPage({ publicModels, refresh, success, fail }: { publicMode
       </div>
       <div>
         <div className="panel"><div className="panel-title"><h3>Groups</h3></div>
-          {groups.map(group => <div className="model-row" key={group.id}><div className="grow"><strong>{group.name}</strong><span>{group.allowed_model_ids.join(", ") || "no models"} · {group.may_publish ? "publish" : "no publish"} · {group.may_admin ? "admin" : "no admin"}</span></div><button className="icon-button danger" onClick={async () => { if (!confirm("Delete this group?")) return; try { await command("delete_directory_group", { id: group.id }); await reload(); success("Group deleted"); } catch (error) { fail(error); } }}><Trash2 size={16} /></button></div>)}
+          {groups.map(group => <div className="model-row" key={group.id}><button type="button" className="grow" style={{ background: "transparent", textAlign: "left" }} onClick={() => setGroupEdit(group)}><strong>{group.name}</strong><span>{group.allowed_model_ids.join(", ") || "no models"} · {group.may_publish ? "publish" : "no publish"} · {group.may_admin ? "admin" : "no admin"}{group.rpm != null ? ` · ${group.rpm} RPM` : ""}</span></button><button className="icon-button danger" onClick={async () => { if (!confirm("Delete this group?")) return; try { await command("delete_directory_group", { id: group.id }); await reload(); success("Group deleted"); } catch (error) { fail(error); } }}><Trash2 size={16} /></button></div>)}
           {!groups.length && <p>Create a group to grant model IDs, publish, or admin.</p>}
         </div>
         <div className="panel" style={{ marginTop: 12 }}><div className="panel-title"><h3>OpenID allowlist</h3></div>
@@ -90,7 +97,7 @@ export function UsersPage({ publicModels, refresh, success, fail }: { publicMode
       </div>
     </div>
     {creating && <UserModal publicModels={publicModels} groups={groups} close={() => setCreating(false)} reload={reload} success={success} fail={fail} />}
-    {groupOpen && <GroupModal close={() => setGroupOpen(false)} publicModels={publicModels} reload={reload} success={success} fail={fail} />}
+    {groupEdit && <GroupModal group={groupEdit === true ? undefined : groupEdit} close={() => setGroupEdit(null)} publicModels={publicModels} reload={reload} success={success} fail={fail} />}
     {inviteOpen && <InviteModal users={users} close={() => setInviteOpen(false)} reload={reload} success={success} fail={fail} />}
   </>;
 }
@@ -116,6 +123,9 @@ function UserModal({ user, groups, publicModels, close, reload, success, fail }:
   const [models, setModels] = useState((user?.allowed_model_ids ?? []).join(", "));
   const [mayPublish, setMayPublish] = useState<"inherit" | "yes" | "no">(user?.may_publish == null ? "inherit" : user.may_publish ? "yes" : "no");
   const [mayAdmin, setMayAdmin] = useState<"inherit" | "yes" | "no">(user?.may_admin == null ? "inherit" : user.may_admin ? "yes" : "no");
+  const [rpm, setRpm] = useState(user?.rpm != null ? String(user.rpm) : "");
+  const [tokenBudget, setTokenBudget] = useState(user?.daily_token_budget != null ? String(user.daily_token_budget) : "");
+  const [usdBudget, setUsdBudget] = useState(user?.daily_usd_budget != null ? String(user.daily_usd_budget) : "");
   const [busy, setBusy] = useState(false);
   const flag = (value: "inherit" | "yes" | "no") => value === "inherit" ? null : value === "yes";
 
@@ -138,6 +148,9 @@ function UserModal({ user, groups, publicModels, close, reload, success, fail }:
             mayAdmin: flag(mayAdmin) ?? false,
             inheritAdmin: mayAdmin === "inherit",
             disabled: !!user.disabled_at,
+            rpm: optionalLimit(rpm),
+            dailyTokenBudget: optionalLimit(tokenBudget),
+            dailyUsdBudget: optionalLimit(usdBudget),
           },
         });
         success("User saved");
@@ -151,6 +164,9 @@ function UserModal({ user, groups, publicModels, close, reload, success, fail }:
             allowedModelIds,
             mayPublish: flag(mayPublish),
             mayAdmin: flag(mayAdmin),
+            rpm: optionalLimit(rpm),
+            dailyTokenBudget: optionalLimit(tokenBudget),
+            dailyUsdBudget: optionalLimit(usdBudget),
           },
         });
         success("User created");
@@ -189,6 +205,11 @@ function UserModal({ user, groups, publicModels, close, reload, success, fail }:
         <label className="field"><span>may_publish</span><select value={mayPublish} onChange={event => setMayPublish(event.target.value as typeof mayPublish)}><option value="inherit">Inherit groups</option><option value="yes">Allow</option><option value="no">Deny</option></select></label>
         <label className="field"><span>may_admin</span><select value={mayAdmin} onChange={event => setMayAdmin(event.target.value as typeof mayAdmin)}><option value="inherit">Inherit groups</option><option value="yes">Allow</option><option value="no">Deny</option></select></label>
       </div>
+      <div className="three-fields">
+        <label className="field"><span>RPM limit</span><input type="number" min="1" value={rpm} onChange={event => setRpm(event.target.value)} placeholder="unlimited" /></label>
+        <label className="field"><span>Daily token budget</span><input type="number" min="1" value={tokenBudget} onChange={event => setTokenBudget(event.target.value)} placeholder="unlimited" /></label>
+        <label className="field"><span>Daily USD budget</span><input type="number" min="0" step="any" value={usdBudget} onChange={event => setUsdBudget(event.target.value)} placeholder="unlimited" /></label>
+      </div>
       <div className="modal-actions">
         {user && !user.is_operator && <button type="button" className="secondary danger-text" onClick={() => void toggleDisabled()}>{user.disabled_at ? "Enable" : "Disable"}</button>}
         <button type="button" className="secondary" onClick={close}>Cancel</button>
@@ -198,27 +219,33 @@ function UserModal({ user, groups, publicModels, close, reload, success, fail }:
   </div></div>;
 }
 
-function GroupModal({ close, publicModels, reload, success, fail }: { close: () => void; publicModels: PublicModel[]; reload: () => Promise<void>; success: (text: string) => void; fail: (error: unknown) => void }) {
-  const [name, setName] = useState("");
-  const [models, setModels] = useState("");
-  const [mayPublish, setMayPublish] = useState(false);
-  const [mayAdmin, setMayAdmin] = useState(false);
+function GroupModal({ group, close, publicModels, reload, success, fail }: { group?: DirectoryGroup; close: () => void; publicModels: PublicModel[]; reload: () => Promise<void>; success: (text: string) => void; fail: (error: unknown) => void }) {
+  const [name, setName] = useState(group?.name ?? "");
+  const [models, setModels] = useState((group?.allowed_model_ids ?? []).join(", "));
+  const [mayPublish, setMayPublish] = useState(group?.may_publish ?? false);
+  const [mayAdmin, setMayAdmin] = useState(group?.may_admin ?? false);
+  const [rpm, setRpm] = useState(group?.rpm != null ? String(group.rpm) : "");
+  const [tokenBudget, setTokenBudget] = useState(group?.daily_token_budget != null ? String(group.daily_token_budget) : "");
+  const [usdBudget, setUsdBudget] = useState(group?.daily_usd_budget != null ? String(group.daily_usd_budget) : "");
   const [busy, setBusy] = useState(false);
   const submit = async (event: FormEvent) => {
     event.preventDefault();
     setBusy(true);
     try {
       await command("save_directory_group", {
-        id: null,
+        id: group?.id ?? null,
         input: {
           name,
           allowedModelIds: models.split(",").map(item => item.trim()).filter(Boolean),
           mayPublish,
           mayAdmin,
+          rpm: optionalLimit(rpm),
+          dailyTokenBudget: optionalLimit(tokenBudget),
+          dailyUsdBudget: optionalLimit(usdBudget),
         },
       });
       await reload();
-      success("Group saved");
+      success(group ? "Group saved" : "Group created");
       close();
     } catch (error) {
       fail(error);
@@ -227,13 +254,18 @@ function GroupModal({ close, publicModels, reload, success, fail }: { close: () 
     }
   };
   return <div className="modal-backdrop" onMouseDown={close}><div className="modal" onMouseDown={event => event.stopPropagation()}>
-    <div className="modal-head"><h2>Create group</h2><button className="icon-button" onClick={close}>×</button></div>
+    <div className="modal-head"><h2>{group ? "Edit group" : "Create group"}</h2><button className="icon-button" onClick={close}>×</button></div>
     <form className="form" onSubmit={event => void submit(event)}>
       <label className="field"><span>Name</span><input value={name} onChange={event => setName(event.target.value)} required /></label>
       <label className="field"><span>Allowed public model IDs</span><input value={models} onChange={event => setModels(event.target.value)} placeholder={publicModels.map(model => model.id).slice(0, 3).join(", ")} /></label>
       <label className="capability-editor"><input type="checkbox" checked={mayPublish} onChange={() => setMayPublish(!mayPublish)} />may_publish — offer local models to a parent</label>
       <label className="capability-editor"><input type="checkbox" checked={mayAdmin} onChange={() => setMayAdmin(!mayAdmin)} />may_admin</label>
-      <div className="modal-actions"><button type="button" className="secondary" onClick={close}>Cancel</button><button className="primary" disabled={busy}>Save</button></div>
+      <div className="three-fields">
+        <label className="field"><span>RPM limit</span><input type="number" min="1" value={rpm} onChange={event => setRpm(event.target.value)} placeholder="unlimited" /></label>
+        <label className="field"><span>Daily token budget</span><input type="number" min="1" value={tokenBudget} onChange={event => setTokenBudget(event.target.value)} placeholder="unlimited" /></label>
+        <label className="field"><span>Daily USD budget</span><input type="number" min="0" step="any" value={usdBudget} onChange={event => setUsdBudget(event.target.value)} placeholder="unlimited" /></label>
+      </div>
+      <div className="modal-actions"><button type="button" className="secondary" onClick={close}>Cancel</button><button className="primary" disabled={busy}>{busy ? "Saving…" : "Save"}</button></div>
     </form>
   </div></div>;
 }

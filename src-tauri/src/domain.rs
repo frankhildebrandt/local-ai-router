@@ -33,6 +33,7 @@ pub enum TargetKind {
     Gguf,
     Mlx,
     Alias,
+    Uplink,
 }
 
 impl TargetKind {
@@ -42,6 +43,14 @@ impl TargetKind {
 
     pub fn is_alias(&self) -> bool {
         matches!(self, Self::Alias)
+    }
+
+    pub fn is_uplink(&self) -> bool {
+        matches!(self, Self::Uplink)
+    }
+
+    pub fn is_remote(&self) -> bool {
+        matches!(self, Self::Cloud | Self::Uplink)
     }
 }
 

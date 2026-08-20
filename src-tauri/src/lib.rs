@@ -24,9 +24,10 @@ pub mod routing;
 pub mod runtime;
 pub mod secrets;
 pub mod speculative;
-pub mod tls;
 pub mod storage;
+pub mod tls;
 pub mod tool_emulation;
+pub mod uplink;
 
 use engine::{Engine, EngineConfig};
 use tauri::{Emitter, Manager, RunEvent, WindowEvent};
@@ -108,8 +109,8 @@ pub fn run() {
             let router = engine.router();
             let tls = engine.tls_config();
             tauri::async_runtime::spawn(async move {
-                if let Err(error) = crate::engine::serve_gateway(listener, tls, router, shutdown_server)
-                    .await
+                if let Err(error) =
+                    crate::engine::serve_gateway(listener, tls, router, shutdown_server).await
                 {
                     tracing::error!(%error, "gateway stopped");
                 }
@@ -204,6 +205,9 @@ pub fn run() {
             ipc::save_directory_group,
             ipc::delete_directory_group,
             ipc::user_permissions,
+            ipc::join_uplink,
+            ipc::uplink_status,
+            ipc::disconnect_uplink,
             ipc::reveal_operator_bootstrap,
             ipc::list_oidc_allowlist,
             ipc::invite_oidc_identity,

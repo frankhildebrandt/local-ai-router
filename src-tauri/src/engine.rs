@@ -109,7 +109,9 @@ impl Engine {
         } else {
             None
         };
-        let tls_fingerprint = tls_material.as_ref().map(|material| material.fingerprint.clone());
+        let tls_fingerprint = tls_material
+            .as_ref()
+            .map(|material| material.fingerprint.clone());
         let tls = tls_material
             .as_ref()
             .map(tls::TlsMaterial::server_config)
@@ -451,8 +453,13 @@ where
         if let Some(fingerprint) = &engine.services.tls_fingerprint {
             println!("TLS fingerprint (SHA-256) {fingerprint}");
         }
-        serve_gateway(listener, engine.tls_config(), engine.router(), engine.services.shutdown.clone())
-            .await?;
+        serve_gateway(
+            listener,
+            engine.tls_config(),
+            engine.router(),
+            engine.services.shutdown.clone(),
+        )
+        .await?;
         engine.services.runtimes.stop_all().await;
         Ok(())
     })
@@ -569,11 +576,13 @@ mod tests {
         let resources = root.path().join("Contents/Resources");
         std::fs::create_dir_all(&exe_dir).unwrap();
         std::fs::create_dir_all(resources.join("ui")).unwrap();
-        std::fs::write(resources.join("ui/index.html"), "<title>Local AI Router</title>").unwrap();
+        std::fs::write(
+            resources.join("ui/index.html"),
+            "<title>Local AI Router</title>",
+        )
+        .unwrap();
         assert_eq!(
-            resource_dir_from_exe_dir(&exe_dir)
-                .canonicalize()
-                .unwrap(),
+            resource_dir_from_exe_dir(&exe_dir).canonicalize().unwrap(),
             resources.canonicalize().unwrap()
         );
     }
@@ -951,7 +960,11 @@ mod tests {
         .await
         .err()
         .expect("lan bind without certs must fail closed");
-        assert!(error.to_string().contains("HTTPS") || error.to_string().contains("TLS") || error.to_string().contains("certificate"));
+        assert!(
+            error.to_string().contains("HTTPS")
+                || error.to_string().contains("TLS")
+                || error.to_string().contains("certificate")
+        );
 
         let ok_dir = root.path().join("ok");
         std::fs::create_dir_all(&ok_dir).unwrap();
@@ -972,7 +985,12 @@ mod tests {
         .unwrap();
         assert!(engine.services.tls_required);
         assert!(engine.tls_config().is_some());
-        assert!(engine.services.tls_fingerprint.as_ref().unwrap().contains(':'));
+        assert!(engine
+            .services
+            .tls_fingerprint
+            .as_ref()
+            .unwrap()
+            .contains(':'));
         assert_eq!(engine.bind_ip().to_string(), "0.0.0.0");
     }
 }

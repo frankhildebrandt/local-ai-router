@@ -197,7 +197,7 @@ impl TargetRoutingProfile {
     pub fn neutral(target_id: impl Into<String>, kind: TargetKind) -> Self {
         let mut task_quality = BTreeMap::new();
         task_quality.insert("general".into(), 50.0);
-        let local = !matches!(kind, TargetKind::Cloud);
+        let local = !kind.is_remote();
         Self {
             version: ROUTING_POLICY_VERSION,
             target_id: target_id.into(),
@@ -237,7 +237,7 @@ impl TargetRoutingProfile {
         let meta = crate::model_catalog::resolve_model_metadata(&target.provider_model, None);
         let mut profile = Self::neutral(&target.id, target.kind);
         profile.context_window = meta.context_window;
-        if matches!(target.kind, TargetKind::Cloud) {
+        if target.kind.is_remote() {
             profile.input_price_per_million = meta.input_price_per_million;
             profile.output_price_per_million = meta.output_price_per_million;
         }
@@ -767,7 +767,7 @@ pub fn rank_candidates(
         }
         .clamp(0.0, 1.0);
         let locality = match policy.privacy {
-            PrivacyMode::LocalPreferred if !matches!(candidate.kind, TargetKind::Cloud) => 1.0,
+            PrivacyMode::LocalPreferred if !candidate.kind.is_remote() => 1.0,
             PrivacyMode::LocalPreferred => 0.0,
             _ => 0.5,
         };
@@ -816,9 +816,7 @@ fn hard_exclude_reason(
         Some("disabled")
     } else if candidate.stats.circuit_open {
         Some("circuit_open")
-    } else if matches!(policy.privacy, PrivacyMode::LocalOnly)
-        && matches!(candidate.kind, TargetKind::Cloud)
-    {
+    } else if matches!(policy.privacy, PrivacyMode::LocalOnly) && candidate.kind.is_remote() {
         Some("privacy_local_only")
     } else if request
         .estimated_input_tokens
@@ -845,9 +843,7 @@ fn reserve_exclude_reason(
         Some("disabled")
     } else if candidate.stats.circuit_open {
         Some("circuit_open")
-    } else if matches!(policy.privacy, PrivacyMode::LocalOnly)
-        && matches!(candidate.kind, TargetKind::Cloud)
-    {
+    } else if matches!(policy.privacy, PrivacyMode::LocalOnly) && candidate.kind.is_remote() {
         Some("privacy_local_only")
     } else {
         None

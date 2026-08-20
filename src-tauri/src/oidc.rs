@@ -11,8 +11,8 @@ use tokio::sync::Mutex;
 
 use crate::{
     identity::{
-        complete_oidc_login, github_authorization_url, google_authorization_url, oidc_secret_account,
-        parse_oidc_config, DirectoryUser,
+        complete_oidc_login, github_authorization_url, google_authorization_url,
+        oidc_secret_account, parse_oidc_config, DirectoryUser,
     },
     secrets::SecretStore,
     storage::Store,
@@ -79,7 +79,13 @@ impl OidcManager {
     pub fn configured_providers(&self) -> Vec<String> {
         ["github", "google"]
             .into_iter()
-            .filter(|provider| self.secrets.get(&oidc_secret_account(provider)).ok().flatten().is_some())
+            .filter(|provider| {
+                self.secrets
+                    .get(&oidc_secret_account(provider))
+                    .ok()
+                    .flatten()
+                    .is_some()
+            })
             .map(str::to_owned)
             .collect()
     }
@@ -94,8 +100,12 @@ impl OidcManager {
         let state = random_urlsafe(32);
         let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
         let authorization_url = match provider {
-            "github" => github_authorization_url(&config.client_id, redirect_uri, &state, &challenge)?,
-            "google" => google_authorization_url(&config.client_id, redirect_uri, &state, &challenge)?,
+            "github" => {
+                github_authorization_url(&config.client_id, redirect_uri, &state, &challenge)?
+            }
+            "google" => {
+                google_authorization_url(&config.client_id, redirect_uri, &state, &challenge)?
+            }
             _ => anyhow::bail!("unsupported OpenID provider"),
         };
         self.pending.lock().await.insert(
@@ -128,12 +138,16 @@ impl OidcManager {
         let config = parse_oidc_config(&config_raw)?;
         match flow.provider.as_str() {
             "github" => {
-                let token = self.exchange_github(&config.client_id, &config.client_secret, code, &flow).await?;
+                let token = self
+                    .exchange_github(&config.client_id, &config.client_secret, code, &flow)
+                    .await?;
                 let (subject, email, login) = self.github_profile(&token).await?;
                 complete_oidc_login(store, "github", &subject, email.as_deref(), Some(&login)).await
             }
             "google" => {
-                let token = self.exchange_google(&config.client_id, &config.client_secret, code, &flow).await?;
+                let token = self
+                    .exchange_google(&config.client_id, &config.client_secret, code, &flow)
+                    .await?;
                 let (subject, email) = self.google_profile(&token).await?;
                 complete_oidc_login(store, "google", &subject, email.as_deref(), None).await
             }
@@ -169,7 +183,10 @@ impl OidcManager {
             .context("GitHub token response missing access_token")
     }
 
-    async fn github_profile(&self, token: &str) -> anyhow::Result<(String, Option<String>, String)> {
+    async fn github_profile(
+        &self,
+        token: &str,
+    ) -> anyhow::Result<(String, Option<String>, String)> {
         let user: Value = self
             .client
             .get(&self.endpoints.github_user_url)
