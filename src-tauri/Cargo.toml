@@ -15,6 +15,7 @@ tauri-build = { version = "2", features = [] }
 
 [dependencies]
 anyhow = "1"
+argon2 = { version = "0.5", features = ["std"] }
 async-stream = "0.3"
 axum = { version = "0.8", features = ["multipart"] }
 base64 = "0.22"
@@ -23,8 +24,11 @@ chrono = { version = "0.4", features = ["serde"] }
 futures-util = "0.3"
 parking_lot = "0.12"
 rand = "0.9"
+rcgen = "0.13"
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "multipart", "rustls-tls"] }
 regex = "1"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rustls-pemfile = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
@@ -37,6 +41,7 @@ tauri-plugin-dialog = "2"
 tauri-plugin-opener = "2"
 tauri-plugin-updater = "2"
 tokio = { version = "1", features = ["full"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 tokio-util = "0.7"
 tower = { version = "0.5", features = ["util"] }
 tower-http = { version = "0.6", features = ["cors", "trace"] }

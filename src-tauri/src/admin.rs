@@ -1,23 +1,23 @@
-use std::{convert::Infallible, path::PathBuf, sync::Arc};
+use std::{path::PathBuf, sync::Arc};
 
 use axum::{
     body::Body,
-    extract::{Path, State},
-    http::{header, StatusCode, Uri},
+    extract::{Path, Query, State},
+    http::{header, HeaderMap, StatusCode, Uri},
     response::{
         sse::{Event, KeepAlive, Sse},
-        IntoResponse, Response,
+        IntoResponse, Redirect, Response,
     },
     routing::{get, post},
     Json, Router,
 };
-use futures_util::stream::Stream;
 use serde::de::DeserializeOwned;
 use serde_json::{json, Value};
 
 use crate::{
     commands::{self, AppServices},
     gateway,
+    identity::{self, DirectoryUser},
 };
 
 #[derive(Clone)]
@@ -29,6 +29,7 @@ pub fn router(services: Arc<AppServices>) -> Router {
     Router::new()
         .route("/admin/events", get(events))
         .route("/admin/{name}", post(invoke))
+        .route("/auth/oidc/callback", get(oidc_callback))
         .with_state(AdminState { services })
 }
 
@@ -96,9 +97,14 @@ fn content_type(path: &std::path::Path) -> &'static str {
     }
 }
 
-async fn events(
-    State(state): State<AdminState>,
-) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+async fn events(State(state): State<AdminState>, headers: HeaderMap) -> Response {
+    let request = match load_admin_request(&state, &headers).await {
+        Ok(request) => request,
+        Err(response) => return response,
+    };
+    if let Some(response) = deny_if_needed(&state, &request, "events").await {
+        return response;
+    }
     let mut install = state.services.install.subscribe();
     let traffic = state.services.core.traffic.clone();
     let mut traffic_events = traffic.subscribe();
@@ -109,7 +115,7 @@ async fn events(
                     match result {
                         Ok(event) => {
                             if let Ok(item) = Event::default().event("install-job").json_data(event) {
-                                yield Ok(item);
+                                yield Ok::<Event, std::convert::Infallible>(item);
                             }
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
@@ -120,7 +126,7 @@ async fn events(
                     match result {
                         Ok(event) => {
                             if let Ok(item) = Event::default().event("gateway-traffic").json_data(event) {
-                                yield Ok(item);
+                                yield Ok::<Event, std::convert::Infallible>(item);
                             }
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
@@ -128,7 +134,7 @@ async fn events(
                                 .event("gateway-traffic")
                                 .json_data(traffic.snapshot())
                             {
-                                yield Ok(item);
+                                yield Ok::<Event, std::convert::Infallible>(item);
                             }
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
@@ -137,11 +143,14 @@ async fn events(
             }
         }
     };
-    Sse::new(stream).keep_alive(KeepAlive::default())
+    Sse::new(stream)
+        .keep_alive(KeepAlive::default())
+        .into_response()
 }
 
 async fn invoke(
     State(state): State<AdminState>,
+    headers: HeaderMap,
     Path(name): Path<String>,
     body: bytes::Bytes,
 ) -> Response {
@@ -153,17 +162,239 @@ async fn invoke(
             Err(error) => return (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
         }
     };
+    let request = match load_admin_request(&state, &headers).await {
+        Ok(request) => request,
+        Err(response) => return response,
+    };
+    if let Some(response) = deny_if_needed(&state, &request, &name).await {
+        return response;
+    }
+    if name == "login" {
+        return login_response(&state, &request, &args).await;
+    }
+    if name == "logout" {
+        if let Some(token) = &request.token {
+            let _ = commands::logout(&state.services, Some(token)).await;
+        }
+        return cookie_json(Value::Null, identity::clear_cookie_header(request.secure));
+    }
+    if name == "auth_status" {
+        return match commands::auth_status_for(&state.services, request.login_required, request.user)
+            .await
+        {
+            Ok(value) => ok_response(value),
+            Err(error) => (StatusCode::BAD_REQUEST, error).into_response(),
+        };
+    }
+    if name == "begin_oidc_login" {
+        let provider = match field::<String>(&args, "provider") {
+            Ok(value) => value,
+            Err(error) => return (StatusCode::BAD_REQUEST, error).into_response(),
+        };
+        let origin = request_origin(&headers, request.secure, state.services.port);
+        let redirect = format!("{origin}/auth/oidc/callback");
+        return match commands::begin_oidc_login(&state.services, provider, redirect).await {
+            Ok(value) => ok_response(value),
+            Err(error) => (StatusCode::BAD_REQUEST, error).into_response(),
+        };
+    }
     match dispatch(&state.services, &name, args).await {
         Ok(value) => Json(value).into_response(),
         Err(error) => {
             let status = if error == "unknown admin command" {
                 StatusCode::NOT_FOUND
+            } else if error == "login required" {
+                StatusCode::UNAUTHORIZED
             } else {
                 StatusCode::BAD_REQUEST
             };
             (status, error).into_response()
         }
     }
+}
+
+struct AdminRequest {
+    login_required: bool,
+    secure: bool,
+    user: Option<DirectoryUser>,
+    token: Option<String>,
+}
+
+async fn load_admin_request(
+    state: &AdminState,
+    headers: &HeaderMap,
+) -> Result<AdminRequest, Response> {
+    let login_required = state.services.tls_required;
+    let token = identity::parse_session_cookie(
+        headers
+            .get(header::COOKIE)
+            .and_then(|value| value.to_str().ok()),
+    );
+    let user = if let Some(token) = token.as_deref() {
+        identity::user_for_session(&state.services.core.store, token)
+            .await
+            .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()).into_response())?
+            .filter(|user| user.disabled_at.is_none())
+    } else {
+        None
+    };
+    Ok(AdminRequest {
+        login_required,
+        secure: state.services.tls_required,
+        user,
+        token,
+    })
+}
+
+async fn deny_if_needed(state: &AdminState, request: &AdminRequest, name: &str) -> Option<Response> {
+    if is_public_command(name) {
+        return None;
+    }
+    if !request.login_required {
+        return None;
+    }
+    let Some(user) = &request.user else {
+        return Some((StatusCode::UNAUTHORIZED, "login required").into_response());
+    };
+    if is_admin_command(name) {
+        let Ok(permissions) = state.services.core.store.permissions_for(user).await else {
+            return Some((StatusCode::FORBIDDEN, "admin permission required").into_response());
+        };
+        if !permissions.may_admin {
+            return Some((StatusCode::FORBIDDEN, "admin permission required").into_response());
+        }
+    }
+    None
+}
+
+fn is_public_command(name: &str) -> bool {
+    matches!(
+        name,
+        "auth_status" | "login" | "logout" | "begin_oidc_login"
+    )
+}
+
+fn is_admin_command(name: &str) -> bool {
+    matches!(
+        name,
+        "create_directory_user"
+            | "update_directory_user"
+            | "save_directory_group"
+            | "delete_directory_group"
+            | "invite_oidc_identity"
+            | "delete_oidc_allowlist"
+            | "save_oidc_client"
+            | "reveal_operator_bootstrap"
+            | "save_setting"
+            | "forget_all_credentials"
+    )
+}
+
+async fn login_response(state: &AdminState, request: &AdminRequest, args: &Value) -> Response {
+    let username = match field::<String>(args, "username") {
+        Ok(value) => value,
+        Err(error) => return (StatusCode::BAD_REQUEST, error).into_response(),
+    };
+    let password = match field::<String>(args, "password") {
+        Ok(value) => value,
+        Err(error) => return (StatusCode::BAD_REQUEST, error).into_response(),
+    };
+    match commands::login_with_session(&state.services, username, password).await {
+        Ok((user, token)) => cookie_json(
+            serde_json::to_value(&user).unwrap_or(Value::Null),
+            identity::set_cookie_header(&token, request.secure),
+        ),
+        Err(error) => (StatusCode::UNAUTHORIZED, error).into_response(),
+    }
+}
+
+fn cookie_json(value: Value, cookie: String) -> Response {
+    (
+        [(header::SET_COOKIE, cookie)],
+        Json(value),
+    )
+        .into_response()
+}
+
+fn ok_response<T: serde::Serialize>(value: T) -> Response {
+    match serde_json::to_value(value) {
+        Ok(value) => Json(value).into_response(),
+        Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
+    }
+}
+
+fn request_origin(headers: &HeaderMap, secure: bool, port: u16) -> String {
+    if let Some(host) = headers
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.is_empty())
+    {
+        let scheme = if secure { "https" } else { "http" };
+        return format!("{scheme}://{host}");
+    }
+    if let Some(origin) = headers
+        .get(header::ORIGIN)
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.is_empty())
+    {
+        return origin.trim_end_matches('/').to_owned();
+    }
+    format!(
+        "{}://127.0.0.1:{port}",
+        if secure { "https" } else { "http" }
+    )
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct OidcCallback {
+    code: Option<String>,
+    state: Option<String>,
+    error: Option<String>,
+}
+
+async fn oidc_callback(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+    Query(query): Query<OidcCallback>,
+) -> Response {
+    let request = match load_admin_request(&state, &headers).await {
+        Ok(request) => request,
+        Err(response) => return response,
+    };
+    let origin = request_origin(&headers, request.secure, state.services.port);
+    if let Some(error) = query.error {
+        return Redirect::to(&format!("{origin}/?oidc_error={error}")).into_response();
+    }
+    let (Some(code), Some(oidc_state)) = (query.code, query.state) else {
+        return Redirect::to(&format!("{origin}/?oidc_error=missing_code")).into_response();
+    };
+    match commands::finish_oidc_login(&state.services, code, oidc_state).await {
+        Ok((_, token)) => {
+            let cookie = identity::set_cookie_header(&token, request.secure);
+            Response::builder()
+                .status(StatusCode::SEE_OTHER)
+                .header(header::LOCATION, format!("{origin}/"))
+                .header(header::SET_COOKIE, cookie)
+                .body(Body::empty())
+                .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+        }
+        Err(error) => {
+            let encoded = urlencoding_lite(&error);
+            Redirect::to(&format!("{origin}/?oidc_error={encoded}")).into_response()
+        }
+    }
+}
+
+fn urlencoding_lite(value: &str) -> String {
+    value
+        .bytes()
+        .map(|byte| match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                (byte as char).to_string()
+            }
+            _ => format!("%{byte:02X}"),
+        })
+        .collect()
 }
 
 async fn dispatch(services: &AppServices, name: &str, args: Value) -> Result<Value, String> {
@@ -372,6 +603,55 @@ async fn dispatch(services: &AppServices, name: &str, args: Value) -> Result<Val
         }
         "forget_all_credentials" => {
             commands::forget_all_credentials(services).await?;
+            Ok(Value::Null)
+        }
+        "list_directory_users" => ok(commands::list_directory_users(services).await?),
+        "create_directory_user" => ok(commands::create_directory_user(
+            services,
+            field(&args, "input")?,
+        )
+        .await?),
+        "update_directory_user" => ok(commands::update_directory_user(
+            services,
+            field(&args, "id")?,
+            field(&args, "input")?,
+        )
+        .await?),
+        "list_directory_groups" => ok(commands::list_directory_groups(services).await?),
+        "save_directory_group" => ok(commands::save_directory_group(
+            services,
+            optional(&args, "id")?,
+            field(&args, "input")?,
+        )
+        .await?),
+        "delete_directory_group" => {
+            commands::delete_directory_group(services, field(&args, "id")?).await?;
+            Ok(Value::Null)
+        }
+        "user_permissions" => ok(commands::user_permissions(services, field(&args, "id")?).await?),
+        "reveal_operator_bootstrap" => {
+            ok(commands::reveal_operator_bootstrap(services).await?)
+        }
+        "list_oidc_allowlist" => ok(commands::list_oidc_allowlist(services).await?),
+        "invite_oidc_identity" => ok(commands::invite_oidc_identity(
+            services,
+            field(&args, "provider")?,
+            field(&args, "identifier")?,
+            optional(&args, "user_id")?,
+        )
+        .await?),
+        "delete_oidc_allowlist" => {
+            commands::delete_oidc_allowlist(services, field(&args, "id")?).await?;
+            Ok(Value::Null)
+        }
+        "save_oidc_client" => {
+            commands::save_oidc_client(
+                services,
+                field(&args, "provider")?,
+                field(&args, "client_id")?,
+                field(&args, "client_secret")?,
+            )
+            .await?;
             Ok(Value::Null)
         }
         _ => Err("unknown admin command".into()),

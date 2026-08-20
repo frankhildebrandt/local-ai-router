@@ -23,7 +23,7 @@ A private, multi-protocol model gateway for Apple Silicon Macs, Linux, and Windo
 - Native MLX chat, image and speech sidecars plus Metal-enabled llama.cpp on macOS; CPU llama.cpp on Linux and Windows
 - Optional speculative decoding for local chat models: pair a smaller draft from the library, or GGUF n-gram without an extra model
 
-The gateway listens only on `http://127.0.0.1:11435`. Inference APIs require a local token managed under **API keys**. Supply it as `Authorization: Bearer`, `x-api-key`, or `x-goog-api-key`; query-string keys are deliberately rejected because URLs are commonly logged. The admin UI on that same loopback port is local-process privileged (like the desktop app’s IPC): it does not use a bearer token.
+The gateway listens on `http://127.0.0.1:11435` by default. Inference APIs require a local token managed under **API keys**. Supply it as `Authorization: Bearer`, `x-api-key`, or `x-goog-api-key`; query-string keys are deliberately rejected because URLs are commonly logged. The admin UI on loopback is local-process privileged (like the desktop app’s IPC): it does not require a login. Sharing the node on a LAN is opt-in under **Settings → Network share** and always uses HTTPS plus a directory login.
 
 ## Install
 
@@ -141,7 +141,7 @@ local-ai-router serve
 | Data directory (macOS) | `~/Library/Application Support/app.local-ai-router.desktop` | Same, or `--data-dir` |
 | Data directory (Linux) | `$XDG_DATA_HOME/app.local-ai-router.desktop` (default `~/.local/share/...`) | Same, or `--data-dir` (systemd unit uses `/var/lib/local-ai-router`) |
 | Data directory (Windows) | `%APPDATA%\app.local-ai-router.desktop` | Same, or `--data-dir` |
-| Bind address | `127.0.0.1` (never LAN) | Same; `--port` overrides the saved setting (default `11435`) |
+| Bind address | `127.0.0.1` HTTP (default). Opt-in LAN/address bind is HTTPS | Same; `--port` overrides the saved setting (default `11435`) |
 | Secrets (macOS) | Keychain service `app.local-ai-router.desktop` | Same Keychain, or `--secrets-file` for an isolated 0600 JSON vault (CI / extra data dirs) |
 | Secrets (Linux) | Secret Service (GNOME Keyring/KWallet) | Same, or `--secrets-file` (required for systemd; no desktop session) |
 | Secrets (Windows) | Windows Credential Manager | Same, or `--secrets-file` (CI, extra data dirs, or tasks without an interactive user) |
@@ -242,6 +242,14 @@ Local chat models accept OpenAI `input_audio` and the Local AI Router extension 
 
 `/v1/images/generations` for local targets supports `model`, `prompt`, `n: 1`, engine-compatible sizes and `response_format: "b64_json"`. The image sidecar runs FLUX.2, SDXL, and non-XL Stable Diffusion (SD 1.x / 2.x Diffusers layouts). Image search can download from Hugging Face or CivitAI. `/v1/audio/speech` supports `model`, `input`, `voice`, `speed`, plus `wav` and `pcm`. New local speech targets must advertise `speech`; stored cloud targets may still use `audio`.
 
+### Identity and LAN share
+
+Each node has a single-tenant user directory. First run creates a local `operator` account (password in the Users page until you change it). Groups grant public model IDs, `may_publish`, and `may_admin`; a user-level allowlist or flag replaces the inherited group grant.
+
+Loopback remains HTTP with an unlocked admin UI. **Settings → Network share** can bind all interfaces or a specific address. That bind requires HTTPS. If you do not supply a certificate and key, the node writes a self-signed pair under the data directory (`tls/server.crt` and `tls/server.key`, mode 0600 on Unix) and shows the SHA-256 fingerprint in Settings and on the login screen. Pin that fingerprint in browsers and HTTP clients (`curl --cacert` or `--pinnedpubkey` / TOFU). Browsers still warn if the hostname is not on the certificate (LAN share often uses a private IP); pin the fingerprint and continue, or supply a certificate whose SAN matches the share address. A specific-address bind adds that IP to the generated certificate. Tailscale is the intended overlay if you need reachability off the LAN: join the tailnet, enable LAN share, pin the fingerprint. Register the gateway callback `https://<host>:11435/auth/oidc/callback` (or the loopback HTTP equivalent) on the OAuth app. OpenID sign-in is for browsers against the hosted gateway; the desktop webview stays a local unlocked console. Unknown GitHub/Google accounts cannot sign in until invited on the Users page. Local operator passwords still work with OpenID disabled or when the node is offline. Local API keys authenticate inference only; they are never uploaded to a parent.
+
+Restart the desktop app or `serve` process after changing bind mode. Clients against a shared node use `https://<host>:11435/v1` and the same local API key.
+
 ## Provider notes
 
 - Poolside requires the HTTPS deployment domain assigned to your organization; enter its OpenAI-compatible base URL in the preset.
@@ -256,7 +264,8 @@ Local chat models accept OpenAI `input_audio` and the Local AI Router extension 
 - Provider, Hugging Face, CivitAI and local API tokens default to the platform keyring (macOS Keychain, Linux Secret Service, or Windows Credential Manager), together in a single `credentials` item. Logical keys stay separate inside that versioned record. Subscription access/refresh tokens, expiry and account ID are kept in the same vault under the provider key. Headless `--secrets-file` is a JSON vault for isolated data directories, CI, Linux systemd hosts without a Secret Service session, and Windows tasks without an interactive user; the desktop app uses the platform keyring. On Unix the file is created mode 0600.
 - SQLite stores configuration and request metadata, never request/response bodies or authorization headers.
 - Local bearer tokens are stored in that vault, compared in constant time and can be rotated or revoked immediately.
-- The gateway never binds to a LAN address. Headless mode uses the same loopback bind; pass `--port` to choose the port without writing it back to settings.
+- The gateway defaults to `127.0.0.1` over HTTP. **Settings → Network share** can bind a LAN or specific address; that always requires HTTPS (an auto-generated self-signed certificate whose SHA-256 fingerprint is shown in Settings, or a certificate/key you provide). Off-loopback admin UI requires a directory login. Inference APIs still need a local API key on every bind.
+- Tailscale (or another overlay VPN) is the preferred way to reach a shared node across networks: join the tailnet, then bind LAN/HTTPS on the node and pin the certificate fingerprint. This is not a public multi-tenant service.
 - Imported models are copied into the app-managed data directory. `--data-dir` relocates SQLite, the model library and KV snapshots for that process only.
 - Optional local KV snapshots (GGUF slots and MLX prefix hashes) can encode sensitive conversation state. They are unencrypted app-private files and can be removed from Settings at any time.
 - Cloud prompts and tool data are sent to the provider selected by the route and remain subject to that provider's retention, training and regional-processing terms. Fallback targets may send a request to a different provider only after an eligible pre-stream failure.

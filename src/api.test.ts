@@ -26,6 +26,6 @@ describe("browser admin transport", () => {
       running: true,
       base_url: "http://127.0.0.1:11435/v1",
     });
-    expect(fetch).toHaveBeenCalledWith("/admin/dashboard", expect.objectContaining({ method: "POST" }));
+    expect(fetch).toHaveBeenCalledWith("/admin/dashboard", expect.objectContaining({ method: "POST", credentials: "include" }));
   });
 });

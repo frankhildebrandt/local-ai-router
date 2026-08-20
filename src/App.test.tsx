@@ -45,6 +45,10 @@ beforeEach(() => {
     if (name === "list_local_api_keys") return Promise.resolve([{ id: "default", name: "Default", created_at: "2026-08-17T10:00:00Z", last_used_at: null, revoked_at: null }]);
     if (name === "list_logs") return Promise.resolve({ total: 1, items: [{ id: "request", created_at: "2026-08-17T10:00:00Z", endpoint: "/v1/chat/completions", alias: "assistant", target: "cloud", attempts: 1, status: 200, latency_ms: 12, input_tokens: 3, output_tokens: 5, error_code: null, error_message: null, api_key_id: "default", api_key_name: "Default" }] });
     if (name === "get_settings") return Promise.resolve({});
+    if (name === "auth_status") return Promise.resolve({ login_required: false, authenticated: false, user: null, permissions: null, bind_mode: "loopback", bind_address: "127.0.0.1", tls_fingerprint: null, oidc_providers: [], operator_bootstrap_pending: false });
+    if (name === "list_directory_users") return Promise.resolve([{ id: "op", username: "operator", display_name: "Operator", is_operator: true, disabled_at: null, created_at: "2026-08-20T00:00:00Z", group_ids: [], allowed_model_ids: null, may_publish: null, may_admin: null, has_password: true }]);
+    if (name === "list_directory_groups" || name === "list_oidc_allowlist") return Promise.resolve([]);
+    if (name === "reveal_operator_bootstrap") return Promise.resolve(null);
     if (name === "get_resource_policy") return Promise.resolve({ version: 1, profile: "stealth", memory_budget_percent: 50, memory_budget_mib: null, auto_load: true, idle_unload_minutes: 5, compute_duty_percent: 25, cpu_threads: 4, max_parallel_prompts: 1, process_priority: -1, gguf_gpu_layers: -1, disk_kv_enabled: true, disk_kv_max_bytes: 10 * 1024 ** 3 });
     if (name === "get_resource_profile_preset") return Promise.resolve({ version: 1, profile: "balanced", memory_budget_percent: 70, memory_budget_mib: null, auto_load: true, idle_unload_minutes: 15, compute_duty_percent: 60, cpu_threads: 8, max_parallel_prompts: 2, process_priority: 0, gguf_gpu_layers: -1, disk_kv_enabled: false, disk_kv_max_bytes: 10 * 1024 ** 3 });
     if (name === "get_log_facets") return Promise.resolve({ aliases: ["assistant"], targets: ["cloud"], endpoints: ["/v1/chat/completions"] });
@@ -603,5 +607,33 @@ describe("Local AI Router shell", () => {
     await waitFor(() => expect(command).toHaveBeenCalledWith("save_routing_policy", expect.objectContaining({
       policy: expect.objectContaining({ preferred_cost_usd: 0.0125 }),
     })));
+  });
+
+  it("lets an operator manage the local user directory", async () => {
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: "Users" }));
+    expect(await screen.findByRole("heading", { name: "Users" })).toBeInTheDocument();
+    expect(await screen.findByText("operator · operator")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "User" }));
+    expect(await screen.findByRole("heading", { name: "Create user" })).toBeInTheDocument();
+    fireEvent.change(screen.getByLabelText("Username"), { target: { value: "alice" } });
+  });
+
+  it("asks for a directory login when the gateway is shared on the LAN", async () => {
+    const previous = command.getMockImplementation();
+    command.mockImplementation((name: string, args?: unknown) => {
+      if (name === "auth_status") {
+        return Promise.resolve({
+          login_required: true, authenticated: false, user: null, permissions: null,
+          bind_mode: "lan", bind_address: "0.0.0.0", tls_fingerprint: "AA:BB",
+          oidc_providers: ["google"], operator_bootstrap_pending: false,
+        });
+      }
+      return previous?.(name, args);
+    });
+    render(<App />);
+    expect(await screen.findByRole("heading", { name: "Sign in" })).toBeInTheDocument();
+    expect(screen.getByText(/TLS fingerprint/)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Continue with google" })).toBeInTheDocument();
   });
 });

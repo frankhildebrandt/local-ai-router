@@ -12,18 +12,20 @@ import {
 import { command, appVersion, downloadTextFile, errorMessage, isTauri, listenDesktopNavigate, listenGatewayTraffic } from "./api";
 import type { DashboardData, InFlightRequest, LocalApiKey, LogQuery, ModelRoute, ModelTarget, Provider, ProviderModel, ProviderPreset, PublicModel, ResourcePolicy, ResourceProfile, RouteRole, RouteTarget, RoutingConfigExport, RoutingEvaluation, RoutingPolicy, RoutingTaskDefinition, TargetKind, TargetRoutingProfile, WireProtocol } from "./types";
 import { ApiKeysPage } from "./ApiKeysPage";
+import { UsersPage, LoginPage } from "./UsersPage";
 import { CandleLineChart } from "./CandleLineChart";
 import { LocalPage } from "./LocalPage";
 import { TypeaheadSelect } from "./TypeaheadSelect";
 import { createQueryClient, defaultResourcePolicy, emptyDashboard, emptyUsage, fetchers, invalidateAppQueries, queryKeys } from "./queries";
 import { useDebouncedValue } from "./useDebouncedValue";
 
-type Page = "overview" | "chat" | "keys" | "usage" | "providers" | "cloud" | "local" | "routes" | "logs" | "routing" | "settings";
+type Page = "overview" | "chat" | "keys" | "users" | "usage" | "providers" | "cloud" | "local" | "routes" | "logs" | "routing" | "settings";
 
 const nav: Array<{ page: Page; label: string; icon: typeof Activity }> = [
   { page: "overview", label: "Overview", icon: Gauge },
   { page: "chat", label: "Chat", icon: Bot },
   { page: "keys", label: "API keys", icon: KeyRound },
+  { page: "users", label: "Users", icon: ShieldCheck },
   { page: "usage", label: "Usage", icon: BarChart3 },
   { page: "providers", label: "Providers", icon: KeyRound },
   { page: "cloud", label: "Cloud models", icon: Cloud },
@@ -49,18 +51,20 @@ function AppShell() {
   const [sidebar, setSidebar] = useState(true);
   const [version, setVersion] = useState("");
 
-  const dashboardQuery = useQuery({ queryKey: queryKeys.dashboard, queryFn: fetchers.dashboard, refetchInterval: page === "overview" ? 10_000 : false });
-  const providersQuery = useQuery({ queryKey: queryKeys.providers, queryFn: fetchers.providers });
-  const presetsQuery = useQuery({ queryKey: queryKeys.providerPresets, queryFn: fetchers.providerPresets });
-  const targetsQuery = useQuery({ queryKey: queryKeys.targets, queryFn: fetchers.targets });
-  const routesQuery = useQuery({ queryKey: queryKeys.routes, queryFn: fetchers.routes });
-  const publicModelsQuery = useQuery({ queryKey: queryKeys.publicModels, queryFn: fetchers.publicModels });
-  const settingsQuery = useQuery({ queryKey: queryKeys.settings, queryFn: fetchers.settings });
-  const localKeysQuery = useQuery({ queryKey: queryKeys.localKeys, queryFn: fetchers.localKeys });
-  const resourcePolicyQuery = useQuery({ queryKey: queryKeys.resourcePolicy, queryFn: fetchers.resourcePolicy });
-  const routingPoliciesQuery = useQuery({ queryKey: queryKeys.routingPolicies, queryFn: fetchers.routingPolicies });
-  const routingProfilesQuery = useQuery({ queryKey: queryKeys.routingProfiles, queryFn: fetchers.routingProfiles });
-  const routingTasksQuery = useQuery({ queryKey: queryKeys.routingTasks, queryFn: fetchers.routingTasks });
+  const authQuery = useQuery({ queryKey: queryKeys.auth, queryFn: fetchers.auth });
+  const signedOut = !!authQuery.data?.login_required && !authQuery.data?.authenticated;
+  const dashboardQuery = useQuery({ queryKey: queryKeys.dashboard, queryFn: fetchers.dashboard, refetchInterval: page === "overview" && !signedOut ? 10_000 : false, enabled: !signedOut });
+  const providersQuery = useQuery({ queryKey: queryKeys.providers, queryFn: fetchers.providers, enabled: !signedOut });
+  const presetsQuery = useQuery({ queryKey: queryKeys.providerPresets, queryFn: fetchers.providerPresets, enabled: !signedOut });
+  const targetsQuery = useQuery({ queryKey: queryKeys.targets, queryFn: fetchers.targets, enabled: !signedOut });
+  const routesQuery = useQuery({ queryKey: queryKeys.routes, queryFn: fetchers.routes, enabled: !signedOut });
+  const publicModelsQuery = useQuery({ queryKey: queryKeys.publicModels, queryFn: fetchers.publicModels, enabled: !signedOut });
+  const settingsQuery = useQuery({ queryKey: queryKeys.settings, queryFn: fetchers.settings, enabled: !signedOut });
+  const localKeysQuery = useQuery({ queryKey: queryKeys.localKeys, queryFn: fetchers.localKeys, enabled: !signedOut });
+  const resourcePolicyQuery = useQuery({ queryKey: queryKeys.resourcePolicy, queryFn: fetchers.resourcePolicy, enabled: !signedOut });
+  const routingPoliciesQuery = useQuery({ queryKey: queryKeys.routingPolicies, queryFn: fetchers.routingPolicies, enabled: !signedOut });
+  const routingProfilesQuery = useQuery({ queryKey: queryKeys.routingProfiles, queryFn: fetchers.routingProfiles, enabled: !signedOut });
+  const routingTasksQuery = useQuery({ queryKey: queryKeys.routingTasks, queryFn: fetchers.routingTasks, enabled: !signedOut });
   const snapshotQueries = [dashboardQuery, providersQuery, presetsQuery, targetsQuery, routesQuery, publicModelsQuery, settingsQuery, localKeysQuery, resourcePolicyQuery, routingPoliciesQuery, routingProfilesQuery, routingTasksQuery];
   const dashboard = dashboardQuery.data ?? emptyDashboard;
   const providers = providersQuery.data ?? [];
@@ -105,6 +109,10 @@ function AppShell() {
   const stopAll = () => { void command("cancel_all_inflight_requests").then(() => setInflight([])).catch(fail); };
   const common = { providers, providerPresets, targets, routes, routingPolicies, routingProfiles, routingTasks, localKeys, settings, resourcePolicy, refresh, success, fail };
 
+  if (signedOut && authQuery.data) {
+    return <LoginPage auth={authQuery.data} onDone={() => { void queryClient.invalidateQueries(); }} fail={fail} />;
+  }
+
   return <div className="shell">
     <aside className={sidebar ? "sidebar" : "sidebar collapsed"}>
       <div className="sidebar-drag" data-tauri-drag-region aria-hidden="true" />
@@ -112,7 +120,7 @@ function AppShell() {
       <nav>{nav.map(({ page: item, label, icon: Icon }) => <button key={item} className={page === item ? "active" : ""} onClick={() => setPage(item)} title={label}><Icon size={18} />{sidebar && <span>{label}</span>}</button>)}</nav>
       <div className="sidebar-foot">
         <div className={`server-pill ${dashboard.running ? "online" : ""}`}><i />{sidebar && <span>{dashboard.running ? "Gateway online" : "Gateway offline"}</span>}</div>
-        {sidebar && <small>v{version || "…"} · localhost only</small>}
+        {sidebar && <small>v{version || "…"} · {dashboard.bind_mode === "lan" || dashboard.bind_mode === "address" ? "network share" : "localhost only"}</small>}
       </div>
     </aside>
     <main>
@@ -122,6 +130,7 @@ function AppShell() {
         {loading ? <Loading /> : page === "overview" ? <Overview dashboard={dashboard} inflight={inflight} targets={targets} publicModels={publicModels} onNavigate={setPage} onStop={stopRequest} onStopAll={stopAll} />
           : page === "chat" ? <Suspense fallback={<Loading />}><ChatPage publicModels={publicModels} /></Suspense>
           : page === "keys" ? <ApiKeysPage localKeys={localKeys} refresh={refresh} success={success} fail={fail} />
+          : page === "users" ? <UsersPage publicModels={publicModels} refresh={refresh} success={success} fail={fail} />
           : page === "usage" ? <UsagePage />
           : page === "providers" ? <ProvidersPage {...common} />
           : page === "cloud" ? <CloudPage {...common} />
@@ -585,8 +594,15 @@ function RoutingLogsPage({ fail }: { fail: (error: unknown) => void }) {
 
 function SettingsPage({ settings, resourcePolicy, dashboard, refresh, success, fail }: Common & { dashboard: DashboardData }) {
   const [autostart, setAutostart] = useState(false); const [hf, setHf] = useState(""); const [civitai, setCivitai] = useState(""); const [policy, setPolicy] = useState(resourcePolicy);
+  const [bindMode, setBindMode] = useState(settings.bind_mode ?? "loopback");
+  const [bindAddress, setBindAddress] = useState(settings.bind_address ?? "");
+  const [tlsCert, setTlsCert] = useState(settings.tls_cert_path ?? "");
+  const [tlsKey, setTlsKey] = useState(settings.tls_key_path ?? "");
+  const [githubId, setGithubId] = useState(""); const [githubSecret, setGithubSecret] = useState("");
+  const [googleId, setGoogleId] = useState(""); const [googleSecret, setGoogleSecret] = useState("");
   useEffect(() => { if (isTauri()) { void isEnabled().then(setAutostart).catch(() => {}); } }, []);
   useEffect(() => setPolicy(resourcePolicy), [resourcePolicy]);
+  useEffect(() => { setBindMode(settings.bind_mode ?? "loopback"); setBindAddress(settings.bind_address ?? ""); setTlsCert(settings.tls_cert_path ?? ""); setTlsKey(settings.tls_key_path ?? ""); }, [settings]);
   const toggleAutostart = async () => { try { autostart ? await disable() : await enable(); setAutostart(!autostart); success(`Launch at login ${autostart ? "disabled" : "enabled"}`); } catch (e) { fail(e); } };
   const saveNumber = async (key: string, value: string) => { try { await command("save_setting", { key, value }); await refresh(); success("Setting saved; runtime changes apply after restart"); } catch (e) { fail(e); } };
   const savePolicy = async (next: ResourcePolicy) => { setPolicy(next); try { await command("save_resource_policy", { policy: next }); await refresh(); success("Resource policy saved; loaded models restart after active requests finish"); } catch (e) { setPolicy(resourcePolicy); fail(e); } };
@@ -595,7 +611,21 @@ function SettingsPage({ settings, resourcePolicy, dashboard, refresh, success, f
   const memoryWarning = dashboard.runtimes.some(runtime => runtime.memory_warning);
   return <><PageHead eyebrow="Application" title="Settings" description="Security, resources and background behavior." />
     {memoryWarning && <div className="security-note"><CircleAlert size={17} /><span>Resident local runtimes currently exceed the soft memory budget. Active responses are allowed to finish.</span></div>}
-    <div className="settings-list"><Setting title="Local endpoint" description="The gateway is bound to 127.0.0.1 and is not reachable from your network."><code>{dashboard.base_url}</code></Setting>{isTauri() && <Setting title="Launch at login" description="Keep the menu bar gateway available after signing in."><Toggle checked={autostart} onChange={() => void toggleAutostart()} /></Setting>}
+    <div className="settings-list"><Setting title="Local endpoint" description={bindMode === "loopback" ? "The gateway is bound to 127.0.0.1 over HTTP. Enable LAN share to reach other machines." : "Non-loopback binds require HTTPS. Restart the app or serve process after changing bind settings."}><code>{dashboard.base_url}</code></Setting>
+      <Setting title="Network share" description="Loopback stays the default. LAN or a specific address requires HTTPS (auto-generated self-signed cert, or your own files). Inference still needs a local API key.">
+        <div className="resource-controls">
+          <select aria-label="Bind mode" value={bindMode} onChange={event => { const value = event.target.value; setBindMode(value); void saveNumber("bind_mode", value); }}><option value="loopback">Loopback (HTTP)</option><option value="lan">LAN (all interfaces, HTTPS)</option><option value="address">Specific address (HTTPS unless loopback)</option></select>
+          {bindMode === "address" && <input value={bindAddress} onChange={event => setBindAddress(event.target.value)} onBlur={() => void saveNumber("bind_address", bindAddress)} placeholder="192.168.1.10" />}
+        </div>
+      </Setting>
+      {(bindMode !== "loopback" || settings.tls_fingerprint) && <Setting title="TLS certificate" description="Leave empty to auto-generate a self-signed certificate in the data directory. Pin the fingerprint in clients and browsers.">
+        <div className="resource-controls" style={{ flexDirection: "column", alignItems: "flex-end" }}>
+          {settings.tls_fingerprint && <code>{settings.tls_fingerprint}</code>}
+          <input value={tlsCert} onChange={event => setTlsCert(event.target.value)} onBlur={() => void saveNumber("tls_cert_path", tlsCert)} placeholder="Certificate PEM path (optional)" />
+          <input value={tlsKey} onChange={event => setTlsKey(event.target.value)} onBlur={() => void saveNumber("tls_key_path", tlsKey)} placeholder="Private key PEM path (optional)" />
+        </div>
+      </Setting>}
+      {isTauri() && <Setting title="Launch at login" description="Keep the menu bar gateway available after signing in."><Toggle checked={autostart} onChange={() => void toggleAutostart()} /></Setting>}
       <Setting title="Inference profile" description="Stealth caps runnable inference time to 25%; this is not an exact Metal GPU utilization quota."><select aria-label="Inference profile" value={policy.profile} onChange={event => void chooseProfile(event.target.value as ResourceProfile)}><option value="stealth">Stealth</option><option value="balanced">Balanced</option><option value="performance">Performance</option><option value="custom">Custom</option></select></Setting>
       <Setting title="Soft memory budget" description="Blocks new model admission and unloads idle models; an active response is never killed."><div className="resource-controls"><ResourceNumber label="Percent" value={policy.memory_budget_percent} min={10} max={95} suffix="%" onChange={value => updatePolicy({ memory_budget_percent: value })} onSave={() => void savePolicy(policy)} /><ResourceNumber label="Absolute cap" value={policy.memory_budget_mib ?? 0} min={0} max={1048576} suffix="MiB (0 = off)" onChange={value => updatePolicy({ memory_budget_mib: value || null })} onSave={() => void savePolicy(policy)} /></div></Setting>
       <Setting title="Compute duty cycle" description="Sidecars may run for this share of each 400 ms window. Short GPU bursts can exceed this percentage."><ResourceNumber label="Duty" value={policy.compute_duty_percent} min={5} max={100} suffix="%" onChange={value => updatePolicy({ compute_duty_percent: value })} onSave={() => void savePolicy(policy)} /></Setting>
@@ -605,7 +635,9 @@ function SettingsPage({ settings, resourcePolicy, dashboard, refresh, success, f
       <Setting title="Persistent local KV" description="Local chat models (GGUF and MLX) can keep KV snapshots on disk. GGUF needs X-Local-AI-Session. MLX reuses prefixes in RAM and restores from token-block hashes without a session; the header is optional isolation. Files are unencrypted, private to the app, and limited to 10 GiB."><div className="resource-controls"><Toggle checked={policy.disk_kv_enabled} onChange={() => void savePolicy({ ...policy, profile: "custom", disk_kv_enabled: !policy.disk_kv_enabled, max_parallel_prompts: !policy.disk_kv_enabled ? 1 : policy.max_parallel_prompts })} /><button className="secondary danger-text" onClick={async () => { if (!confirm("Delete all persistent KV snapshots?")) return; try { await command("clear_kv_cache", { targetId: null }); success("Persistent KV snapshots deleted"); } catch (e) { fail(e); } }}><Trash2 size={15} />Clear cache</button></div></Setting>
       <Setting title="Log retention" description="Metadata older than this is removed automatically."><NumberSetting value={settings.log_retention_days ?? "30"} suffix="days" onSave={value => void saveNumber("log_retention_days", value)} /></Setting>
       <Setting title="Hugging Face token" description="Optional for gated and private model repositories."><div className="inline-form"><input type="password" value={hf} onChange={e => setHf(e.target.value)} placeholder={settings.has_hf_token === "true" ? "Token stored in Keychain" : "hf_…"} /><button className="secondary" onClick={async () => { try { await command("save_hugging_face_token", { token: hf }); setHf(""); await refresh(); success("Hugging Face token saved"); } catch (e) { fail(e); } }}>Save</button></div></Setting>
-      <Setting title="CivitAI token" description="Optional for CivitAI checkpoint downloads."><div className="inline-form"><input type="password" value={civitai} onChange={e => setCivitai(e.target.value)} placeholder={settings.has_civitai_token === "true" ? "Token stored in Keychain" : "API token"} /><button className="secondary" onClick={async () => { try { await command("save_civitai_token", { token: civitai }); setCivitai(""); await refresh(); success("CivitAI token saved"); } catch (e) { fail(e); } }}>Save</button></div></Setting></div>
+      <Setting title="CivitAI token" description="Optional for CivitAI checkpoint downloads."><div className="inline-form"><input type="password" value={civitai} onChange={e => setCivitai(e.target.value)} placeholder={settings.has_civitai_token === "true" ? "Token stored in Keychain" : "API token"} /><button className="secondary" onClick={async () => { try { await command("save_civitai_token", { token: civitai }); setCivitai(""); await refresh(); success("CivitAI token saved"); } catch (e) { fail(e); } }}>Save</button></div></Setting>
+      <Setting title="GitHub OpenID" description="Allowlisted GitHub accounts can sign in to the admin UI. Callback is /auth/oidc/callback on this gateway."><div className="inline-form"><input value={githubId} onChange={e => setGithubId(e.target.value)} placeholder={settings.has_github_oidc === "true" ? "Client ID stored" : "Client ID"} /><input type="password" value={githubSecret} onChange={e => setGithubSecret(e.target.value)} placeholder="Client secret" /><button className="secondary" onClick={async () => { try { await command("save_oidc_client", { provider: "github", clientId: githubId, clientSecret: githubSecret }); setGithubSecret(""); await refresh(); success("GitHub OpenID saved"); } catch (e) { fail(e); } }}>Save</button></div></Setting>
+      <Setting title="Google OpenID" description="Allowlisted Google accounts can sign in. Invite emails on the Users page first."><div className="inline-form"><input value={googleId} onChange={e => setGoogleId(e.target.value)} placeholder={settings.has_google_oidc === "true" ? "Client ID stored" : "Client ID"} /><input type="password" value={googleSecret} onChange={e => setGoogleSecret(e.target.value)} placeholder="Client secret" /><button className="secondary" onClick={async () => { try { await command("save_oidc_client", { provider: "google", clientId: googleId, clientSecret: googleSecret }); setGoogleSecret(""); await refresh(); success("Google OpenID saved"); } catch (e) { fail(e); } }}>Save</button></div></Setting></div>
   </>;
 }
 

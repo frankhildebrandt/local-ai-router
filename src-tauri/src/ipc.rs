@@ -102,6 +102,30 @@ wrap_async!(save_model_resource_overrides(id: String, overrides: Option<Resource
 wrap_async!(save_model_speculative_config(id: String, config: Option<SpeculativeConfig>) -> ModelTarget);
 wrap_async!(clear_kv_cache(target_id: Option<String>) -> ());
 wrap_async!(forget_all_credentials() -> ());
+wrap_async!(auth_status() -> crate::commands::AuthStatus);
+wrap_async!(login(username: String, password: String) -> crate::identity::DirectoryUser);
+wrap_async!(list_directory_users() -> Vec<crate::identity::DirectoryUser>);
+wrap_async!(create_directory_user(input: crate::identity::CreateUserInput) -> crate::identity::DirectoryUser);
+wrap_async!(update_directory_user(id: String, input: crate::identity::UpdateUserInput) -> crate::identity::DirectoryUser);
+wrap_async!(list_directory_groups() -> Vec<crate::identity::DirectoryGroup>);
+wrap_async!(save_directory_group(id: Option<String>, input: crate::identity::UpsertGroupInput) -> crate::identity::DirectoryGroup);
+wrap_async!(delete_directory_group(id: String) -> ());
+wrap_async!(user_permissions(id: String) -> crate::identity::EffectivePermissions);
+wrap_async!(reveal_operator_bootstrap() -> Option<String>);
+wrap_async!(list_oidc_allowlist() -> Vec<crate::identity::OidcAllowlistEntry>);
+wrap_async!(invite_oidc_identity(provider: String, identifier: String, user_id: Option<String>) -> crate::identity::OidcAllowlistEntry);
+wrap_async!(delete_oidc_allowlist(id: String) -> ());
+wrap_async!(save_oidc_client(provider: String, client_id: String, client_secret: String) -> ());
+
+#[tauri::command]
+pub async fn begin_oidc_login(
+    state: State<'_, AppServices>,
+    provider: String,
+) -> Result<crate::oidc::OidcStart, String> {
+    let scheme = if state.tls_required { "https" } else { "http" };
+    let redirect_uri = format!("{scheme}://127.0.0.1:{}/auth/oidc/callback", state.port);
+    crate::commands::begin_oidc_login(&state, provider, redirect_uri).await
+}
 wrap_sync!(save_hugging_face_token(token: String) -> ());
 wrap_sync!(save_civitai_token(token: String) -> ());
 

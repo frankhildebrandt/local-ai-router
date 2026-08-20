@@ -375,6 +375,7 @@ impl AppCore {
             core.create_local_api_key("Default").await?;
         }
         core.cleanup_revoked_local_api_key_secrets().await;
+        crate::identity::bootstrap_operator(&core.store, core.secrets.as_ref()).await?;
         Ok(core)
     }
 

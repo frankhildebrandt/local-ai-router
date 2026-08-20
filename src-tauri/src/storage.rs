@@ -536,7 +536,9 @@ impl Store {
         sqlx::query("CREATE INDEX IF NOT EXISTS request_logs_api_key_idx ON request_logs(api_key_id, created_at DESC)")
             .execute(&self.pool)
             .await?;
+        crate::identity::migrate(&self.pool).await?;
         self.set_default("port", "11435").await?;
+        self.set_default("bind_mode", "loopback").await?;
         self.set_default("memory_budget_percent", "70").await?;
         self.set_default("idle_unload_minutes", "15").await?;
         self.set_default("log_retention_days", "30").await?;
@@ -560,6 +562,10 @@ impl Store {
             self.set_resource_policy(&policy).await?;
         }
         Ok(())
+    }
+
+    pub(crate) fn pool(&self) -> &SqlitePool {
+        &self.pool
     }
 
     async fn set_default(&self, key: &str, value: &str) -> anyhow::Result<()> {
