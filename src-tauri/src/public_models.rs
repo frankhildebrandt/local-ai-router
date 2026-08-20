@@ -4,7 +4,7 @@ use serde::Serialize;
 
 use crate::{
     catalog::unique_alias,
-    domain::{ModelRoute, RouteRole, RouteTarget},
+    domain::{ModelRoute, RouteTarget},
     hub::slug,
     routing::{
         default_task_rules, PolicyStatus, PrivacyMode, RoutingMode, RoutingPolicy, RoutingWeights,
@@ -167,7 +167,7 @@ fn singleton_route(public_id: String, target: &ModelTarget) -> ModelRoute {
         capabilities: target.capabilities.clone(),
         targets: vec![RouteTarget {
             id: target.id.clone(),
-            kind: target.kind.clone(),
+            kind: target.kind,
             model: target.provider_model.clone(),
             priority: 10,
             enabled: true,
@@ -187,7 +187,7 @@ fn adaptive_route(assigned: &[(String, &ModelTarget)]) -> ModelRoute {
         }
         targets.push(RouteTarget {
             id: target.id.clone(),
-            kind: target.kind.clone(),
+            kind: target.kind,
             model: target.provider_model.clone(),
             priority: ((index + 1) * 10) as i64,
             enabled: true,
@@ -335,7 +335,11 @@ async fn expand_adaptive_alias_capabilities(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{domain::TargetKind, providers::WireProtocol, storage::LocalModelMeta};
+    use crate::{
+        domain::{RouteRole, TargetKind},
+        providers::WireProtocol,
+        storage::LocalModelMeta,
+    };
 
     fn target(id: &str, name: &str, provider_model: &str, enabled: bool) -> ModelTarget {
         ModelTarget {

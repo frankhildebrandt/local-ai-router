@@ -34,9 +34,139 @@ jobs:
         env:
           REQUIRE_PYTHON_CONTRACT: "1"
       - run: cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
+      - run: ./scripts/check-linux-packaging.sh
+      - run: ./scripts/check-windows-packaging.sh
       - run: swift build --package-path sidecars/mlx-server -c debug --arch arm64
       - run: ./scripts/prepare-flux-vendor.sh
       - run: swift build --package-path sidecars/mlx-image-server -c debug --arch arm64
       - run: ./scripts/prepare-kokoro-vendor.sh
       - run: swift build --package-path sidecars/mlx-speech-server -c debug --arch arm64
       - run: ./scripts/test-sidecar-stubs.sh
+
+  linux:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+      - run: ./scripts/install-linux-build-deps.sh
+      - run: npm ci
+      - run: python -m pip install openai
+      - run: npm test
+      - run: npm run build
+      - run: cargo test --manifest-path src-tauri/Cargo.toml
+      - run: cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
+      - run: npm run test:contract
+        env:
+          REQUIRE_PYTHON_CONTRACT: "1"
+      - run: ./scripts/test-headless.sh
+      - run: ./scripts/check-linux-packaging.sh
+
+  windows:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+      - run: npm ci
+      - run: python -m pip install openai
+      - run: npm test
+      - run: npm run build
+      - run: cargo test --manifest-path src-tauri/Cargo.toml
+      - run: cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
+      - run: ./scripts/test-contracts.sh
+        env:
+          REQUIRE_PYTHON_CONTRACT: "1"
+      - run: ./scripts/test-headless.sh
+      - run: ./scripts/check-windows-packaging.sh
+
+  windows-package:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ilammy/msvc-dev-cmd@v1
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+      - run: cmake --version
+      - run: npm ci
+      - run: ./scripts/build-sidecars.sh
+      - name: Build Windows desktop installer
+        run: npm run tauri build -- --bundles nsis
+      - run: ./scripts/package-windows-headless.sh
+      - name: Verify Windows artifacts
+        run: |
+          ls -la src-tauri/target/release/bundle/nsis/*.exe
+          test -s src-tauri/target/release/local-ai-router-windows-headless.zip
+          src-tauri/target/release/local-ai-router.exe serve --help | grep -q -- "--secrets-file"
+          tar -tf src-tauri/target/release/local-ai-router-windows-headless.zip | grep -q 'ui/index.html'
+          tar -tf src-tauri/target/release/local-ai-router-windows-headless.zip | grep -q llama-server-
+          tar -tf src-tauri/target/release/local-ai-router-windows-headless.zip | grep -q local-ai-router.exe
+          tar -tf src-tauri/target/release/local-ai-router-windows-headless.zip | grep -q README.txt
+
+  linux-package:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+      - run: ./scripts/install-linux-build-deps.sh
+      - run: npm ci
+      - run: ./scripts/build-sidecars.sh
+      - name: Build Linux desktop packages
+        env:
+          NO_STRIP: "true"
+          APPIMAGE_EXTRACT_AND_RUN: "1"
+        run: npm run tauri build -- --bundles deb,appimage --config '{"bundle":{"createUpdaterArtifacts":false}}'
+      - run: ./scripts/package-linux-headless.sh
+      - name: Verify Linux artifacts
+        run: |
+          ls -la src-tauri/target/release/bundle/deb/*.deb
+          ls -la src-tauri/target/release/bundle/appimage/*.AppImage
+          test -s src-tauri/target/release/local-ai-router-linux-headless.tar.gz
+          src-tauri/target/release/local-ai-router serve --help | grep -q -- "--secrets-file"
+          tar -tzf src-tauri/target/release/local-ai-router-linux-headless.tar.gz | grep -q local-ai-router.service
+          tar -tzf src-tauri/target/release/local-ai-router-linux-headless.tar.gz | grep -q '/ui/index.html'
+          tar -tzf src-tauri/target/release/local-ai-router-linux-headless.tar.gz | grep -q llama-server-
+          dpkg-deb -c src-tauri/target/release/bundle/deb/*.deb | grep -E 'ui/index.html'
+          dpkg-deb -c src-tauri/target/release/bundle/deb/*.deb | grep -E 'llama-server-'
+          dpkg-deb -c src-tauri/target/release/bundle/deb/*.deb | grep -E 'local-ai-router.service'

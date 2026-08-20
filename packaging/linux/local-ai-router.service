@@ -1,0 +1,28 @@
+[Unit]
+Description=Local AI Router headless gateway
+Documentation=https://github.com/frankhildebrandt/local-ai-router
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=local-ai-router
+Group=local-ai-router
+WorkingDirectory=/var/lib/local-ai-router
+ExecStart=/usr/bin/local-ai-router serve --data-dir /var/lib/local-ai-router --secrets-file /var/lib/local-ai-router/secrets.json
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/local-ai-router
+
+# The gateway binds 127.0.0.1 only. Browse the admin UI from this host.
+# Create the service user and data directory before enabling:
+#   sudo useradd --system --home /var/lib/local-ai-router --shell /usr/sbin/nologin local-ai-router
+#   sudo mkdir -p /var/lib/local-ai-router
+#   sudo chown local-ai-router:local-ai-router /var/lib/local-ai-router
+
+[Install]
+WantedBy=multi-user.target

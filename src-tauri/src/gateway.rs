@@ -46,17 +46,15 @@ struct GatewayState {
 }
 
 pub fn router(core: Arc<AppCore>) -> Router {
-    router_with_state(GatewayState {
-        core,
-        runtimes: None,
-    })
+    inference_router(core, None).fallback(not_found)
 }
 
 pub fn managed_router(core: Arc<AppCore>, runtimes: Arc<RuntimeManager>) -> Router {
-    router_with_state(GatewayState {
-        core,
-        runtimes: Some(runtimes),
-    })
+    inference_router(core, Some(runtimes)).fallback(not_found)
+}
+
+pub fn inference_router(core: Arc<AppCore>, runtimes: Option<Arc<RuntimeManager>>) -> Router {
+    router_with_state(GatewayState { core, runtimes })
 }
 
 async fn sync_runtime_states(core: &AppCore, runtimes: &RuntimeManager) {
@@ -96,7 +94,6 @@ fn router_with_state(state: GatewayState) -> Router {
         .route("/v1/audio/transcriptions", post(proxy))
         .route("/v1/audio/translations", post(proxy))
         .route("/v1/moderations", post(proxy))
-        .fallback(not_found)
         .with_state(state)
 }
 
@@ -140,7 +137,7 @@ async fn health() -> Json<Value> {
     Json(json!({ "status": "ok" }))
 }
 
-async fn not_found() -> Response<Body> {
+pub(crate) async fn not_found() -> Response<Body> {
     openai_error(
         StatusCode::NOT_FOUND,
         "route_not_found",
@@ -2704,6 +2701,7 @@ fn cancelled_status() -> StatusCode {
     StatusCode::from_u16(499).unwrap_or(StatusCode::REQUEST_TIMEOUT)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn cancelled_proxy_response(
     core: &AppCore,
     public_protocol: Option<PublicProtocol>,
@@ -4483,18 +4481,19 @@ mod tests {
     async fn inflight_clears_when_streaming_client_disconnects() {
         let hang = hanging_sse_upstream().await;
         let (core, app) = inflight_test_core(hang).await;
-        let request_fut = app.oneshot(chat_request(true));
-        tokio::pin!(request_fut);
-        tokio::select! {
-            biased;
-            request = wait_for_inflight(&core) => {
-                assert_eq!(request.alias, "assistant");
-            }
-            result = &mut request_fut => {
-                drop(result.unwrap());
+        {
+            let request_fut = app.oneshot(chat_request(true));
+            tokio::pin!(request_fut);
+            tokio::select! {
+                biased;
+                request = wait_for_inflight(&core) => {
+                    assert_eq!(request.alias, "assistant");
+                }
+                result = &mut request_fut => {
+                    drop(result.unwrap());
+                }
             }
         }
-        drop(request_fut);
         wait_until_idle(&core).await;
     }
 

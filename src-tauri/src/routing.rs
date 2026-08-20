@@ -235,7 +235,7 @@ impl TargetRoutingProfile {
 
     pub fn for_target(target: &crate::storage::ModelTarget) -> Self {
         let meta = crate::model_catalog::resolve_model_metadata(&target.provider_model, None);
-        let mut profile = Self::neutral(&target.id, target.kind.clone());
+        let mut profile = Self::neutral(&target.id, target.kind);
         profile.context_window = meta.context_window;
         if matches!(target.kind, TargetKind::Cloud) {
             profile.input_price_per_million = meta.input_price_per_million;
@@ -1156,7 +1156,7 @@ mod tests {
             max_output_tokens: 1_000,
         };
         let candidate = |id: &str, kind: TargetKind, priority: i64, context_window: u64| {
-            let mut profile = TargetRoutingProfile::neutral(id, kind.clone());
+            let mut profile = TargetRoutingProfile::neutral(id, kind);
             profile.context_window = context_window;
             CandidateInput {
                 target_id: id.into(),
@@ -1231,9 +1231,11 @@ mod tests {
             max_output_tokens: 10,
         };
         let candidate = |id: &str, recent: Option<u64>| {
-            let mut stats = RoutingStats::default();
-            stats.recent_latency_ms = recent;
-            stats.samples = if recent.is_some() { 3 } else { 0 };
+            let stats = RoutingStats {
+                recent_latency_ms: recent,
+                samples: if recent.is_some() { 3 } else { 0 },
+                ..Default::default()
+            };
             CandidateInput {
                 target_id: id.into(),
                 kind: TargetKind::Cloud,

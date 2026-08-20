@@ -72,10 +72,8 @@ pub fn salvage_tool_calls(response: &mut CanonicalResponse, tools: &[CanonicalTo
             ContentBlock::Text { text } => {
                 leftover.push_str(&extract_calls(text, &allowed, &mut calls))
             }
-            other => match other {
-                ContentBlock::Reasoning { text } => leftover.push_str(text),
-                _ => {}
-            },
+            ContentBlock::Reasoning { text } => leftover.push_str(text),
+            _ => {}
         }
     }
     if calls.is_empty() {
@@ -214,7 +212,7 @@ fn parse_tool_payload(payload: &str, allowed: &[&str]) -> Option<ContentBlock> {
         .get("name")
         .or_else(|| value.pointer("/function/name"))
         .and_then(Value::as_str)?;
-    if !allowed.iter().any(|item| *item == name) {
+    if !allowed.contains(&name) {
         return None;
     }
     let input = value

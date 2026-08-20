@@ -9,7 +9,7 @@ import {
   Plus, RefreshCw, Route, Search, Settings, ShieldCheck, Sparkles, Timer,
   Trash2, Wallet, X, Zap,
 } from "lucide-react";
-import { command, appVersion, errorMessage, isTauri, listenDesktopNavigate, listenGatewayTraffic } from "./api";
+import { command, appVersion, downloadTextFile, errorMessage, isTauri, listenDesktopNavigate, listenGatewayTraffic } from "./api";
 import type { DashboardData, InFlightRequest, LocalApiKey, LogQuery, ModelRoute, ModelTarget, Provider, ProviderModel, ProviderPreset, PublicModel, ResourcePolicy, ResourceProfile, RouteRole, RouteTarget, RoutingConfigExport, RoutingEvaluation, RoutingPolicy, RoutingTaskDefinition, TargetKind, TargetRoutingProfile, WireProtocol } from "./types";
 import { ApiKeysPage } from "./ApiKeysPage";
 import { CandleLineChart } from "./CandleLineChart";
@@ -43,25 +43,24 @@ export default function App() {
 
 function AppShell() {
   const queryClient = useQueryClient();
-  const enabled = isTauri();
   const [page, setPage] = useState<Page>("overview");
   const [inflight, setInflight] = useState<InFlightRequest[]>([]);
   const [notice, setNotice] = useState<{ type: "error" | "success"; text: string } | null>(null);
   const [sidebar, setSidebar] = useState(true);
   const [version, setVersion] = useState("");
 
-  const dashboardQuery = useQuery({ queryKey: queryKeys.dashboard, queryFn: fetchers.dashboard, enabled, refetchInterval: page === "overview" ? 10_000 : false });
-  const providersQuery = useQuery({ queryKey: queryKeys.providers, queryFn: fetchers.providers, enabled });
-  const presetsQuery = useQuery({ queryKey: queryKeys.providerPresets, queryFn: fetchers.providerPresets, enabled });
-  const targetsQuery = useQuery({ queryKey: queryKeys.targets, queryFn: fetchers.targets, enabled });
-  const routesQuery = useQuery({ queryKey: queryKeys.routes, queryFn: fetchers.routes, enabled });
-  const publicModelsQuery = useQuery({ queryKey: queryKeys.publicModels, queryFn: fetchers.publicModels, enabled });
-  const settingsQuery = useQuery({ queryKey: queryKeys.settings, queryFn: fetchers.settings, enabled });
-  const localKeysQuery = useQuery({ queryKey: queryKeys.localKeys, queryFn: fetchers.localKeys, enabled });
-  const resourcePolicyQuery = useQuery({ queryKey: queryKeys.resourcePolicy, queryFn: fetchers.resourcePolicy, enabled });
-  const routingPoliciesQuery = useQuery({ queryKey: queryKeys.routingPolicies, queryFn: fetchers.routingPolicies, enabled });
-  const routingProfilesQuery = useQuery({ queryKey: queryKeys.routingProfiles, queryFn: fetchers.routingProfiles, enabled });
-  const routingTasksQuery = useQuery({ queryKey: queryKeys.routingTasks, queryFn: fetchers.routingTasks, enabled });
+  const dashboardQuery = useQuery({ queryKey: queryKeys.dashboard, queryFn: fetchers.dashboard, refetchInterval: page === "overview" ? 10_000 : false });
+  const providersQuery = useQuery({ queryKey: queryKeys.providers, queryFn: fetchers.providers });
+  const presetsQuery = useQuery({ queryKey: queryKeys.providerPresets, queryFn: fetchers.providerPresets });
+  const targetsQuery = useQuery({ queryKey: queryKeys.targets, queryFn: fetchers.targets });
+  const routesQuery = useQuery({ queryKey: queryKeys.routes, queryFn: fetchers.routes });
+  const publicModelsQuery = useQuery({ queryKey: queryKeys.publicModels, queryFn: fetchers.publicModels });
+  const settingsQuery = useQuery({ queryKey: queryKeys.settings, queryFn: fetchers.settings });
+  const localKeysQuery = useQuery({ queryKey: queryKeys.localKeys, queryFn: fetchers.localKeys });
+  const resourcePolicyQuery = useQuery({ queryKey: queryKeys.resourcePolicy, queryFn: fetchers.resourcePolicy });
+  const routingPoliciesQuery = useQuery({ queryKey: queryKeys.routingPolicies, queryFn: fetchers.routingPolicies });
+  const routingProfilesQuery = useQuery({ queryKey: queryKeys.routingProfiles, queryFn: fetchers.routingProfiles });
+  const routingTasksQuery = useQuery({ queryKey: queryKeys.routingTasks, queryFn: fetchers.routingTasks });
   const snapshotQueries = [dashboardQuery, providersQuery, presetsQuery, targetsQuery, routesQuery, publicModelsQuery, settingsQuery, localKeysQuery, resourcePolicyQuery, routingPoliciesQuery, routingProfilesQuery, routingTasksQuery];
   const dashboard = dashboardQuery.data ?? emptyDashboard;
   const providers = providersQuery.data ?? [];
@@ -75,7 +74,7 @@ function AppShell() {
   const routingPolicies = routingPoliciesQuery.data ?? [];
   const routingProfiles = routingProfilesQuery.data ?? [];
   const routingTasks = routingTasksQuery.data ?? [];
-  const loading = enabled && snapshotQueries.some(query => query.isPending);
+  const loading = snapshotQueries.some(query => query.isPending);
   const snapshotError = snapshotQueries.find(query => query.error)?.error;
 
   const refresh = useCallback(async () => { await invalidateAppQueries(queryClient); }, [queryClient]);
@@ -186,7 +185,6 @@ function UsagePage() {
   const usageQuery = useQuery({
     queryKey: queryKeys.usage(period, target),
     queryFn: () => fetchers.usage(period, target),
-    enabled: isTauri(),
     refetchInterval: 10_000,
   });
   const usage = usageQuery.data ?? emptyUsage;
@@ -236,7 +234,7 @@ function ProvidersPage({ providers, providerPresets, refresh, success, fail }: C
   const [editing, setEditing] = useState<Provider | null | undefined>();
   const remove = async (id: string) => { if (!confirm("Delete this provider and its cloud targets?")) return; try { await command("delete_provider", { id }); await refresh(); success("Provider removed"); } catch (e) { fail(e); } };
   const test = async (id: string) => { try { const models = await command<string[]>("test_provider_connection", { id }); success(`Connection successful${models.length > 1 ? ` · ${models.length} models visible` : ""}`); } catch (e) { fail(e); } };
-  const connect = async (id: string) => { try { const start = await command<{ authorization_url: string }>("begin_openai_subscription", { id }); await openUrl(start.authorization_url); success("Browser opened; complete sign-in within three minutes"); } catch (e) { fail(e); } };
+  const connect = async (id: string) => { try { const start = await command<{ authorization_url: string }>("begin_openai_subscription", { id }); if (isTauri()) { await openUrl(start.authorization_url); } else { window.open(start.authorization_url, "_blank", "noopener"); } success("Browser opened; complete sign-in within three minutes"); } catch (e) { fail(e); } };
   const oauthStatus = async (id: string) => { try { const status = await command<{ state: string; account_id: string | null; error: string | null }>("openai_subscription_status", { id }); if (status.state === "error") fail(status.error ?? "OAuth failed"); else success(`OAuth status: ${status.state}${status.account_id ? ` · ${status.account_id}` : ""}`); await refresh(); } catch (e) { fail(e); } };
   const logout = async (id: string) => { try { await command("logout_openai_subscription", { id }); await refresh(); success("Subscription disconnected and tokens removed from Keychain"); } catch (e) { fail(e); } };
   return <>
@@ -292,13 +290,13 @@ function CloudPage({ providers, targets, routingProfiles, refresh, success, fail
   const cloud = targets.filter(target => target.kind === "cloud");
   const [providerId, setProviderId] = useState(providers[0]?.id ?? ""); const [model, setModel] = useState(""); const [protocol, setProtocol] = useState<WireProtocol>("open_ai_chat"); const [capabilities, setCapabilities] = useState(["chat", "streaming"]); const [busy, setBusy] = useState(false);
   const queryClient = useQueryClient();
-  const modelsQuery = useQuery({ queryKey: queryKeys.providerModels(providerId), queryFn: () => fetchers.providerModels(providerId), enabled: isTauri() && !!providerId });
+  const modelsQuery = useQuery({ queryKey: queryKeys.providerModels(providerId), queryFn: () => fetchers.providerModels(providerId), enabled: !!providerId });
   const models = modelsQuery.data ?? [];
   const selected = models.find(item => item.id === model);
   const metadataQuery = useQuery({
     queryKey: queryKeys.modelMetadata(model),
     queryFn: () => fetchers.modelMetadata(model),
-    enabled: isTauri() && !!model.trim() && !selected,
+    enabled: !!model.trim() && !selected,
   });
   useEffect(() => {
     if (selected) {
@@ -455,7 +453,7 @@ function TargetProfileModal({ target, profile, tasks, close, done, fail }: { tar
 
 function RoutingConfigModal({ close, refresh, success, fail }: { close: () => void; refresh: () => Promise<void>; success: (text: string) => void; fail: (error: unknown) => void }) {
   const [json, setJson] = useState(""); const [preview, setPreview] = useState<string[]>([]); const [busy, setBusy] = useState(false);
-  const exportQuery = useQuery({ queryKey: queryKeys.routingConfig, queryFn: fetchers.routingConfig, enabled: isTauri() });
+  const exportQuery = useQuery({ queryKey: queryKeys.routingConfig, queryFn: fetchers.routingConfig });
   useEffect(() => { if (exportQuery.data) setJson(JSON.stringify(exportQuery.data, null, 2)); }, [exportQuery.data]);
   useEffect(() => { if (exportQuery.error) fail(exportQuery.error); }, [exportQuery.error, fail]);
   const run = async (apply: boolean) => { setBusy(true); try { const config = JSON.parse(json) as RoutingConfigExport; const result = await command<{ valid: boolean; task_count: number; profile_count: number; policy_count: number; warnings: string[] }>("import_routing_config", { config, apply }); setPreview([`${result.task_count} tasks · ${result.profile_count} profiles · ${result.policy_count} policies`, ...result.warnings]); if (apply) { await refresh(); success("Routing configuration imported atomically"); close(); } } catch (error) { fail(error); } finally { setBusy(false); } };
@@ -529,8 +527,8 @@ function LogsPage({ localKeys, refresh, success, fail }: Common) {
     ...(withPage ? { limit: 50, offset: page * 50 } : {}),
   });
   const query = logQuery();
-  const facetsQuery = useQuery({ queryKey: queryKeys.logFacets, queryFn: fetchers.logFacets, enabled: isTauri() });
-  const logsQuery = useQuery({ queryKey: queryKeys.logs(query), queryFn: () => fetchers.logs(query), enabled: isTauri(), placeholderData: keepPreviousData });
+  const facetsQuery = useQuery({ queryKey: queryKeys.logFacets, queryFn: fetchers.logFacets });
+  const logsQuery = useQuery({ queryKey: queryKeys.logs(query), queryFn: () => fetchers.logs(query), placeholderData: keepPreviousData });
   const facets = facetsQuery.data ?? { aliases: [], targets: [], endpoints: [] };
   const items = logsQuery.data?.items ?? [];
   const total = logsQuery.data?.total ?? 0;
@@ -539,7 +537,20 @@ function LogsPage({ localKeys, refresh, success, fail }: Common) {
   const updateFilter = (setter: (value: string) => void, value: string) => { setter(value); setPage(0); };
   const reset = () => { setText(""); setKeyFilter(""); setAlias(""); setTarget(""); setEndpoint(""); setStatus(""); setFrom(""); setTo(""); setPage(0); };
   const clear = async () => { if (!confirm("Delete all request metadata?")) return; try { await command("clear_logs"); await queryClient.invalidateQueries({ queryKey: ["logs"] }); await queryClient.invalidateQueries({ queryKey: queryKeys.logFacets }); await refresh(); success("Logs cleared"); } catch (e) { fail(e); } };
-  const exportCsv = async () => { const path = await save({ defaultPath: "local-ai-router-logs.csv", filters: [{ name: "CSV", extensions: ["csv"] }] }); if (!path) return; try { await command("export_logs_csv", { path, query: logQuery(false) }); success(`${total} matching logs exported`); } catch (e) { fail(e); } };
+  const exportCsv = async () => {
+    try {
+      if (!isTauri()) {
+        const csv = await command<string>("export_logs_csv", { path: null, query: logQuery(false) });
+        downloadTextFile("local-ai-router-logs.csv", csv, "text/csv");
+        success(`${total} matching logs exported`);
+        return;
+      }
+      const path = await save({ defaultPath: "local-ai-router-logs.csv", filters: [{ name: "CSV", extensions: ["csv"] }] });
+      if (!path) return;
+      await command("export_logs_csv", { path, query: logQuery(false) });
+      success(`${total} matching logs exported`);
+    } catch (e) { fail(e); }
+  };
   return <><PageHead eyebrow="Observability" title="Request logs" description="Metadata only. Prompt and response content is never stored." action={<div className="button-row"><button className="secondary" onClick={() => void exportCsv()}><FileDown size={16} />Export filtered CSV</button><button className="secondary danger-text" onClick={() => void clear()}><Trash2 size={16} />Clear</button></div>} />
     <section className="panel log-filters"><div className="search"><Search size={17} /><input value={text} onChange={e => updateFilter(setText, e.target.value)} placeholder="Search endpoint, key, alias, target, status or error…" /></div><div className="filter-grid">
       <select aria-label="API key" value={keyFilter} onChange={e => updateFilter(setKeyFilter, e.target.value)}><option value="">All API keys</option><option value="legacy">Unknown / Legacy</option>{localKeys.map(key => <option key={key.id} value={key.id}>{key.name}{key.revoked_at ? " (revoked)" : ""}</option>)}</select>
@@ -557,7 +568,7 @@ function LogsPage({ localKeys, refresh, success, fail }: Common) {
 
 function RoutingLogsPage({ fail }: { fail: (error: unknown) => void }) {
   const [alias, setAlias] = useState("");
-  const attemptsQuery = useQuery({ queryKey: queryKeys.routingAttempts, queryFn: fetchers.routingAttempts, enabled: isTauri() });
+  const attemptsQuery = useQuery({ queryKey: queryKeys.routingAttempts, queryFn: fetchers.routingAttempts });
   useEffect(() => { if (attemptsQuery.error) fail(attemptsQuery.error); }, [attemptsQuery.error, fail]);
   const items = attemptsQuery.data ?? [];
   const aliases = [...new Set(items.map(item => item.alias))];
@@ -584,7 +595,7 @@ function SettingsPage({ settings, resourcePolicy, dashboard, refresh, success, f
   const memoryWarning = dashboard.runtimes.some(runtime => runtime.memory_warning);
   return <><PageHead eyebrow="Application" title="Settings" description="Security, resources and background behavior." />
     {memoryWarning && <div className="security-note"><CircleAlert size={17} /><span>Resident local runtimes currently exceed the soft memory budget. Active responses are allowed to finish.</span></div>}
-    <div className="settings-list"><Setting title="Local endpoint" description="The gateway is bound to 127.0.0.1 and is not reachable from your network."><code>{dashboard.base_url}</code></Setting><Setting title="Launch at login" description="Keep the menu bar gateway available after signing in."><Toggle checked={autostart} onChange={() => void toggleAutostart()} /></Setting>
+    <div className="settings-list"><Setting title="Local endpoint" description="The gateway is bound to 127.0.0.1 and is not reachable from your network."><code>{dashboard.base_url}</code></Setting>{isTauri() && <Setting title="Launch at login" description="Keep the menu bar gateway available after signing in."><Toggle checked={autostart} onChange={() => void toggleAutostart()} /></Setting>}
       <Setting title="Inference profile" description="Stealth caps runnable inference time to 25%; this is not an exact Metal GPU utilization quota."><select aria-label="Inference profile" value={policy.profile} onChange={event => void chooseProfile(event.target.value as ResourceProfile)}><option value="stealth">Stealth</option><option value="balanced">Balanced</option><option value="performance">Performance</option><option value="custom">Custom</option></select></Setting>
       <Setting title="Soft memory budget" description="Blocks new model admission and unloads idle models; an active response is never killed."><div className="resource-controls"><ResourceNumber label="Percent" value={policy.memory_budget_percent} min={10} max={95} suffix="%" onChange={value => updatePolicy({ memory_budget_percent: value })} onSave={() => void savePolicy(policy)} /><ResourceNumber label="Absolute cap" value={policy.memory_budget_mib ?? 0} min={0} max={1048576} suffix="MiB (0 = off)" onChange={value => updatePolicy({ memory_budget_mib: value || null })} onSave={() => void savePolicy(policy)} /></div></Setting>
       <Setting title="Compute duty cycle" description="Sidecars may run for this share of each 400 ms window. Short GPU bursts can exceed this percentage."><ResourceNumber label="Duty" value={policy.compute_duty_percent} min={5} max={100} suffix="%" onChange={value => updatePolicy({ compute_duty_percent: value })} onSave={() => void savePolicy(policy)} /></Setting>

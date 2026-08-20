@@ -56,7 +56,7 @@ async fn main() -> anyhow::Result<()> {
             capabilities: target.capabilities.clone(),
             targets: vec![RouteTarget {
                 id: target.id.clone(),
-                kind: target.kind.clone(),
+                kind: target.kind,
                 model: target.provider_model.clone(),
                 priority: 10,
                 enabled: true,

@@ -352,17 +352,9 @@ impl RuntimeManager {
                 TargetKind::Mlx => "mlx_chat",
                 _ => "cloud",
             });
-        let binary = match engine {
-            "mlx_image" => "mlx-image-server-aarch64-apple-darwin",
-            "mlx_speech" => "mlx-speech-server-aarch64-apple-darwin",
-            "mlx_chat" => "mlx-server-aarch64-apple-darwin",
-            _ => match target.kind {
-                TargetKind::Gguf => "llama-server-aarch64-apple-darwin",
-                TargetKind::Mlx => "mlx-server-aarch64-apple-darwin",
-                _ => anyhow::bail!("not a local target"),
-            },
-        };
-        let binary = self.bin_dir.join(binary);
+        let binary = self
+            .bin_dir
+            .join(sidecar_binary_name(engine, target.kind)?);
         if !binary.exists() {
             anyhow::bail!("runtime sidecar missing: {}", binary.display());
         }
@@ -453,6 +445,11 @@ impl RuntimeManager {
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::piped());
+        #[cfg(windows)]
+        {
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            command.creation_flags(CREATE_NO_WINDOW);
+        }
         let mut child = command.spawn().context("starting inference sidecar")?;
         let pid = child.id().context("inference sidecar has no process id")?;
         set_background_priority(pid, policy.process_priority);
@@ -503,7 +500,7 @@ impl RuntimeManager {
         self.restart_attempted.lock().remove(id);
         if let Some(mut entry) = entry {
             entry.governor.cancel();
-            signal_process(entry.pid, libc::SIGCONT);
+            resume_sidecar(entry.pid);
             entry.child.kill().await?;
         }
         Ok(())
@@ -513,7 +510,7 @@ impl RuntimeManager {
         let entries = std::mem::take(&mut *self.entries.lock());
         for (_, mut entry) in entries {
             entry.governor.cancel();
-            signal_process(entry.pid, libc::SIGCONT);
+            resume_sidecar(entry.pid);
             let _ = entry.child.kill().await;
         }
     }
@@ -569,7 +566,7 @@ impl RuntimeManager {
             .map(|id| {
                 if let Some(entry) = entries.remove(&id) {
                     entry.governor.cancel();
-                    signal_process(entry.pid, libc::SIGCONT);
+                    resume_sidecar(entry.pid);
                 }
                 let may_restart = attempted.insert(id.clone());
                 (id, may_restart)
@@ -750,14 +747,14 @@ fn spawn_duty_governor(
                 break;
             }
             if activity.active(&target_id) == 0 {
-                signal_process(pid, libc::SIGCONT);
+                resume_sidecar(pid);
                 tokio::select! {
                     _ = cancellation.cancelled() => break,
                     _ = sleep(Duration::from_millis(50)) => {}
                 }
                 continue;
             }
-            signal_process(pid, libc::SIGCONT);
+            resume_sidecar(pid);
             tokio::select! {
                 _ = cancellation.cancelled() => break,
                 _ = sleep(active_slice) => {}
@@ -765,13 +762,13 @@ fn spawn_duty_governor(
             if cancellation.is_cancelled() {
                 break;
             }
-            signal_process(pid, libc::SIGSTOP);
+            pause_sidecar(pid);
             tokio::select! {
                 _ = cancellation.cancelled() => break,
                 _ = sleep(paused_slice) => {}
             }
         }
-        signal_process(pid, libc::SIGCONT);
+        resume_sidecar(pid);
     });
 }
 
@@ -781,6 +778,16 @@ fn duty_slices(duty_percent: u8) -> (Duration, Duration) {
     (active, window.saturating_sub(active))
 }
 
+fn resume_sidecar(_pid: u32) {
+    #[cfg(unix)]
+    signal_process(_pid, libc::SIGCONT);
+}
+
+fn pause_sidecar(_pid: u32) {
+    #[cfg(unix)]
+    signal_process(_pid, libc::SIGSTOP);
+}
+
 #[cfg(unix)]
 fn signal_process(pid: u32, signal: libc::c_int) {
     // The PID comes directly from the child we spawned and is never user-controlled.
@@ -788,9 +795,6 @@ fn signal_process(pid: u32, signal: libc::c_int) {
         libc::kill(pid as libc::pid_t, signal);
     }
 }
-
-#[cfg(not(unix))]
-fn signal_process(_pid: u32, _signal: libc::c_int) {}
 
 #[cfg(unix)]
 fn set_background_priority(pid: u32, priority: i8) {
@@ -983,16 +987,42 @@ pub fn image_pipeline_for(target: &ModelTarget) -> &'static str {
     "flux2"
 }
 
+fn host_sidecar_filename(stem: &str) -> String {
+    let mut name = format!("{stem}-{}", env!("TARGET"));
+    if cfg!(windows) {
+        name.push_str(".exe");
+    }
+    name
+}
+
+pub fn sidecar_binary_name(engine: &str, kind: TargetKind) -> anyhow::Result<String> {
+    let stem = match engine {
+        "mlx_image" => "mlx-image-server",
+        "mlx_speech" => "mlx-speech-server",
+        "mlx_chat" => "mlx-server",
+        _ => match kind {
+            TargetKind::Gguf => "llama-server",
+            TargetKind::Mlx => "mlx-server",
+            _ => anyhow::bail!("not a local target"),
+        },
+    };
+    Ok(host_sidecar_filename(stem))
+}
+
+fn host_sidecar_names() -> [String; 4] {
+    [
+        host_sidecar_filename("llama-server"),
+        host_sidecar_filename("mlx-server"),
+        host_sidecar_filename("mlx-image-server"),
+        host_sidecar_filename("mlx-speech-server"),
+    ]
+}
+
 pub fn bundled_bin_dir(resource_dir: &Path) -> PathBuf {
     let bundled = resource_dir.join("sidecars/bin");
-    if bundled.join("llama-server-aarch64-apple-darwin").exists()
-        || bundled.join("mlx-server-aarch64-apple-darwin").exists()
-        || bundled
-            .join("mlx-image-server-aarch64-apple-darwin")
-            .exists()
-        || bundled
-            .join("mlx-speech-server-aarch64-apple-darwin")
-            .exists()
+    if host_sidecar_names()
+        .iter()
+        .any(|name| bundled.join(name).exists())
     {
         bundled
     } else {
@@ -1003,6 +1033,48 @@ pub fn bundled_bin_dir(resource_dir: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn local_sidecars_are_named_for_the_compile_target() {
+        assert_eq!(
+            sidecar_binary_name("llama", TargetKind::Gguf).unwrap(),
+            host_sidecar_filename("llama-server")
+        );
+        assert_eq!(
+            sidecar_binary_name("mlx_chat", TargetKind::Mlx).unwrap(),
+            host_sidecar_filename("mlx-server")
+        );
+        assert_eq!(
+            sidecar_binary_name("mlx_image", TargetKind::Mlx).unwrap(),
+            host_sidecar_filename("mlx-image-server")
+        );
+        assert_eq!(
+            sidecar_binary_name("mlx_speech", TargetKind::Mlx).unwrap(),
+            host_sidecar_filename("mlx-speech-server")
+        );
+        assert!(sidecar_binary_name("cloud", TargetKind::Cloud).is_err());
+        #[cfg(windows)]
+        assert!(sidecar_binary_name("llama", TargetKind::Gguf)
+            .unwrap()
+            .ends_with(".exe"));
+        #[cfg(not(windows))]
+        assert!(!sidecar_binary_name("llama", TargetKind::Gguf)
+            .unwrap()
+            .ends_with(".exe"));
+    }
+
+    #[test]
+    fn bundled_bin_dir_uses_the_host_llama_server_when_present() {
+        let root = tempfile::tempdir().unwrap();
+        let bin = root.path().join("sidecars/bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(
+            bin.join(sidecar_binary_name("llama", TargetKind::Gguf).unwrap()),
+            b"",
+        )
+        .unwrap();
+        assert_eq!(bundled_bin_dir(root.path()), bin);
+    }
 
     #[tokio::test]
     async fn stopping_a_target_without_a_local_runtime_is_a_noop() {
