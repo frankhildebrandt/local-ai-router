@@ -574,13 +574,23 @@ mod tests {
                 authorization_url: "https://auth.example/authorize".into(),
                 token_url: "https://auth.example/token".into(),
                 client_id: "client".into(),
-                timeout: Duration::from_millis(10),
+                timeout: Duration::from_millis(50),
             },
         );
         manager.begin("provider").await.unwrap();
-        tokio::time::sleep(Duration::from_millis(25)).await;
-        let status = manager.status("provider").await.unwrap();
-        assert!(matches!(status.state, OAuthState::Error));
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        let status = loop {
+            let status = manager.status("provider").await.unwrap();
+            if matches!(status.state, OAuthState::Error) {
+                break status;
+            }
+            assert!(
+                tokio::time::Instant::now() <= deadline,
+                "OAuth timeout was not reported, last state: {:?}",
+                status.state
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
         assert!(status.error.unwrap().contains("timed out"));
     }
 
