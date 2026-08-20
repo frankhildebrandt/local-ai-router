@@ -10,7 +10,7 @@ fn main() {
         }
         Some("-h" | "--help" | "help") => {
             print!(
-                "Local AI Router\n\nCommands:\n  serve    Start the gateway without a desktop window or tray\n\n{}Run without arguments to open the macOS menu-bar app.\n",
+                "Local AI Router\n\nCommands:\n  serve    Start the gateway without a desktop window or tray\n\n{}Run without arguments to open the desktop app.\n",
                 local_ai_router_lib::engine::serve_help()
             );
         }

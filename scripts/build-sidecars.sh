@@ -6,7 +6,19 @@ BIN_DIR="$PROJECT_DIR/sidecars/bin"
 LICENSE_DIR="$PROJECT_DIR/sidecars/licenses"
 LLAMA_REF="${LLAMA_CPP_REF:-9f0d017efb4a388bd5c60a27a575c90f20868e51}"
 BUILD_DIR="$(mktemp -d)"
+HOST_TRIPLE="$(rustc -vV | awk '/^host:/{print $2}')"
+OS="$(uname -s)"
 trap 'rm -rf "$BUILD_DIR"' EXIT
+
+job_count() {
+  if command -v nproc >/dev/null 2>&1; then
+    nproc
+  elif command -v sysctl >/dev/null 2>&1; then
+    sysctl -n hw.logicalcpu
+  else
+    echo 4
+  fi
+}
 
 mkdir -p "$BIN_DIR" "$LICENSE_DIR"
 
@@ -30,19 +42,34 @@ git -C "$BUILD_DIR" init llama.cpp
 git -C "$BUILD_DIR/llama.cpp" remote add origin https://github.com/ggml-org/llama.cpp.git
 git -C "$BUILD_DIR/llama.cpp" fetch --depth 1 origin "$LLAMA_REF"
 git -C "$BUILD_DIR/llama.cpp" checkout --detach FETCH_HEAD
-cmake -S "$BUILD_DIR/llama.cpp" -B "$BUILD_DIR/llama.cpp/build" -DCMAKE_BUILD_TYPE=Release -DGGML_METAL=ON -DLLAMA_BUILD_SERVER=ON -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF
-cmake --build "$BUILD_DIR/llama.cpp/build" --config Release --target llama-server -j "$(sysctl -n hw.logicalcpu)"
-cp "$BUILD_DIR/llama.cpp/build/bin/llama-server" "$BIN_DIR/llama-server-aarch64-apple-darwin"
+
+llama_cmake_flags=(-DCMAKE_BUILD_TYPE=Release -DLLAMA_BUILD_SERVER=ON -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF)
+if [[ "$OS" == Darwin ]]; then
+  llama_cmake_flags+=(-DGGML_METAL=ON)
+else
+  # CPU GGUF only on Linux for this slice; CUDA/Vulkan ship in later issues.
+  llama_cmake_flags+=(-DGGML_METAL=OFF -DGGML_CUDA=OFF -DGGML_VULKAN=OFF)
+fi
+cmake -S "$BUILD_DIR/llama.cpp" -B "$BUILD_DIR/llama.cpp/build" "${llama_cmake_flags[@]}"
+cmake --build "$BUILD_DIR/llama.cpp/build" --config Release --target llama-server -j "$(job_count)"
+cp "$BUILD_DIR/llama.cpp/build/bin/llama-server" "$BIN_DIR/llama-server-$HOST_TRIPLE"
 cp "$BUILD_DIR/llama.cpp/LICENSE" "$LICENSE_DIR/llama.cpp-LICENSE"
+chmod +x "$BIN_DIR/llama-server-$HOST_TRIPLE"
+
+if [[ "$OS" != Darwin ]]; then
+  echo "Skipping MLX sidecars on $OS (Apple Silicon only)."
+  chmod u+w "$LICENSE_DIR"/* 2>/dev/null || true
+  exit 0
+fi
 
 swift build --package-path "$PROJECT_DIR/sidecars/mlx-server" -c release --arch arm64
-cp "$PROJECT_DIR/sidecars/mlx-server/.build/arm64-apple-macosx/release/mlx-server" "$BIN_DIR/mlx-server-aarch64-apple-darwin"
+cp "$PROJECT_DIR/sidecars/mlx-server/.build/arm64-apple-macosx/release/mlx-server" "$BIN_DIR/mlx-server-$HOST_TRIPLE"
 copy_first "$LICENSE_DIR/mlx-swift-lm-LICENSE" \
   "$PROJECT_DIR/sidecars/mlx-server/.build/checkouts/mlx-swift-lm/LICENSE"
 
 "$PROJECT_DIR/scripts/prepare-flux-vendor.sh"
 swift build --package-path "$PROJECT_DIR/sidecars/mlx-image-server" -c release --arch arm64
-cp "$PROJECT_DIR/sidecars/mlx-image-server/.build/arm64-apple-macosx/release/mlx-image-server" "$BIN_DIR/mlx-image-server-aarch64-apple-darwin"
+cp "$PROJECT_DIR/sidecars/mlx-image-server/.build/arm64-apple-macosx/release/mlx-image-server" "$BIN_DIR/mlx-image-server-$HOST_TRIPLE"
 copy_first "$LICENSE_DIR/flux-2-swift-mlx-LICENSE" \
   "$PROJECT_DIR/sidecars/vendor/flux-2-swift-mlx/LICENSE"
 copy_first "$LICENSE_DIR/mlx-swift-examples-LICENSE" \
@@ -50,10 +77,10 @@ copy_first "$LICENSE_DIR/mlx-swift-examples-LICENSE" \
 
 "$PROJECT_DIR/scripts/prepare-kokoro-vendor.sh"
 swift build --package-path "$PROJECT_DIR/sidecars/mlx-speech-server" -c release --arch arm64
-cp "$PROJECT_DIR/sidecars/mlx-speech-server/.build/arm64-apple-macosx/release/mlx-speech-server" "$BIN_DIR/mlx-speech-server-aarch64-apple-darwin"
+cp "$PROJECT_DIR/sidecars/mlx-speech-server/.build/arm64-apple-macosx/release/mlx-speech-server" "$BIN_DIR/mlx-speech-server-$HOST_TRIPLE"
 copy_first "$LICENSE_DIR/kokoro-swift-LICENSE" \
   "$PROJECT_DIR/sidecars/vendor/kokoro-swift/LICENSE"
 
 "$PROJECT_DIR/scripts/build-mlx-metallib.sh" "$PROJECT_DIR/sidecars/mlx-server" "$BIN_DIR"
-chmod +x "$BIN_DIR"/*-aarch64-apple-darwin
+chmod +x "$BIN_DIR"/*-"$HOST_TRIPLE"
 chmod u+w "$LICENSE_DIR"/* 2>/dev/null || true

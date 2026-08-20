@@ -1923,11 +1923,11 @@ impl UsageSample {
 
 fn cache_prices(rates: &CostRates) -> (f64, f64) {
     let input = rates.input.unwrap_or(0.0);
-    let read = rates.cache_read.unwrap_or_else(|| match rates.protocol {
+    let read = rates.cache_read.unwrap_or(match rates.protocol {
         WireProtocol::AnthropicMessages => input * 0.1,
         _ => input * 0.5,
     });
-    let write = rates.cache_write.unwrap_or_else(|| match rates.protocol {
+    let write = rates.cache_write.unwrap_or(match rates.protocol {
         WireProtocol::AnthropicMessages => input * 1.25,
         _ => input,
     });

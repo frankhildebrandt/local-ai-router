@@ -603,12 +603,14 @@ mod tests {
 
     #[tokio::test]
     async fn search_enriches_missing_sizes_from_blobs_and_prefers_bit_quantization() {
-        let mut state = MockHub::default();
-        state.search_models = vec![json!({
-            "id": "mlx-community/Qwen3.8-27B-4bit",
-            "tags": ["mlx", "4-bit"],
-            "siblings": [{"rfilename": "model.safetensors"}]
-        })];
+        let mut state = MockHub {
+            search_models: vec![json!({
+                "id": "mlx-community/Qwen3.8-27B-4bit",
+                "tags": ["mlx", "4-bit"],
+                "siblings": [{"rfilename": "model.safetensors"}]
+            })],
+            ..Default::default()
+        };
         state.models.insert(
             "mlx-community/Qwen3.8-27B-4bit".into(),
             json!({
@@ -633,12 +635,14 @@ mod tests {
 
     #[tokio::test]
     async fn search_marks_missing_sizes_unknown_and_reads_quant_from_repo_name() {
-        let mut state = MockHub::default();
-        state.search_models = vec![json!({
-            "id": "org/mystery-bf16",
-            "tags": ["mlx"],
-            "siblings": [{"rfilename": "model.safetensors"}]
-        })];
+        let state = MockHub {
+            search_models: vec![json!({
+                "id": "org/mystery-bf16",
+                "tags": ["mlx"],
+                "siblings": [{"rfilename": "model.safetensors"}]
+            })],
+            ..Default::default()
+        };
         let server = mock_hub(state).await;
         let hub = HubClient::new(reqwest::Client::new(), server, None);
         let page = hub.search("mystery", None, gb(16)).await.unwrap();

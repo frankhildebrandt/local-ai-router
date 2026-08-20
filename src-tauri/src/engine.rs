@@ -211,11 +211,13 @@ pub fn default_data_dir() -> PathBuf {
 }
 
 pub fn default_ui_dir() -> Option<PathBuf> {
+    let resource_ui = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(resource_dir_from_exe_dir))
+        .and_then(|dir| ui_dir_from_resource_dir(&dir));
     let candidates = [
         std::env::current_dir().ok().map(|dir| dir.join("dist")),
-        std::env::current_exe()
-            .ok()
-            .and_then(|exe| exe.parent().map(|dir| dir.join("../Resources/ui"))),
+        resource_ui,
         std::env::current_exe()
             .ok()
             .and_then(|exe| exe.parent().map(|dir| dir.join("ui"))),
@@ -227,6 +229,33 @@ pub fn default_ui_dir() -> Option<PathBuf> {
         .flatten()
         .map(|path| path.canonicalize().unwrap_or(path))
         .find(|path| path.join("index.html").is_file())
+}
+
+pub(crate) fn resource_dir_from_exe_dir(exe_dir: &Path) -> PathBuf {
+    let macos = exe_dir.join("../Resources");
+    if macos.is_dir() {
+        return macos;
+    }
+    for name in ["local-ai-router", BUNDLE_ID] {
+        let linux = exe_dir.join("../lib").join(name);
+        if linux.is_dir() {
+            return linux;
+        }
+    }
+    exe_dir.to_path_buf()
+}
+
+fn ui_dir_from_resource_dir(resource_dir: &Path) -> Option<PathBuf> {
+    let ui = resource_dir.join("ui");
+    ui.join("index.html").is_file().then_some(ui)
+}
+
+fn resource_dir_from_exe() -> PathBuf {
+    std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(Path::to_path_buf))
+        .map(|dir| resource_dir_from_exe_dir(&dir))
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")))
 }
 
 pub fn parse_serve_args<I, S>(args: I) -> anyhow::Result<ServeArgs>
@@ -276,8 +305,11 @@ where
     Ok(parsed)
 }
 
-pub fn serve_help() -> &'static str {
-    "Start Local AI Router without a desktop window or tray icon.
+pub fn serve_help() -> String {
+    let data = default_data_dir_help();
+    let secrets = default_secrets_help();
+    format!(
+        "Start Local AI Router without a desktop window or tray icon.
 
 Usage:
   local-ai-router serve [options]
@@ -286,14 +318,33 @@ Options:
   --port <port>            Loopback port (default: saved setting or 11435)
   --data-dir <path>        SQLite, models and KV cache directory
   --ui-dir <path>          Built admin SPA directory (contains index.html)
-  --secrets-file <path>    Store secrets in a 0600 JSON vault instead of Keychain
+  --secrets-file <path>    Store secrets in a 0600 JSON vault instead of the platform keyring
   -h, --help               Show this help
 
-Defaults match the macOS desktop app:
-  Data:  ~/Library/Application Support/app.local-ai-router.desktop
+Defaults match the desktop app:
+  Data:  {data}
   Bind:  127.0.0.1 (never LAN)
-  Secrets: macOS Keychain service app.local-ai-router.desktop
+  Secrets: {secrets}
 "
+    )
+}
+
+fn default_data_dir_help() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "~/Library/Application Support/app.local-ai-router.desktop"
+    } else {
+        "$XDG_DATA_HOME/app.local-ai-router.desktop (default ~/.local/share/...)"
+    }
+}
+
+fn default_secrets_help() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "macOS Keychain service app.local-ai-router.desktop"
+    } else if cfg!(target_os = "linux") {
+        "Secret Service (GNOME Keyring/KWallet), or --secrets-file for headless/systemd"
+    } else {
+        "the platform keyring, or --secrets-file for an isolated 0600 JSON vault"
+    }
 }
 
 pub fn serve_headless<I, S>(args: I) -> anyhow::Result<()>
@@ -340,21 +391,6 @@ where
         engine.services.runtimes.stop_all().await;
         Ok(())
     })
-}
-
-fn resource_dir_from_exe() -> PathBuf {
-    std::env::current_exe()
-        .ok()
-        .and_then(|exe| exe.parent().map(Path::to_path_buf))
-        .map(|dir| {
-            let resources = dir.join("../Resources");
-            if resources.is_dir() {
-                resources
-            } else {
-                dir
-            }
-        })
-        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")))
 }
 
 async fn shutdown_signal(token: CancellationToken) {
@@ -413,6 +449,52 @@ mod tests {
     }
 
     #[test]
+    fn packaged_linux_layout_resolves_ui_and_sidecars_from_usr_lib() {
+        let root = tempfile::tempdir().unwrap();
+        let exe_dir = root.path().join("usr/bin");
+        let resources = root.path().join("usr/lib/local-ai-router");
+        let ui = resources.join("ui");
+        let sidecars = resources.join("sidecars/bin");
+        std::fs::create_dir_all(&exe_dir).unwrap();
+        std::fs::create_dir_all(&ui).unwrap();
+        std::fs::create_dir_all(&sidecars).unwrap();
+        std::fs::write(ui.join("index.html"), "<title>Local AI Router</title>").unwrap();
+        std::fs::write(sidecars.join("llama-server-x86_64-unknown-linux-gnu"), b"").unwrap();
+
+        let resolved = resource_dir_from_exe_dir(&exe_dir);
+        assert_eq!(
+            resolved.canonicalize().unwrap(),
+            resources.canonicalize().unwrap()
+        );
+        assert_eq!(
+            ui_dir_from_resource_dir(&resolved)
+                .unwrap()
+                .canonicalize()
+                .unwrap(),
+            ui.canonicalize().unwrap()
+        );
+        assert!(sidecars
+            .join("llama-server-x86_64-unknown-linux-gnu")
+            .is_file());
+    }
+
+    #[test]
+    fn macos_app_bundle_layout_resolves_resources_next_to_macos() {
+        let root = tempfile::tempdir().unwrap();
+        let exe_dir = root.path().join("Contents/MacOS");
+        let resources = root.path().join("Contents/Resources");
+        std::fs::create_dir_all(&exe_dir).unwrap();
+        std::fs::create_dir_all(resources.join("ui")).unwrap();
+        std::fs::write(resources.join("ui/index.html"), "<title>Local AI Router</title>").unwrap();
+        assert_eq!(
+            resource_dir_from_exe_dir(&exe_dir)
+                .canonicalize()
+                .unwrap(),
+            resources.canonicalize().unwrap()
+        );
+    }
+
+    #[test]
     fn serve_args_parse_port_data_and_secrets() {
         let args = parse_serve_args([
             "--port",
@@ -439,8 +521,36 @@ mod tests {
         let help = serve_help();
         assert!(help.contains("without a desktop window or tray icon"));
         assert!(help.contains("127.0.0.1"));
-        assert!(help.contains("Application Support/app.local-ai-router.desktop"));
-        assert!(help.contains("Keychain"));
+        assert!(help.contains("app.local-ai-router.desktop"));
+        assert!(help.contains("--secrets-file"));
+        #[cfg(target_os = "macos")]
+        {
+            assert!(help.contains("Application Support"));
+            assert!(help.contains("Keychain"));
+        }
+        #[cfg(target_os = "linux")]
+        {
+            assert!(help.contains(".local/share") || help.contains("XDG_DATA_HOME"));
+            assert!(help.contains("secret service") || help.contains("Secret Service"));
+        }
+    }
+
+    #[test]
+    fn default_data_dir_uses_the_host_app_support_location() {
+        let dir = default_data_dir();
+        let rendered = dir.to_string_lossy();
+        assert!(rendered.contains("app.local-ai-router.desktop"));
+        #[cfg(target_os = "macos")]
+        assert!(rendered.contains("Application Support"));
+        #[cfg(target_os = "linux")]
+        {
+            let xdg = std::env::var_os("XDG_DATA_HOME").map(PathBuf::from);
+            if let Some(xdg) = xdg {
+                assert_eq!(dir, xdg.join("app.local-ai-router.desktop"));
+            } else {
+                assert!(rendered.contains(".local/share"));
+            }
+        }
     }
 
     #[tokio::test]

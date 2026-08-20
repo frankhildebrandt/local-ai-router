@@ -2701,6 +2701,7 @@ fn cancelled_status() -> StatusCode {
     StatusCode::from_u16(499).unwrap_or(StatusCode::REQUEST_TIMEOUT)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn cancelled_proxy_response(
     core: &AppCore,
     public_protocol: Option<PublicProtocol>,
@@ -4480,18 +4481,19 @@ mod tests {
     async fn inflight_clears_when_streaming_client_disconnects() {
         let hang = hanging_sse_upstream().await;
         let (core, app) = inflight_test_core(hang).await;
-        let request_fut = app.oneshot(chat_request(true));
-        tokio::pin!(request_fut);
-        tokio::select! {
-            biased;
-            request = wait_for_inflight(&core) => {
-                assert_eq!(request.alias, "assistant");
-            }
-            result = &mut request_fut => {
-                drop(result.unwrap());
+        {
+            let request_fut = app.oneshot(chat_request(true));
+            tokio::pin!(request_fut);
+            tokio::select! {
+                biased;
+                request = wait_for_inflight(&core) => {
+                    assert_eq!(request.alias, "assistant");
+                }
+                result = &mut request_fut => {
+                    drop(result.unwrap());
+                }
             }
         }
-        drop(request_fut);
         wait_until_idle(&core).await;
     }
 
