@@ -100,13 +100,14 @@ jobs:
           for f in icons/icon.png icons/32x32.png icons/128x128.png icons/icon.ico; do
             test -f "$f" || { echo "missing $f"; exit 1; }
           done
-      - uses: Jimver/cuda-toolkit@v0.2.35
-        id: cuda-toolkit
-        with:
-          cuda: "12.8.1"
-          method: network
-          sub-packages: '["nvcc","cudart","cudart_dev","cublas","cublas_dev"]'
-          use-github-cache: false
+      - name: Install CUDA toolkit
+        run: |
+          wget -q https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
+          sudo dpkg -i cuda-keyring_1.1-1_all.deb
+          sudo apt-get update
+          sudo apt-get install -y cuda-nvcc-12-8 cuda-cudart-12-8
+          echo "CUDA_PATH=/usr/local/cuda-12.8" >> "$GITHUB_ENV"
+          echo "/usr/local/cuda-12.8/bin" >> "$GITHUB_PATH"
       - name: Build GGUF sidecars (CPU, CUDA, Vulkan)
         run: BUILD_LLAMA_CUDA=1 BUILD_LLAMA_VULKAN=1 ./scripts/build-sidecars.sh
       - uses: tauri-apps/tauri-action@v0
@@ -180,13 +181,21 @@ jobs:
           $sdk = "C:\VulkanSDK\$ver"
           "VULKAN_SDK=$sdk" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
           "$sdk\Bin" | Out-File $env:GITHUB_PATH -Append -Encoding utf8
-      - uses: Jimver/cuda-toolkit@v0.2.35
+      - name: Install CUDA toolkit
         id: cuda-toolkit
-        with:
-          cuda: "12.8.1"
-          method: network
-          sub-packages: '["nvcc","cudart","cudart_dev","cublas","cublas_dev"]'
-          use-github-cache: false
+        shell: pwsh
+        run: |
+          $version = "12.8.1"
+          $short = "12.8"
+          $url = "https://developer.download.nvidia.com/compute/cuda/$version/network_installers/cuda_${version}_windows_network.exe"
+          Invoke-WebRequest -Uri $url -OutFile cuda_installer.exe -UseBasicParsing
+          $packages = "nvcc_$short cudart_$short cudart_dev_$short cublas_$short cublas_dev_$short"
+          $p = Start-Process -FilePath .\cuda_installer.exe -ArgumentList "-s $packages" -Wait -PassThru -NoNewWindow
+          if ($p.ExitCode -ne 0) { throw "CUDA installer exited $($p.ExitCode)" }
+          $cudaPath = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v$short"
+          "CUDA_PATH=$cudaPath" | Out-File -Append $env:GITHUB_OUTPUT
+          "CUDA_PATH=$cudaPath" | Out-File -Append $env:GITHUB_ENV
+          "$cudaPath\bin" | Out-File -Append $env:GITHUB_PATH
       - name: Build GGUF sidecars (CPU, CUDA, and Vulkan)
         run: BUILD_LLAMA_CUDA=1 BUILD_LLAMA_VULKAN=1 ./scripts/build-sidecars.sh
       - uses: tauri-apps/tauri-action@v0
