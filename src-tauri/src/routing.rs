@@ -308,10 +308,40 @@ pub struct RoutingEvaluation {
     pub task_rule_id: Option<String>,
     pub decision: RoutingDecision,
     pub ordered_target_ids: Vec<String>,
+    #[serde(default)]
+    pub primary_target_ids: Vec<String>,
+    #[serde(default)]
+    pub fallback_target_ids: Vec<String>,
     pub shadow_target_id: Option<String>,
     pub half_open_target_ids: Vec<String>,
     pub estimated_input_tokens: u64,
     pub peer_latency_ms: Option<u64>,
+}
+
+impl RoutingEvaluation {
+    pub fn is_fallback_hop(&self, target_id: &str) -> bool {
+        self.fallback_target_ids.iter().any(|id| id == target_id)
+    }
+
+    pub fn has_later_hop(&self, target_id: &str) -> bool {
+        self.hop_index(target_id)
+            .is_some_and(|index| index + 1 < self.ordered_target_ids.len())
+    }
+
+    pub fn has_later_primary(&self, target_id: &str) -> bool {
+        let Some(index) = self.hop_index(target_id) else {
+            return false;
+        };
+        self.ordered_target_ids[index + 1..]
+            .iter()
+            .any(|id| self.primary_target_ids.iter().any(|primary| primary == id))
+    }
+
+    fn hop_index(&self, target_id: &str) -> Option<usize> {
+        self.ordered_target_ids
+            .iter()
+            .position(|id| id == target_id)
+    }
 }
 
 pub struct RouteEvaluationInput<'a> {
@@ -345,7 +375,10 @@ pub async fn evaluate_route(
             .unwrap_or(4_096),
     };
     let mut scoped_route = route.clone();
-    if !policy.candidate_target_ids.is_empty() {
+    if policy.mode == RoutingMode::Adaptive
+        && policy.status == PolicyStatus::Active
+        && !policy.candidate_target_ids.is_empty()
+    {
         scoped_route
             .targets
             .retain(|hop| hop.role.is_fallback() || policy.candidate_target_ids.contains(&hop.id));
@@ -421,20 +454,15 @@ pub async fn evaluate_route(
         .filter(|candidate| candidate.reason == "circuit_open" || candidate.reason == "slow")
         .map(|candidate| candidate.target_id.clone())
         .collect();
-    let adaptive_order = decision
+    let ranked_primary_ids = decision
         .ranked
         .iter()
         .map(|candidate| candidate.target_id.clone())
-        .chain(fallback_order.iter().cloned())
         .collect::<Vec<_>>();
     let primary_fixed = expanded
         .iter()
         .filter(|target| !target.role.is_fallback() && !blocked.contains(&target.id))
         .map(|target| target.id.clone())
-        .collect::<Vec<_>>();
-    let fixed_order = primary_fixed
-        .into_iter()
-        .chain(fallback_order)
         .collect::<Vec<_>>();
     let peer_latency_ms = crate::domain::median_u64(
         &decision
@@ -448,13 +476,24 @@ pub async fn evaluate_route(
             })
             .collect::<Vec<_>>(),
     );
-    let (mode, ordered_target_ids, shadow_target_id) = match (policy.mode, policy.status) {
-        (RoutingMode::Adaptive, PolicyStatus::Active) => ("adaptive", adaptive_order, None),
-        (RoutingMode::Adaptive, PolicyStatus::Shadow) => {
-            ("shadow", fixed_order, adaptive_order.first().cloned())
-        }
-        _ => ("fixed", fixed_order, None),
+    let (mode, primary_target_ids, shadow_target_id) = match (policy.mode, policy.status) {
+        (RoutingMode::Adaptive, PolicyStatus::Active) => ("adaptive", ranked_primary_ids, None),
+        (RoutingMode::Adaptive, PolicyStatus::Shadow) => (
+            "shadow",
+            primary_fixed,
+            ranked_primary_ids
+                .first()
+                .cloned()
+                .or_else(|| fallback_order.first().cloned()),
+        ),
+        _ => ("fixed", primary_fixed, None),
     };
+    let fallback_target_ids = fallback_order;
+    let ordered_target_ids = primary_target_ids
+        .iter()
+        .cloned()
+        .chain(fallback_target_ids.iter().cloned())
+        .collect::<Vec<_>>();
     Ok(RoutingEvaluation {
         alias: route.alias.clone(),
         mode: mode.into(),
@@ -463,6 +502,8 @@ pub async fn evaluate_route(
         task_rule_id: selected.rule_id,
         decision,
         ordered_target_ids,
+        primary_target_ids,
+        fallback_target_ids,
         shadow_target_id,
         half_open_target_ids,
         estimated_input_tokens: signals.estimated_input_tokens,
@@ -1354,6 +1395,106 @@ mod tests {
             evaluation.ordered_target_ids,
             vec!["chat-a", "chat-b", "vision"]
         );
+        assert_eq!(
+            evaluation.primary_target_ids,
+            vec!["chat-a".to_string(), "chat-b".to_string()]
+        );
+        assert_eq!(evaluation.fallback_target_ids, vec!["vision".to_string()]);
+        assert!(evaluation.has_later_primary("chat-a"));
+        assert!(!evaluation.has_later_primary("chat-b"));
+        assert!(evaluation.has_later_hop("chat-b"));
+        assert!(evaluation.is_fallback_hop("vision"));
+        assert!(!evaluation.has_later_hop("vision"));
+    }
+
+    #[tokio::test]
+    async fn performance_keeps_every_primary_when_candidate_ids_are_a_subset() {
+        let (store, route) = pool_fixture().await;
+        let mut policy = RoutingPolicy::new("assistant");
+        policy.mode = RoutingMode::Fixed;
+        policy.status = PolicyStatus::Draft;
+        policy.candidate_target_ids = vec!["chat-a".into()];
+
+        let evaluation = evaluate_route(
+            &store,
+            &route,
+            RouteEvaluationInput {
+                policy: Some(&policy),
+                explicit_task: None,
+                endpoint: "/v1/chat/completions",
+                canonical: None,
+                required_capabilities: vec!["chat".into()],
+                streaming: false,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(evaluation.mode, "fixed");
+        assert_eq!(
+            evaluation.ordered_target_ids,
+            vec!["chat-a", "chat-b", "vision"]
+        );
+        assert_eq!(
+            evaluation.primary_target_ids,
+            vec!["chat-a".to_string(), "chat-b".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn open_circuit_on_one_primary_leaves_the_rest_of_the_pool() {
+        let (store, route) = pool_fixture().await;
+        for index in 0..3 {
+            store
+                .insert_routing_attempt(&RoutingAttemptRecord {
+                    id: format!("missing-{index}"),
+                    request_id: "seed".into(),
+                    created_at: Utc::now(),
+                    alias: "assistant".into(),
+                    task: "general".into(),
+                    task_source: "default".into(),
+                    target_id: "chat-a".into(),
+                    routing_mode: "fixed".into(),
+                    status: 404,
+                    transient_failure: false,
+                    retry_after_until: None,
+                    latency_ms: 5,
+                    ttft_ms: None,
+                    streaming: false,
+                    input_tokens: None,
+                    output_tokens: None,
+                    estimated_cost_usd: None,
+                    cost_verified: false,
+                    score: None,
+                    reason: "default".into(),
+                })
+                .await
+                .unwrap();
+        }
+
+        let evaluation = evaluate_route(
+            &store,
+            &route,
+            RouteEvaluationInput {
+                policy: None,
+                explicit_task: None,
+                endpoint: "/v1/chat/completions",
+                canonical: None,
+                required_capabilities: vec!["chat".into()],
+                streaming: false,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(evaluation.primary_target_ids, vec!["chat-b".to_string()]);
+        assert_eq!(evaluation.fallback_target_ids, vec!["vision".to_string()]);
+        assert_eq!(evaluation.ordered_target_ids, vec!["chat-b", "vision"]);
+        assert!(evaluation
+            .decision
+            .excluded
+            .iter()
+            .any(|item| item.target_id == "chat-a" && item.reason == "circuit_open"));
     }
 
     #[tokio::test]

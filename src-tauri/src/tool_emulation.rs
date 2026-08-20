@@ -69,7 +69,9 @@ pub fn salvage_tool_calls(response: &mut CanonicalResponse, tools: &[CanonicalTo
     let mut calls = Vec::new();
     for block in &response.content {
         match block {
-            ContentBlock::Text { text } => leftover.push_str(&extract_calls(text, &allowed, &mut calls)),
+            ContentBlock::Text { text } => {
+                leftover.push_str(&extract_calls(text, &allowed, &mut calls))
+            }
             other => match other {
                 ContentBlock::Reasoning { text } => leftover.push_str(text),
                 _ => {}
@@ -182,7 +184,10 @@ fn next_tag_span(text: &str) -> Option<(usize, usize, &str)> {
         };
         let end = inner_start + inner_end + close.len();
         let inner = text[inner_start..inner_start + inner_end].trim();
-        if best.map(|(best_start, _, _)| start < best_start).unwrap_or(true) {
+        if best
+            .map(|(best_start, _, _)| start < best_start)
+            .unwrap_or(true)
+        {
             best = Some((start, end, inner));
         }
     }
@@ -281,9 +286,8 @@ mod tests {
     #[test]
     fn salvage_parses_hermes_tags_and_named_json_fences() {
         let tools = vec![tool("terminal")];
-        let mut tagged = text_response(
-            r#"<tool_call>{"name":"terminal","arguments":{"cmd":"ls"}}</tool_call>"#,
-        );
+        let mut tagged =
+            text_response(r#"<tool_call>{"name":"terminal","arguments":{"cmd":"ls"}}</tool_call>"#);
         salvage_tool_calls(&mut tagged, &tools);
         assert!(matches!(
             &tagged.content[0],
@@ -291,7 +295,8 @@ mod tests {
         ));
         assert_eq!(tagged.stop_reason.as_deref(), Some("tool_calls"));
 
-        let mut fence = text_response("```json\n{\"name\":\"terminal\",\"arguments\":{\"cmd\":\"pwd\"}}\n```");
+        let mut fence =
+            text_response("```json\n{\"name\":\"terminal\",\"arguments\":{\"cmd\":\"pwd\"}}\n```");
         salvage_tool_calls(&mut fence, &tools);
         assert!(matches!(
             &fence.content[0],
