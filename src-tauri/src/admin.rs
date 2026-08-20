@@ -179,8 +179,12 @@ async fn invoke(
         return cookie_json(Value::Null, identity::clear_cookie_header(request.secure));
     }
     if name == "auth_status" {
-        return match commands::auth_status_for(&state.services, request.login_required, request.user)
-            .await
+        return match commands::auth_status_for(
+            &state.services,
+            request.login_required,
+            request.user,
+        )
+        .await
         {
             Ok(value) => ok_response(value),
             Err(error) => (StatusCode::BAD_REQUEST, error).into_response(),
@@ -246,7 +250,11 @@ async fn load_admin_request(
     })
 }
 
-async fn deny_if_needed(state: &AdminState, request: &AdminRequest, name: &str) -> Option<Response> {
+async fn deny_if_needed(
+    state: &AdminState,
+    request: &AdminRequest,
+    name: &str,
+) -> Option<Response> {
     if is_public_command(name) {
         return None;
     }
@@ -309,11 +317,7 @@ async fn login_response(state: &AdminState, request: &AdminRequest, args: &Value
 }
 
 fn cookie_json(value: Value, cookie: String) -> Response {
-    (
-        [(header::SET_COOKIE, cookie)],
-        Json(value),
-    )
-        .into_response()
+    ([(header::SET_COOKIE, cookie)], Json(value)).into_response()
 }
 
 fn ok_response<T: serde::Serialize>(value: T) -> Response {
@@ -606,11 +610,9 @@ async fn dispatch(services: &AppServices, name: &str, args: Value) -> Result<Val
             Ok(Value::Null)
         }
         "list_directory_users" => ok(commands::list_directory_users(services).await?),
-        "create_directory_user" => ok(commands::create_directory_user(
-            services,
-            field(&args, "input")?,
-        )
-        .await?),
+        "create_directory_user" => {
+            ok(commands::create_directory_user(services, field(&args, "input")?).await?)
+        }
         "update_directory_user" => ok(commands::update_directory_user(
             services,
             field(&args, "id")?,
@@ -629,9 +631,13 @@ async fn dispatch(services: &AppServices, name: &str, args: Value) -> Result<Val
             Ok(Value::Null)
         }
         "user_permissions" => ok(commands::user_permissions(services, field(&args, "id")?).await?),
-        "reveal_operator_bootstrap" => {
-            ok(commands::reveal_operator_bootstrap(services).await?)
+        "join_uplink" => ok(commands::join_uplink(services, field(&args, "input")?).await?),
+        "uplink_status" => ok(commands::uplink_status(services).await?),
+        "disconnect_uplink" => {
+            commands::disconnect_uplink(services).await?;
+            Ok(Value::Null)
         }
+        "reveal_operator_bootstrap" => ok(commands::reveal_operator_bootstrap(services).await?),
         "list_oidc_allowlist" => ok(commands::list_oidc_allowlist(services).await?),
         "invite_oidc_identity" => ok(commands::invite_oidc_identity(
             services,

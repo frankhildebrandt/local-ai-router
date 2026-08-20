@@ -45,6 +45,7 @@ beforeEach(() => {
     if (name === "list_local_api_keys") return Promise.resolve([{ id: "default", name: "Default", created_at: "2026-08-17T10:00:00Z", last_used_at: null, revoked_at: null }]);
     if (name === "list_logs") return Promise.resolve({ total: 1, items: [{ id: "request", created_at: "2026-08-17T10:00:00Z", endpoint: "/v1/chat/completions", alias: "assistant", target: "cloud", attempts: 1, status: 200, latency_ms: 12, input_tokens: 3, output_tokens: 5, error_code: null, error_message: null, api_key_id: "default", api_key_name: "Default" }] });
     if (name === "get_settings") return Promise.resolve({});
+    if (name === "uplink_status") return Promise.resolve(null);
     if (name === "auth_status") return Promise.resolve({ login_required: false, authenticated: false, user: null, permissions: null, bind_mode: "loopback", bind_address: "127.0.0.1", tls_fingerprint: null, oidc_providers: [], operator_bootstrap_pending: false });
     if (name === "list_directory_users") return Promise.resolve([{ id: "op", username: "operator", display_name: "Operator", is_operator: true, disabled_at: null, created_at: "2026-08-20T00:00:00Z", group_ids: [], allowed_model_ids: null, may_publish: null, may_admin: null, has_password: true }]);
     if (name === "list_directory_groups" || name === "list_oidc_allowlist") return Promise.resolve([]);
@@ -314,6 +315,8 @@ describe("Local AI Router shell", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "Settings" }));
     expect(await screen.findByLabelText("Inference profile")).toHaveValue("stealth");
+    expect(screen.getByRole("heading", { name: "Uplink parent" })).toBeInTheDocument();
+    expect(screen.getByLabelText("Uplink parent URL")).toBeInTheDocument();
     expect(screen.getByRole("heading", { name: "Persistent local KV" })).toBeInTheDocument();
     expect(screen.queryByRole("heading", { name: "Local API keys" })).not.toBeInTheDocument();
     expect(screen.queryByPlaceholderText("New key name")).not.toBeInTheDocument();
@@ -616,6 +619,7 @@ describe("Local AI Router shell", () => {
     expect(await screen.findByText("operator · operator")).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "User" }));
     expect(await screen.findByRole("heading", { name: "Create user" })).toBeInTheDocument();
+    expect(screen.getByLabelText("RPM limit")).toBeInTheDocument();
     fireEvent.change(screen.getByLabelText("Username"), { target: { value: "alice" } });
   });
 

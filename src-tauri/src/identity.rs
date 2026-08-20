@@ -19,7 +19,7 @@ pub const OPERATOR_BOOTSTRAP_ACCOUNT: &str = "directory-operator-bootstrap";
 pub const SESSION_COOKIE: &str = "lar_session";
 const SESSION_TTL_DAYS: i64 = 14;
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct DirectoryUser {
     pub id: String,
     pub username: String,
@@ -32,9 +32,15 @@ pub struct DirectoryUser {
     pub may_publish: Option<bool>,
     pub may_admin: Option<bool>,
     pub has_password: bool,
+    #[serde(default)]
+    pub rpm: Option<i64>,
+    #[serde(default)]
+    pub daily_token_budget: Option<i64>,
+    #[serde(default)]
+    pub daily_usd_budget: Option<f64>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct DirectoryGroup {
     pub id: String,
     pub name: String,
@@ -42,6 +48,12 @@ pub struct DirectoryGroup {
     pub allowed_model_ids: Vec<String>,
     pub may_publish: bool,
     pub may_admin: bool,
+    #[serde(default)]
+    pub rpm: Option<i64>,
+    #[serde(default)]
+    pub daily_token_budget: Option<i64>,
+    #[serde(default)]
+    pub daily_usd_budget: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -76,6 +88,58 @@ impl EffectivePermissions {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct EffectiveQuota {
+    pub rpm: Option<i64>,
+    pub daily_token_budget: Option<i64>,
+    pub daily_usd_budget: Option<f64>,
+}
+
+pub fn tighten_int(
+    user: Option<i64>,
+    groups: impl IntoIterator<Item = Option<i64>>,
+) -> Option<i64> {
+    let group = groups.into_iter().flatten().min();
+    match (user, group) {
+        (Some(user), Some(group)) => Some(user.min(group)),
+        (Some(user), None) => Some(user),
+        (None, group) => group,
+    }
+}
+
+pub fn tighten_float(
+    user: Option<f64>,
+    groups: impl IntoIterator<Item = Option<f64>>,
+) -> Option<f64> {
+    let group = groups
+        .into_iter()
+        .flatten()
+        .min_by(|left, right| left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal));
+    match (user, group) {
+        (Some(user), Some(group)) => Some(user.min(group)),
+        (Some(user), None) => Some(user),
+        (None, group) => group,
+    }
+}
+
+pub fn effective_quota(user: &DirectoryUser, groups: &[DirectoryGroup]) -> EffectiveQuota {
+    let membership: Vec<&DirectoryGroup> = groups
+        .iter()
+        .filter(|group| user.group_ids.iter().any(|id| id == &group.id))
+        .collect();
+    EffectiveQuota {
+        rpm: tighten_int(user.rpm, membership.iter().map(|group| group.rpm)),
+        daily_token_budget: tighten_int(
+            user.daily_token_budget,
+            membership.iter().map(|group| group.daily_token_budget),
+        ),
+        daily_usd_budget: tighten_float(
+            user.daily_usd_budget,
+            membership.iter().map(|group| group.daily_usd_budget),
+        ),
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct OidcIdentity {
     pub id: String,
@@ -106,6 +170,12 @@ pub struct CreateUserInput {
     pub allowed_model_ids: Option<Vec<String>>,
     pub may_publish: Option<bool>,
     pub may_admin: Option<bool>,
+    #[serde(default)]
+    pub rpm: Option<i64>,
+    #[serde(default)]
+    pub daily_token_budget: Option<i64>,
+    #[serde(default)]
+    pub daily_usd_budget: Option<f64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -121,6 +191,12 @@ pub struct UpdateUserInput {
     pub may_admin: Option<bool>,
     pub inherit_admin: Option<bool>,
     pub disabled: Option<bool>,
+    #[serde(default)]
+    pub rpm: Option<Option<i64>>,
+    #[serde(default)]
+    pub daily_token_budget: Option<Option<i64>>,
+    #[serde(default)]
+    pub daily_usd_budget: Option<Option<f64>>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -133,6 +209,12 @@ pub struct UpsertGroupInput {
     pub may_publish: bool,
     #[serde(default)]
     pub may_admin: bool,
+    #[serde(default)]
+    pub rpm: Option<i64>,
+    #[serde(default)]
+    pub daily_token_budget: Option<i64>,
+    #[serde(default)]
+    pub daily_usd_budget: Option<f64>,
 }
 
 pub async fn migrate(pool: &SqlitePool) -> anyhow::Result<()> {
@@ -215,9 +297,23 @@ pub async fn migrate(pool: &SqlitePool) -> anyhow::Result<()> {
     )
     .execute(pool)
     .await?;
-    sqlx::query("CREATE INDEX IF NOT EXISTS directory_sessions_token_idx ON directory_sessions(token_hash)")
-        .execute(pool)
-        .await?;
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS directory_sessions_token_idx ON directory_sessions(token_hash)",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS directory_quotas (
+            subject_type TEXT NOT NULL,
+            subject_id TEXT NOT NULL,
+            rpm INTEGER,
+            daily_token_budget INTEGER,
+            daily_usd_budget REAL,
+            PRIMARY KEY (subject_type, subject_id)
+        )",
+    )
+    .execute(pool)
+    .await?;
     Ok(())
 }
 
@@ -232,7 +328,11 @@ fn hash_password(password: &str) -> anyhow::Result<String> {
 fn verify_password(hash: &str, password: &str) -> bool {
     PasswordHash::new(hash)
         .ok()
-        .and_then(|parsed| Argon2::default().verify_password(password.as_bytes(), &parsed).ok())
+        .and_then(|parsed| {
+            Argon2::default()
+                .verify_password(password.as_bytes(), &parsed)
+                .ok()
+        })
         .is_some()
 }
 
@@ -330,6 +430,7 @@ impl Store {
         .fetch_all(self.pool())
         .await?;
         let password_hash: Option<String> = row.get("password_hash");
+        let quota = self.load_quota("user", &id).await?;
         Ok(DirectoryUser {
             id,
             username: row.get("username"),
@@ -344,7 +445,66 @@ impl Store {
             may_publish: optional_bool(row.get("may_publish")),
             may_admin: optional_bool(row.get("may_admin")),
             has_password: password_hash.is_some(),
+            rpm: quota.0,
+            daily_token_budget: quota.1,
+            daily_usd_budget: quota.2,
         })
+    }
+
+    async fn load_quota(
+        &self,
+        subject_type: &str,
+        subject_id: &str,
+    ) -> anyhow::Result<(Option<i64>, Option<i64>, Option<f64>)> {
+        let row = sqlx::query(
+            "SELECT rpm, daily_token_budget, daily_usd_budget FROM directory_quotas WHERE subject_type=? AND subject_id=?",
+        )
+        .bind(subject_type)
+        .bind(subject_id)
+        .fetch_optional(self.pool())
+        .await?;
+        Ok(match row {
+            Some(row) => (
+                row.get("rpm"),
+                row.get("daily_token_budget"),
+                row.get("daily_usd_budget"),
+            ),
+            None => (None, None, None),
+        })
+    }
+
+    async fn save_quota(
+        &self,
+        subject_type: &str,
+        subject_id: &str,
+        rpm: Option<i64>,
+        daily_token_budget: Option<i64>,
+        daily_usd_budget: Option<f64>,
+    ) -> anyhow::Result<()> {
+        if rpm.is_none() && daily_token_budget.is_none() && daily_usd_budget.is_none() {
+            sqlx::query("DELETE FROM directory_quotas WHERE subject_type=? AND subject_id=?")
+                .bind(subject_type)
+                .bind(subject_id)
+                .execute(self.pool())
+                .await?;
+            return Ok(());
+        }
+        sqlx::query(
+            "INSERT INTO directory_quotas(subject_type,subject_id,rpm,daily_token_budget,daily_usd_budget)
+             VALUES(?,?,?,?,?)
+             ON CONFLICT(subject_type, subject_id) DO UPDATE SET
+                rpm=excluded.rpm,
+                daily_token_budget=excluded.daily_token_budget,
+                daily_usd_budget=excluded.daily_usd_budget",
+        )
+        .bind(subject_type)
+        .bind(subject_id)
+        .bind(rpm)
+        .bind(daily_token_budget)
+        .bind(daily_usd_budget)
+        .execute(self.pool())
+        .await?;
+        Ok(())
     }
 
     async fn user_password_hash(&self, id: &str) -> anyhow::Result<Option<String>> {
@@ -377,7 +537,15 @@ impl Store {
         .bind(user.may_admin.map(|flag| flag as i64))
         .execute(self.pool())
         .await?;
-        self.replace_user_groups(&user.id, &user.group_ids).await
+        self.replace_user_groups(&user.id, &user.group_ids).await?;
+        self.save_quota(
+            "user",
+            &user.id,
+            user.rpm,
+            user.daily_token_budget,
+            user.daily_usd_budget,
+        )
+        .await
     }
 
     pub async fn update_directory_user(
@@ -412,7 +580,15 @@ impl Store {
             .execute(self.pool())
             .await?;
         }
-        self.replace_user_groups(&user.id, &user.group_ids).await
+        self.replace_user_groups(&user.id, &user.group_ids).await?;
+        self.save_quota(
+            "user",
+            &user.id,
+            user.rpm,
+            user.daily_token_budget,
+            user.daily_usd_budget,
+        )
+        .await
     }
 
     async fn replace_user_groups(&self, user_id: &str, group_ids: &[String]) -> anyhow::Result<()> {
@@ -436,18 +612,40 @@ impl Store {
         )
         .fetch_all(self.pool())
         .await?;
-        rows.into_iter().map(row_to_group).collect()
+        let mut groups = Vec::new();
+        for row in rows {
+            groups.push(self.hydrate_group(row).await?);
+        }
+        Ok(groups)
     }
 
     pub async fn directory_group(&self, id: &str) -> anyhow::Result<Option<DirectoryGroup>> {
-        sqlx::query(
+        let row = sqlx::query(
             "SELECT id,name,created_at,allowed_model_ids,may_publish,may_admin FROM directory_groups WHERE id=?",
         )
         .bind(id)
         .fetch_optional(self.pool())
-        .await?
-        .map(row_to_group)
-        .transpose()
+        .await?;
+        match row {
+            Some(row) => Ok(Some(self.hydrate_group(row).await?)),
+            None => Ok(None),
+        }
+    }
+
+    async fn hydrate_group(&self, row: sqlx::sqlite::SqliteRow) -> anyhow::Result<DirectoryGroup> {
+        let id: String = row.get("id");
+        let quota = self.load_quota("group", &id).await?;
+        Ok(DirectoryGroup {
+            id,
+            name: row.get("name"),
+            created_at: row.get::<String, _>("created_at").parse()?,
+            allowed_model_ids: decode_models(row.get("allowed_model_ids")).unwrap_or_default(),
+            may_publish: row.get::<i64, _>("may_publish") != 0,
+            may_admin: row.get::<i64, _>("may_admin") != 0,
+            rpm: quota.0,
+            daily_token_budget: quota.1,
+            daily_usd_budget: quota.2,
+        })
     }
 
     pub async fn upsert_directory_group(&self, group: &DirectoryGroup) -> anyhow::Result<()> {
@@ -464,7 +662,14 @@ impl Store {
         .bind(group.may_admin as i64)
         .execute(self.pool())
         .await?;
-        Ok(())
+        self.save_quota(
+            "group",
+            &group.id,
+            group.rpm,
+            group.daily_token_budget,
+            group.daily_usd_budget,
+        )
+        .await
     }
 
     pub async fn delete_directory_group(&self, id: &str) -> anyhow::Result<bool> {
@@ -533,10 +738,7 @@ impl Store {
             .collect()
     }
 
-    pub async fn upsert_oidc_allowlist(
-        &self,
-        entry: &OidcAllowlistEntry,
-    ) -> anyhow::Result<()> {
+    pub async fn upsert_oidc_allowlist(&self, entry: &OidcAllowlistEntry) -> anyhow::Result<()> {
         sqlx::query(
             "INSERT INTO directory_oidc_allowlist(id,provider,identifier,user_id,created_at)
              VALUES(?,?,?,?,?)
@@ -635,18 +837,10 @@ impl Store {
     }
 }
 
-fn row_to_group(row: sqlx::sqlite::SqliteRow) -> anyhow::Result<DirectoryGroup> {
-    Ok(DirectoryGroup {
-        id: row.get("id"),
-        name: row.get("name"),
-        created_at: row.get::<String, _>("created_at").parse()?,
-        allowed_model_ids: decode_models(row.get("allowed_model_ids")).unwrap_or_default(),
-        may_publish: row.get::<i64, _>("may_publish") != 0,
-        may_admin: row.get::<i64, _>("may_admin") != 0,
-    })
-}
-
-pub fn effective_permissions(user: &DirectoryUser, groups: &[DirectoryGroup]) -> EffectivePermissions {
+pub fn effective_permissions(
+    user: &DirectoryUser,
+    groups: &[DirectoryGroup],
+) -> EffectivePermissions {
     if user.disabled_at.is_some() {
         return EffectivePermissions::none();
     }
@@ -677,7 +871,10 @@ pub fn effective_permissions(user: &DirectoryUser, groups: &[DirectoryGroup]) ->
 }
 
 impl Store {
-    pub async fn permissions_for(&self, user: &DirectoryUser) -> anyhow::Result<EffectivePermissions> {
+    pub async fn permissions_for(
+        &self,
+        user: &DirectoryUser,
+    ) -> anyhow::Result<EffectivePermissions> {
         let groups = self.directory_groups().await?;
         Ok(effective_permissions(user, &groups))
     }
@@ -703,6 +900,9 @@ pub async fn bootstrap_operator(
         may_publish: None,
         may_admin: None,
         has_password: true,
+        rpm: None,
+        daily_token_budget: None,
+        daily_usd_budget: None,
     };
     store
         .insert_directory_user(&user, Some(&hash_password(&password)?))
@@ -720,7 +920,11 @@ pub async fn create_user(store: &Store, input: CreateUserInput) -> anyhow::Resul
     if display_name.is_empty() {
         anyhow::bail!("display name is required");
     }
-    let password_hash = match input.password.as_deref().map(str::trim).filter(|value| !value.is_empty())
+    let password_hash = match input
+        .password
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
     {
         Some(password) => Some(hash_password(password)?),
         None => None,
@@ -737,6 +941,9 @@ pub async fn create_user(store: &Store, input: CreateUserInput) -> anyhow::Resul
         may_publish: input.may_publish,
         may_admin: input.may_admin,
         has_password: password_hash.is_some(),
+        rpm: input.rpm,
+        daily_token_budget: input.daily_token_budget,
+        daily_usd_budget: input.daily_usd_budget,
     };
     store
         .insert_directory_user(&user, password_hash.as_deref())
@@ -753,10 +960,7 @@ pub async fn update_user(
     id: &str,
     input: UpdateUserInput,
 ) -> anyhow::Result<DirectoryUser> {
-    let mut user = store
-        .directory_user(id)
-        .await?
-        .context("user not found")?;
+    let mut user = store.directory_user(id).await?.context("user not found")?;
     if let Some(display_name) = input.display_name {
         let display_name = display_name.trim();
         if display_name.is_empty() {
@@ -781,6 +985,15 @@ pub async fn update_user(
         user.may_admin = None;
     } else if let Some(may_admin) = input.may_admin {
         user.may_admin = Some(may_admin);
+    }
+    if let Some(rpm) = input.rpm {
+        user.rpm = rpm;
+    }
+    if let Some(daily_token_budget) = input.daily_token_budget {
+        user.daily_token_budget = daily_token_budget;
+    }
+    if let Some(daily_usd_budget) = input.daily_usd_budget {
+        user.daily_usd_budget = daily_usd_budget;
     }
     if let Some(disabled) = input.disabled {
         if disabled && user.is_operator {
@@ -825,7 +1038,11 @@ pub async fn update_user(
         .context("updated user missing")
 }
 
-pub async fn upsert_group(store: &Store, id: Option<String>, input: UpsertGroupInput) -> anyhow::Result<DirectoryGroup> {
+pub async fn upsert_group(
+    store: &Store,
+    id: Option<String>,
+    input: UpsertGroupInput,
+) -> anyhow::Result<DirectoryGroup> {
     let name = normalize_group_name(&input.name)?;
     let existing = if let Some(id) = id.as_deref() {
         store.directory_group(id).await?
@@ -844,6 +1061,9 @@ pub async fn upsert_group(store: &Store, id: Option<String>, input: UpsertGroupI
         allowed_model_ids: input.allowed_model_ids,
         may_publish: input.may_publish,
         may_admin: input.may_admin,
+        rpm: input.rpm,
+        daily_token_budget: input.daily_token_budget,
+        daily_usd_budget: input.daily_usd_budget,
     };
     store.upsert_directory_group(&group).await?;
     Ok(group)
@@ -978,9 +1198,11 @@ async fn ensure_oidc_still_invited(
     {
         return Ok(());
     }
-    let linked = store.oidc_allowlist().await?.into_iter().any(|entry| {
-        entry.provider == provider && entry.user_id.as_deref() == Some(user_id)
-    });
+    let linked = store
+        .oidc_allowlist()
+        .await?
+        .into_iter()
+        .any(|entry| entry.provider == provider && entry.user_id.as_deref() == Some(user_id));
     if linked {
         return Ok(());
     }
@@ -1003,7 +1225,16 @@ pub async fn complete_oidc_login(
         if user.disabled_at.is_some() {
             anyhow::bail!("this account is disabled");
         }
-        ensure_oidc_still_invited(store, &provider, &user.id, email, login, existing.email.as_deref(), existing.login.as_deref()).await?;
+        ensure_oidc_still_invited(
+            store,
+            &provider,
+            &user.id,
+            email,
+            login,
+            existing.email.as_deref(),
+            existing.login.as_deref(),
+        )
+        .await?;
         let token = create_session(store, &user.id).await?;
         return Ok((user, token));
     }
@@ -1024,11 +1255,7 @@ pub async fn complete_oidc_login(
             .await?
             .context("invited user missing")?
     } else {
-        let username = unique_oidc_username(
-            store,
-            login.or(email).unwrap_or(subject),
-        )
-        .await?;
+        let username = unique_oidc_username(store, login.or(email).unwrap_or(subject)).await?;
         create_user(
             store,
             CreateUserInput {
@@ -1039,6 +1266,9 @@ pub async fn complete_oidc_login(
                 allowed_model_ids: None,
                 may_publish: None,
                 may_admin: None,
+                rpm: None,
+                daily_token_budget: None,
+                daily_usd_budget: None,
             },
         )
         .await?
@@ -1091,7 +1321,11 @@ async fn unique_oidc_username(store: &Store, seed: &str) -> anyhow::Result<Strin
     }
     for index in 2..1000 {
         let candidate = format!("{base}-{index}");
-        if store.directory_user_by_username(&candidate).await?.is_none() {
+        if store
+            .directory_user_by_username(&candidate)
+            .await?
+            .is_none()
+        {
             return Ok(candidate);
         }
     }
@@ -1157,6 +1391,51 @@ mod tests {
         Store::memory().await.unwrap()
     }
 
+    #[test]
+    fn user_limits_tighten_but_do_not_loosen_group_quotas() {
+        let user = DirectoryUser {
+            id: "u".into(),
+            username: "alice".into(),
+            display_name: "Alice".into(),
+            is_operator: false,
+            disabled_at: None,
+            created_at: Utc::now(),
+            group_ids: vec!["g".into()],
+            allowed_model_ids: None,
+            may_publish: None,
+            may_admin: None,
+            has_password: true,
+            rpm: Some(2),
+            daily_token_budget: Some(100),
+            daily_usd_budget: Some(5.0),
+        };
+        let group = DirectoryGroup {
+            id: "g".into(),
+            name: "limited".into(),
+            created_at: Utc::now(),
+            allowed_model_ids: vec!["alice-gpt".into()],
+            may_publish: false,
+            may_admin: false,
+            rpm: Some(10),
+            daily_token_budget: Some(50),
+            daily_usd_budget: Some(8.0),
+        };
+        let quota = effective_quota(&user, std::slice::from_ref(&group));
+        assert_eq!(quota.rpm, Some(2));
+        assert_eq!(quota.daily_token_budget, Some(50));
+        assert!((quota.daily_usd_budget.unwrap() - 5.0).abs() < f64::EPSILON);
+        let looser = DirectoryUser {
+            rpm: Some(20),
+            daily_token_budget: Some(80),
+            daily_usd_budget: Some(9.0),
+            ..user
+        };
+        let tightened = effective_quota(&looser, &[group]);
+        assert_eq!(tightened.rpm, Some(10));
+        assert_eq!(tightened.daily_token_budget, Some(50));
+        assert!((tightened.daily_usd_budget.unwrap() - 8.0).abs() < f64::EPSILON);
+    }
+
     #[tokio::test]
     async fn first_run_creates_a_local_operator_account() {
         let store = memory().await;
@@ -1197,6 +1476,9 @@ mod tests {
                     allowed_model_ids: None,
                     may_publish: None,
                     may_admin: None,
+                    rpm: None,
+                    daily_token_budget: None,
+                    daily_usd_budget: None,
                 },
             )
             .await
@@ -1222,6 +1504,9 @@ mod tests {
                 allowed_model_ids: vec!["qwen".into(), "llama".into()],
                 may_publish: true,
                 may_admin: false,
+                rpm: None,
+                daily_token_budget: None,
+                daily_usd_budget: None,
             },
         )
         .await
@@ -1236,6 +1521,9 @@ mod tests {
                 allowed_model_ids: None,
                 may_publish: None,
                 may_admin: None,
+                rpm: None,
+                daily_token_budget: None,
+                daily_usd_budget: None,
             },
         )
         .await
@@ -1262,6 +1550,9 @@ mod tests {
                 may_admin: Some(true),
                 inherit_admin: None,
                 disabled: None,
+                rpm: None,
+                daily_token_budget: None,
+                daily_usd_budget: None,
             },
         )
         .await
@@ -1287,6 +1578,9 @@ mod tests {
                 allowed_model_ids: None,
                 may_publish: None,
                 may_admin: None,
+                rpm: None,
+                daily_token_budget: None,
+                daily_usd_budget: None,
             },
         )
         .await
@@ -1311,6 +1605,9 @@ mod tests {
                 may_admin: None,
                 inherit_admin: None,
                 disabled: Some(true),
+                rpm: None,
+                daily_token_budget: None,
+                daily_usd_budget: None,
             },
         )
         .await
@@ -1327,7 +1624,11 @@ mod tests {
         let store = memory().await;
         let secrets = MemorySecrets::default();
         bootstrap_operator(&store, &secrets).await.unwrap();
-        let operator = store.directory_user_by_username("operator").await.unwrap().unwrap();
+        let operator = store
+            .directory_user_by_username("operator")
+            .await
+            .unwrap()
+            .unwrap();
         let perms = store.permissions_for(&operator).await.unwrap();
         assert!(perms.allows_model("anything"));
         assert!(perms.may_admin);
@@ -1346,6 +1647,9 @@ mod tests {
                 may_admin: None,
                 inherit_admin: None,
                 disabled: Some(true),
+                rpm: None,
+                daily_token_budget: None,
+                daily_usd_budget: None,
             },
         )
         .await
@@ -1356,39 +1660,22 @@ mod tests {
     #[tokio::test]
     async fn unknown_oidc_identity_is_rejected_until_allowlisted() {
         let store = memory().await;
-        let error = complete_oidc_login(
-            &store,
-            "google",
-            "sub-1",
-            Some("alice@example.com"),
-            None,
-        )
-        .await
-        .unwrap_err();
+        let error = complete_oidc_login(&store, "google", "sub-1", Some("alice@example.com"), None)
+            .await
+            .unwrap_err();
         assert!(error.to_string().contains("not invited"));
         invite_oidc(&store, "google", "alice@example.com", None)
             .await
             .unwrap();
-        let (user, token) = complete_oidc_login(
-            &store,
-            "google",
-            "sub-1",
-            Some("alice@example.com"),
-            None,
-        )
-        .await
-        .unwrap();
+        let (user, token) =
+            complete_oidc_login(&store, "google", "sub-1", Some("alice@example.com"), None)
+                .await
+                .unwrap();
         assert_eq!(user.username, "alice");
         assert!(user_for_session(&store, &token).await.unwrap().is_some());
-        let again = complete_oidc_login(
-            &store,
-            "google",
-            "sub-1",
-            Some("alice@example.com"),
-            None,
-        )
-        .await
-        .unwrap();
+        let again = complete_oidc_login(&store, "google", "sub-1", Some("alice@example.com"), None)
+            .await
+            .unwrap();
         assert_eq!(again.0.id, user.id);
         let invite = store
             .oidc_allowlist()
@@ -1398,15 +1685,10 @@ mod tests {
             .next()
             .unwrap();
         store.delete_oidc_allowlist(&invite.id).await.unwrap();
-        let denied = complete_oidc_login(
-            &store,
-            "google",
-            "sub-1",
-            Some("alice@example.com"),
-            None,
-        )
-        .await
-        .unwrap_err();
+        let denied =
+            complete_oidc_login(&store, "google", "sub-1", Some("alice@example.com"), None)
+                .await
+                .unwrap_err();
         assert!(denied.to_string().contains("not invited"));
     }
 
@@ -1421,6 +1703,9 @@ mod tests {
                 allowed_model_ids: vec!["qwen".into()],
                 may_publish: false,
                 may_admin: false,
+                rpm: None,
+                daily_token_budget: None,
+                daily_usd_budget: None,
             },
         )
         .await
@@ -1435,6 +1720,9 @@ mod tests {
                 allowed_model_ids: None,
                 may_publish: None,
                 may_admin: None,
+                rpm: None,
+                daily_token_budget: None,
+                daily_usd_budget: None,
             },
         )
         .await
@@ -1447,19 +1735,84 @@ mod tests {
         )
         .await
         .unwrap();
-        let (user, _) = complete_oidc_login(
-            &store,
-            "google",
-            "sub-9",
-            Some("alice@example.com"),
-            None,
-        )
-        .await
-        .unwrap();
+        let (user, _) =
+            complete_oidc_login(&store, "google", "sub-9", Some("alice@example.com"), None)
+                .await
+                .unwrap();
         assert_eq!(user.id, alice.id);
         let perms = store.permissions_for(&user).await.unwrap();
         assert!(perms.allows_model("qwen"));
         assert!(!perms.may_admin);
+    }
+
+    #[tokio::test]
+    async fn update_user_can_clear_quota_limits() {
+        let store = memory().await;
+        let alice = create_user(
+            &store,
+            CreateUserInput {
+                username: "alice".into(),
+                display_name: "Alice".into(),
+                password: Some("pw".into()),
+                group_ids: Vec::new(),
+                allowed_model_ids: None,
+                may_publish: None,
+                may_admin: None,
+                rpm: Some(4),
+                daily_token_budget: Some(100),
+                daily_usd_budget: Some(2.0),
+            },
+        )
+        .await
+        .unwrap();
+        let cleared = update_user(
+            &store,
+            &MemorySecrets::default(),
+            &alice.id,
+            UpdateUserInput {
+                display_name: None,
+                password: None,
+                group_ids: None,
+                allowed_model_ids: None,
+                inherit_models: None,
+                may_publish: None,
+                inherit_publish: None,
+                may_admin: None,
+                inherit_admin: None,
+                disabled: None,
+                rpm: Some(None),
+                daily_token_budget: Some(None),
+                daily_usd_budget: Some(None),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(cleared.rpm, None);
+        assert_eq!(cleared.daily_token_budget, None);
+        assert_eq!(cleared.daily_usd_budget, None);
+        let kept = update_user(
+            &store,
+            &MemorySecrets::default(),
+            &alice.id,
+            UpdateUserInput {
+                display_name: Some("Alice".into()),
+                password: None,
+                group_ids: None,
+                allowed_model_ids: None,
+                inherit_models: None,
+                may_publish: None,
+                inherit_publish: None,
+                may_admin: None,
+                inherit_admin: None,
+                disabled: None,
+                rpm: None,
+                daily_token_budget: None,
+                daily_usd_budget: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(kept.rpm, None);
     }
 
     #[tokio::test]

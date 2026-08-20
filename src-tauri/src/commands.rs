@@ -9,8 +9,8 @@ use crate::{
     core::{AppCore, InFlightRequest},
     domain::{ModelRoute, RouteRole, TargetKind},
     identity::{
-        self, CreateUserInput, DirectoryGroup, DirectoryUser, EffectivePermissions, OidcAllowlistEntry,
-        UpdateUserInput, UpsertGroupInput, OPERATOR_BOOTSTRAP_ACCOUNT,
+        self, CreateUserInput, DirectoryGroup, DirectoryUser, EffectivePermissions,
+        OidcAllowlistEntry, UpdateUserInput, UpsertGroupInput, OPERATOR_BOOTSTRAP_ACCOUNT,
     },
     library,
     providers::{
@@ -836,10 +836,16 @@ pub async fn lookup_model_metadata(
 }
 
 pub async fn save_target(state: &AppServices, target: ModelTarget) -> Result<ModelTarget, String> {
+    if target.kind.is_uplink() {
+        return Err("uplink models are mounted by joining a parent".into());
+    }
     persist_target(&state.core.store, target).await
 }
 
 pub async fn delete_target(state: &AppServices, id: String) -> Result<(), String> {
+    if crate::uplink::is_uplink_target_id(&id) {
+        return Err("uplink models are removed by disconnecting from the parent".into());
+    }
     let dependents: Vec<String> = state
         .core
         .store
@@ -1865,7 +1871,12 @@ pub async fn forget_all_credentials(state: &AppServices) -> Result<(), String> {
     state.core.secrets.delete(HF_ACCOUNT).map_err(err)?;
     state.core.secrets.delete(CIVITAI_ACCOUNT).map_err(err)?;
     state.core.secrets.delete(LOCAL_API_KEY).map_err(err)?;
-    state.core.secrets.delete(OPERATOR_BOOTSTRAP_ACCOUNT).map_err(err)?;
+    state
+        .core
+        .secrets
+        .delete(OPERATOR_BOOTSTRAP_ACCOUNT)
+        .map_err(err)?;
+    let _ = crate::uplink::disconnect_uplink(state).await;
     state
         .core
         .secrets
@@ -1878,9 +1889,7 @@ pub async fn forget_all_credentials(state: &AppServices) -> Result<(), String> {
         .map_err(err)
 }
 
-pub async fn auth_status(
-    state: &AppServices,
-) -> Result<AuthStatus, String> {
+pub async fn auth_status(state: &AppServices) -> Result<AuthStatus, String> {
     auth_status_for(state, false, None).await
 }
 
@@ -1984,7 +1993,13 @@ pub async fn save_directory_group(
 }
 
 pub async fn delete_directory_group(state: &AppServices, id: String) -> Result<(), String> {
-    if !state.core.store.delete_directory_group(&id).await.map_err(err)? {
+    if !state
+        .core
+        .store
+        .delete_directory_group(&id)
+        .await
+        .map_err(err)?
+    {
         return Err("group not found".into());
     }
     Ok(())
@@ -2002,6 +2017,32 @@ pub async fn user_permissions(
         .map_err(err)?
         .ok_or_else(|| "user not found".to_string())?;
     state.core.store.permissions_for(&user).await.map_err(err)
+}
+
+pub async fn join_uplink(
+    state: &AppServices,
+    input: crate::uplink::JoinUplinkInput,
+) -> Result<crate::uplink::UplinkParent, String> {
+    crate::uplink::join_uplink(state, input).await.map_err(err)
+}
+
+pub async fn uplink_status(
+    state: &AppServices,
+) -> Result<Option<crate::uplink::UplinkParent>, String> {
+    let Some(parent) = crate::uplink::load_parent(&state.core.store)
+        .await
+        .map_err(err)?
+    else {
+        return Ok(None);
+    };
+    if let Ok(refreshed) = crate::uplink::refresh_uplink(state).await {
+        return Ok(Some(refreshed));
+    }
+    Ok(Some(parent))
+}
+
+pub async fn disconnect_uplink(state: &AppServices) -> Result<(), String> {
+    crate::uplink::disconnect_uplink(state).await.map_err(err)
 }
 
 pub async fn reveal_operator_bootstrap(state: &AppServices) -> Result<Option<String>, String> {
@@ -2028,7 +2069,13 @@ pub async fn invite_oidc_identity(
 }
 
 pub async fn delete_oidc_allowlist(state: &AppServices, id: String) -> Result<(), String> {
-    if !state.core.store.delete_oidc_allowlist(&id).await.map_err(err)? {
+    if !state
+        .core
+        .store
+        .delete_oidc_allowlist(&id)
+        .await
+        .map_err(err)?
+    {
         return Err("allowlist entry not found".into());
     }
     Ok(())
@@ -2054,7 +2101,11 @@ pub async fn begin_oidc_login(
     provider: String,
     redirect_uri: String,
 ) -> Result<crate::oidc::OidcStart, String> {
-    state.oidc.begin(&provider, &redirect_uri).await.map_err(err)
+    state
+        .oidc
+        .begin(&provider, &redirect_uri)
+        .await
+        .map_err(err)
 }
 
 pub async fn finish_oidc_login(
@@ -2129,6 +2180,9 @@ mod tests {
                     error_message: None,
                     api_key_id: None,
                     api_key_name: None,
+                    directory_user_id: None,
+                    directory_user_name: None,
+                    estimated_cost_usd: None,
                 })
                 .await
                 .unwrap();
@@ -2151,6 +2205,9 @@ mod tests {
                 error_message: None,
                 api_key_id: None,
                 api_key_name: None,
+                directory_user_id: None,
+                directory_user_name: None,
+                estimated_cost_usd: None,
             })
             .await
             .unwrap();

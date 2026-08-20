@@ -94,6 +94,9 @@ fn router_with_state(state: GatewayState) -> Router {
         .route("/v1/audio/transcriptions", post(proxy))
         .route("/v1/audio/translations", post(proxy))
         .route("/v1/moderations", post(proxy))
+        .route("/uplink/join", post(uplink_join))
+        .route("/uplink/models", get(uplink_models))
+        .route("/uplink/leave", post(uplink_leave))
         .with_state(state)
 }
 
@@ -111,19 +114,22 @@ async fn gemini_models(
             "API keys in the query string are not accepted",
         );
     }
-    if authenticated_key_id(&core, &headers).await.is_none() {
+    let Some(caller) = authenticated_caller(&core, &headers).await else {
         return protocol_error(
             PublicProtocol::Gemini,
             StatusCode::UNAUTHORIZED,
             "invalid_api_key",
             "Invalid local API key",
         );
-    }
+    };
     match advertised_routes(&core).await {
-        Ok(routes) => json_response(
-            StatusCode::OK,
-            json!({"models": routes.into_iter().filter(|route| route.enabled).map(|route| json!({"name":format!("models/{}",route.alias),"displayName":route.alias,"supportedGenerationMethods":["generateContent","streamGenerateContent"]})).collect::<Vec<_>>() }),
-        ),
+        Ok(routes) => {
+            let routes = filter_routes_for_caller(&core, &caller, routes).await;
+            json_response(
+                StatusCode::OK,
+                json!({"models": routes.into_iter().filter(|route| route.enabled).map(|route| json!({"name":format!("models/{}",route.alias),"displayName":route.alias,"supportedGenerationMethods":["generateContent","streamGenerateContent"]})).collect::<Vec<_>>() }),
+            )
+        }
         Err(_) => protocol_error(
             PublicProtocol::Gemini,
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -158,19 +164,22 @@ async fn models(
             "API keys in the query string are not accepted",
         );
     }
-    if authenticated_key_id(&core, &headers).await.is_none() {
+    let Some(caller) = authenticated_caller(&core, &headers).await else {
         return unauthorized();
-    }
+    };
     match advertised_routes(&core).await {
-        Ok(routes) => json_response(
-            StatusCode::OK,
-            json!({
-                "object": "list",
-                "data": routes.into_iter().filter(|route| route.enabled).map(|route| json!({
-                    "id": route.alias, "object": "model", "created": 0, "owned_by": "local-ai-router", "capabilities": route.capabilities
-                })).collect::<Vec<_>>()
-            }),
-        ),
+        Ok(routes) => {
+            let routes = filter_routes_for_caller(&core, &caller, routes).await;
+            json_response(
+                StatusCode::OK,
+                json!({
+                    "object": "list",
+                    "data": routes.into_iter().filter(|route| route.enabled).map(|route| json!({
+                        "id": route.alias, "object": "model", "created": 0, "owned_by": "local-ai-router", "capabilities": route.capabilities
+                    })).collect::<Vec<_>>()
+                }),
+            )
+        }
         Err(_) => openai_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             "storage_error",
@@ -196,7 +205,7 @@ async fn proxy(
             "API keys in the query string are not accepted",
         );
     }
-    let Some(api_key_id) = authenticated_key_id(&core, &headers).await else {
+    let Some(caller) = authenticated_caller(&core, &headers).await else {
         return request_error(
             public_protocol,
             StatusCode::UNAUTHORIZED,
@@ -204,6 +213,7 @@ async fn proxy(
             "Invalid local API key",
         );
     };
+    let api_key_id = caller.kv_id();
     let session_id = match validated_session_id(headers.get("x-local-ai-session")) {
         Ok(value) => value.map(str::to_owned),
         Err(message) => {
@@ -280,6 +290,9 @@ async fn proxy(
         }
     };
     let route = resolved.route;
+    if let Err(response) = enforce_uplink_access(&core, &caller, public_protocol, &alias).await {
+        return response;
+    }
     let capability = endpoint_capability(uri.path());
     let routing_policy = resolved.policy;
     let adaptive_active = routing_policy.as_ref().is_some_and(|policy| {
@@ -871,7 +884,8 @@ async fn proxy(
                             &core,
                             LogMetadata {
                                 id: &request_id,
-                                api_key_id: &api_key_id,
+                                api_key_id: caller.api_key_id(),
+                                directory_user_id: caller.directory_user_id(),
                                 endpoint: uri.path(),
                                 alias: Some(&alias),
                                 target: Some(&target.name),
@@ -916,7 +930,9 @@ async fn proxy(
             } else {
                 None
             };
-            let upstream_path = if provider
+            let upstream_path = if target.kind.is_uplink() {
+                crate::uplink::uplink_upstream_path(uri.path(), &target.provider_model)
+            } else if provider
                 .as_ref()
                 .is_some_and(|provider| provider.preset_id == "openai_subscription")
                 && canonical.is_some()
@@ -938,9 +954,18 @@ async fn proxy(
             } else {
                 join_api_url(&base_url, &upstream_path)
             };
-            let mut request = core.client.post(upstream_url);
+            let client = hop_http_client(&core, &target)
+                .await
+                .unwrap_or_else(|_| core.client.clone());
+            let mut request = client.post(upstream_url);
             if let Some(payload) = json_payload.as_mut() {
-                let mut outbound = if let Some(canonical) = canonical.as_ref() {
+                let mut outbound = if target.kind.is_uplink() {
+                    let mut native = payload.clone();
+                    if native.get("model").is_some() {
+                        native["model"] = Value::String(target.provider_model.clone());
+                    }
+                    native
+                } else if let Some(canonical) = canonical.as_ref() {
                     let protocol = public_protocol.unwrap();
                     if !matches!(
                         target.kind,
@@ -1049,7 +1074,8 @@ async fn proxy(
                             &core,
                             LogMetadata {
                                 id: &request_id,
-                                api_key_id: &api_key_id,
+                                api_key_id: caller.api_key_id(),
+                                directory_user_id: caller.directory_user_id(),
                                 endpoint: uri.path(),
                                 alias: Some(&alias),
                                 target: Some(&target.name),
@@ -1076,8 +1102,10 @@ async fn proxy(
                     let mut error_message = None;
                     let mut attempt_ttft = None;
                     let response = if is_stream && !buffer_emulation && status.is_success() {
-                        let translated_stream = public_protocol
-                            .filter(|protocol| !protocol_matches(*protocol, target.wire_protocol));
+                        let translated_stream = public_protocol.filter(|protocol| {
+                            !target.kind.is_uplink()
+                                && !protocol_matches(*protocol, target.wire_protocol)
+                        });
                         let content_type = if translated_stream.is_some() {
                             Some(HeaderValue::from_static("text/event-stream"))
                         } else {
@@ -1392,12 +1420,12 @@ async fn proxy(
                             usage = usage_from_value(&value);
                             if status.is_success() {
                                 if let Some(protocol) = public_protocol {
-                                    let translate =
-                                        !protocol_matches(protocol, target.wire_protocol)
+                                    let translate = !target.kind.is_uplink()
+                                        && (!protocol_matches(protocol, target.wire_protocol)
                                             || !matches!(
                                                 emulation,
                                                 crate::tool_emulation::ToolEmulation::None
-                                            );
+                                            ));
                                     if translate {
                                         match decode_response(target.wire_protocol, &value) {
                                             Ok(mut canonical_response) => {
@@ -1444,7 +1472,9 @@ async fn proxy(
                                     }
                                 }
                             } else if let Some(protocol) = public_protocol {
-                                if !protocol_matches(protocol, target.wire_protocol) {
+                                if !target.kind.is_uplink()
+                                    && !protocol_matches(protocol, target.wire_protocol)
+                                {
                                     response_bytes = protocol_error_value(
                                         protocol,
                                         status,
@@ -1459,14 +1489,16 @@ async fn proxy(
                             }
                         } else if status.is_success()
                             && public_protocol.is_some_and(|protocol| {
-                                !protocol_matches(protocol, target.wire_protocol)
+                                !target.kind.is_uplink()
+                                    && !protocol_matches(protocol, target.wire_protocol)
                             })
                         {
                             log_request(
                             &core,
                             LogMetadata {
                                 id: &request_id,
-                                api_key_id: &api_key_id,
+                                api_key_id: caller.api_key_id(),
+                    directory_user_id: caller.directory_user_id(),
                                 endpoint: uri.path(),
                                 alias: Some(&alias),
                                 target: Some(&target.name),
@@ -1595,7 +1627,8 @@ async fn proxy(
                         &core,
                         LogMetadata {
                             id: &request_id,
-                            api_key_id: &api_key_id,
+                            api_key_id: caller.api_key_id(),
+                            directory_user_id: caller.directory_user_id(),
                             endpoint: uri.path(),
                             alias: Some(&alias),
                             target: Some(&target.name),
@@ -1700,7 +1733,8 @@ async fn proxy(
                                 &core,
                                 LogMetadata {
                                     id: &request_id,
-                                    api_key_id: &api_key_id,
+                                    api_key_id: caller.api_key_id(),
+                                    directory_user_id: caller.directory_user_id(),
                                     endpoint: uri.path(),
                                     alias: Some(&alias),
                                     target: Some(&target.name),
@@ -1799,7 +1833,8 @@ async fn proxy(
                                 &core,
                                 LogMetadata {
                                     id: &request_id,
-                                    api_key_id: &api_key_id,
+                                    api_key_id: caller.api_key_id(),
+                                    directory_user_id: caller.directory_user_id(),
                                     endpoint: uri.path(),
                                     alias: Some(&alias),
                                     target: Some(&target.name),
@@ -1829,7 +1864,8 @@ async fn proxy(
                 &core,
                 LogMetadata {
                     id: &request_id,
-                    api_key_id: &api_key_id,
+                    api_key_id: caller.api_key_id(),
+                    directory_user_id: caller.directory_user_id(),
                     endpoint: uri.path(),
                     alias: Some(&alias),
                     target: last_error_target_name.as_deref(),
@@ -2383,6 +2419,12 @@ fn with_routing_headers(
                 .insert(axum::http::HeaderName::from_static(name), value);
         }
     }
+    if crate::uplink::is_uplink_target_id(target_id) {
+        response.headers_mut().insert(
+            axum::http::HeaderName::from_static("x-local-ai-hop"),
+            HeaderValue::from_static("uplink"),
+        );
+    }
     response
 }
 
@@ -2589,7 +2631,7 @@ fn validate_local_speech_request(payload: &Value) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn authenticated_key_id(core: &AppCore, headers: &HeaderMap) -> Option<String> {
+async fn authenticated_caller(core: &AppCore, headers: &HeaderMap) -> Option<GatewayCaller> {
     let candidate = headers
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
@@ -2604,7 +2646,227 @@ async fn authenticated_key_id(core: &AppCore, headers: &HeaderMap) -> Option<Str
                 .get("x-goog-api-key")
                 .and_then(|value| value.to_str().ok())
         });
-    core.authorized_token(candidate).await
+    if let Some(id) = core.authorized_token(candidate).await {
+        return Some(GatewayCaller::LocalApiKey { id });
+    }
+    crate::uplink::authenticate_token(core, candidate)
+        .await
+        .map(GatewayCaller::Uplink)
+}
+
+#[derive(Clone)]
+enum GatewayCaller {
+    LocalApiKey { id: String },
+    Uplink(crate::uplink::UplinkCaller),
+}
+
+impl GatewayCaller {
+    fn kv_id(&self) -> String {
+        match self {
+            Self::LocalApiKey { id } => id.clone(),
+            Self::Uplink(caller) => format!("uplink:{}", caller.user_id),
+        }
+    }
+
+    fn api_key_id(&self) -> Option<&str> {
+        match self {
+            Self::LocalApiKey { id } => Some(id),
+            Self::Uplink(_) => None,
+        }
+    }
+
+    fn directory_user_id(&self) -> Option<&str> {
+        match self {
+            Self::Uplink(caller) => Some(caller.user_id.as_str()),
+            Self::LocalApiKey { .. } => None,
+        }
+    }
+}
+
+async fn hop_http_client(
+    core: &AppCore,
+    target: &crate::storage::ModelTarget,
+) -> anyhow::Result<reqwest::Client> {
+    if target.kind.is_uplink() {
+        crate::uplink::parent_http_client(&core.store).await
+    } else {
+        Ok(core.client.clone())
+    }
+}
+
+async fn filter_routes_for_caller(
+    core: &AppCore,
+    caller: &GatewayCaller,
+    routes: Vec<crate::domain::ModelRoute>,
+) -> Vec<crate::domain::ModelRoute> {
+    let GatewayCaller::Uplink(uplink) = caller else {
+        return routes;
+    };
+    let Ok(Some(user)) = core.store.directory_user(&uplink.user_id).await else {
+        return Vec::new();
+    };
+    let Ok(permissions) = core.store.permissions_for(&user).await else {
+        return Vec::new();
+    };
+    routes
+        .into_iter()
+        .filter(|route| permissions.allows_model(&route.alias))
+        .collect()
+}
+
+async fn enforce_uplink_access(
+    core: &AppCore,
+    caller: &GatewayCaller,
+    public_protocol: Option<crate::protocol::PublicProtocol>,
+    alias: &str,
+) -> Result<(), Response<Body>> {
+    let GatewayCaller::Uplink(uplink) = caller else {
+        return Ok(());
+    };
+    let user = match core.store.directory_user(&uplink.user_id).await {
+        Ok(Some(user)) => user,
+        _ => {
+            return Err(request_error(
+                public_protocol,
+                StatusCode::UNAUTHORIZED,
+                "invalid_api_key",
+                "Invalid uplink session",
+            ))
+        }
+    };
+    let Ok(permissions) = core.store.permissions_for(&user).await else {
+        return Err(request_error(
+            public_protocol,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "storage_error",
+            "Unable to read permissions",
+        ));
+    };
+    if !permissions.allows_model(alias) {
+        return Err(request_error(
+            public_protocol,
+            StatusCode::FORBIDDEN,
+            "model_not_allowed",
+            "This uplink user is not granted that model",
+        ));
+    }
+    let groups = core.store.directory_groups().await.unwrap_or_default();
+    let quota = crate::identity::effective_quota(&user, &groups);
+    let status = match crate::uplink::quota_status(&core.store, &user).await {
+        Ok(status) => status,
+        Err(_) => {
+            return Err(request_error(
+                public_protocol,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "storage_error",
+                "Unable to read uplink quota",
+            ))
+        }
+    };
+    if let Some(message) = crate::uplink::quota_rejection(&quota, &status) {
+        return Err(request_error(
+            public_protocol,
+            StatusCode::TOO_MANY_REQUESTS,
+            "uplink_quota_exceeded",
+            &message,
+        ));
+    }
+    Ok(())
+}
+
+async fn uplink_join(
+    State(state): State<GatewayState>,
+    Json(request): Json<crate::uplink::JoinRequest>,
+) -> Response<Body> {
+    match crate::uplink::accept_join(&state.core, request).await {
+        Ok(joined) => json_response(
+            StatusCode::OK,
+            serde_json::to_value(joined).unwrap_or(json!({})),
+        ),
+        Err(error) => {
+            let message = error.to_string();
+            let status = if message.contains("cycle") || message.contains("cannot join") {
+                StatusCode::CONFLICT
+            } else if message.contains("invalid") || message.contains("disabled") {
+                StatusCode::UNAUTHORIZED
+            } else {
+                StatusCode::BAD_REQUEST
+            };
+            json_response(
+                status,
+                json!({"error": {"code": "uplink_join_failed", "message": message}}),
+            )
+        }
+    }
+}
+
+async fn uplink_models(State(state): State<GatewayState>, headers: HeaderMap) -> Response<Body> {
+    let Some(GatewayCaller::Uplink(caller)) = authenticated_caller(&state.core, &headers).await
+    else {
+        return openai_error(
+            StatusCode::UNAUTHORIZED,
+            "invalid_api_key",
+            "Invalid uplink session",
+        );
+    };
+    let Ok(Some(user)) = state.core.store.directory_user(&caller.user_id).await else {
+        return openai_error(
+            StatusCode::UNAUTHORIZED,
+            "invalid_api_key",
+            "Invalid uplink session",
+        );
+    };
+    match crate::uplink::granted_models(&state.core.store, &user).await {
+        Ok(models) => {
+            let quota = crate::uplink::quota_status(&state.core.store, &user)
+                .await
+                .ok();
+            let parent_node_id = crate::uplink::node_id(&state.core.store)
+                .await
+                .unwrap_or_default();
+            json_response(
+                StatusCode::OK,
+                serde_json::to_value(crate::uplink::JoinResponse {
+                    token: String::new(),
+                    parent_node_id: parent_node_id.clone(),
+                    ancestor_node_ids: crate::uplink::load_parent(&state.core.store)
+                        .await
+                        .ok()
+                        .flatten()
+                        .map(|parent| parent.ancestor_node_ids)
+                        .unwrap_or_else(|| vec![parent_node_id]),
+                    user_id: user.id,
+                    username: user.username,
+                    models,
+                    quota: quota.unwrap_or(crate::uplink::QuotaStatus {
+                        rpm: None,
+                        rpm_used: 0,
+                        daily_token_budget: None,
+                        daily_tokens_used: 0,
+                        daily_usd_budget: None,
+                        daily_usd_used: 0.0,
+                    }),
+                })
+                .unwrap_or(json!({})),
+            )
+        }
+        Err(error) => openai_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "storage_error",
+            &error.to_string(),
+        ),
+    }
+}
+
+async fn uplink_leave(State(state): State<GatewayState>, headers: HeaderMap) -> Response<Body> {
+    let candidate = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "));
+    if let Some(token) = candidate {
+        let _ = crate::uplink::revoke_session(&state.core.store, token).await;
+    }
+    json_response(StatusCode::OK, json!({"ok": true}))
 }
 
 fn protocol_for_path(path: &str) -> Option<PublicProtocol> {
@@ -2717,7 +2979,8 @@ async fn cancelled_proxy_response(
         core,
         LogMetadata {
             id: request_id,
-            api_key_id,
+            api_key_id: (!api_key_id.starts_with("uplink:")).then_some(api_key_id),
+            directory_user_id: api_key_id.strip_prefix("uplink:"),
             endpoint,
             alias: Some(alias),
             target: target_name,
@@ -2821,7 +3084,8 @@ fn response_from_body(
 
 struct LogMetadata<'a> {
     id: &'a str,
-    api_key_id: &'a str,
+    api_key_id: Option<&'a str>,
+    directory_user_id: Option<&'a str>,
     endpoint: &'a str,
     alias: Option<&'a str>,
     target: Option<&'a str>,
@@ -2851,10 +3115,42 @@ async fn log_request(core: &AppCore, metadata: LogMetadata<'_>) {
             cache_write_tokens: metadata.usage.cache_write_tokens,
             error_code: metadata.error_code.map(str::to_owned),
             error_message: metadata.error_message.map(str::to_owned),
-            api_key_id: Some(metadata.api_key_id.into()),
+            api_key_id: metadata.api_key_id.map(str::to_owned),
             api_key_name: None,
+            directory_user_id: metadata.directory_user_id.map(str::to_owned),
+            directory_user_name: None,
+            estimated_cost_usd: estimated_logged_cost(core, metadata.target, metadata.usage).await,
         })
         .await;
+}
+
+async fn estimated_logged_cost(
+    core: &AppCore,
+    target_name: Option<&str>,
+    usage: TokenUsage,
+) -> Option<f64> {
+    if !usage.is_present() {
+        return None;
+    }
+    let target_name = target_name?;
+    let targets = core.store.targets().await.ok()?;
+    let target = targets
+        .iter()
+        .find(|target| target.name == target_name || target.id == target_name)?;
+    let profile = core
+        .store
+        .target_routing_profile(&target.id)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| crate::routing::TargetRoutingProfile::for_target(target));
+    let input = profile.input_price_per_million?;
+    let output = profile.output_price_per_million?;
+    Some(
+        (usage.input_tokens.unwrap_or(0) as f64 * input
+            + usage.output_tokens.unwrap_or(0) as f64 * output)
+            / 1_000_000.0,
+    )
 }
 
 #[cfg(test)]

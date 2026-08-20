@@ -594,6 +594,20 @@ impl AppCore {
             crate::domain::TargetKind::Alias => {
                 anyhow::bail!("alias hops must be expanded before they are served")
             }
+            crate::domain::TargetKind::Uplink => {
+                let parent = crate::uplink::load_parent(&self.store)
+                    .await?
+                    .context("not joined to an uplink")?;
+                let token = self
+                    .secrets
+                    .get(crate::uplink::TOKEN_ACCOUNT)?
+                    .context("uplink token missing")?;
+                Ok((
+                    parent.base_url.trim_end_matches('/').to_owned(),
+                    Some(token),
+                    None,
+                ))
+            }
         }
     }
 

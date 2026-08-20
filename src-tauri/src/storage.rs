@@ -140,6 +140,12 @@ pub struct RequestLog {
     pub error_message: Option<String>,
     pub api_key_id: Option<String>,
     pub api_key_name: Option<String>,
+    #[serde(default)]
+    pub directory_user_id: Option<String>,
+    #[serde(default)]
+    pub directory_user_name: Option<String>,
+    #[serde(default)]
+    pub estimated_cost_usd: Option<f64>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -428,6 +434,22 @@ impl Store {
                 .await?;
             }
         }
+        if !log_columns
+            .iter()
+            .any(|column| column.get::<String, _>("name") == "directory_user_id")
+        {
+            sqlx::query("ALTER TABLE request_logs ADD COLUMN directory_user_id TEXT")
+                .execute(&self.pool)
+                .await?;
+        }
+        if !log_columns
+            .iter()
+            .any(|column| column.get::<String, _>("name") == "estimated_cost_usd")
+        {
+            sqlx::query("ALTER TABLE request_logs ADD COLUMN estimated_cost_usd REAL")
+                .execute(&self.pool)
+                .await?;
+        }
         let provider_columns = sqlx::query("PRAGMA table_info(providers)")
             .fetch_all(&self.pool)
             .await?;
@@ -536,7 +558,11 @@ impl Store {
         sqlx::query("CREATE INDEX IF NOT EXISTS request_logs_api_key_idx ON request_logs(api_key_id, created_at DESC)")
             .execute(&self.pool)
             .await?;
+        sqlx::query("CREATE INDEX IF NOT EXISTS request_logs_user_idx ON request_logs(directory_user_id, created_at DESC)")
+            .execute(&self.pool)
+            .await?;
         crate::identity::migrate(&self.pool).await?;
+        crate::uplink::migrate(&self.pool).await?;
         self.set_default("port", "11435").await?;
         self.set_default("bind_mode", "loopback").await?;
         self.set_default("memory_budget_percent", "70").await?;
@@ -1270,10 +1296,11 @@ impl Store {
     }
 
     pub async fn insert_log(&self, log: &RequestLog) -> anyhow::Result<()> {
-        sqlx::query("INSERT INTO request_logs(id,created_at,endpoint,alias,target,attempts,status,latency_ms,input_tokens,output_tokens,cache_read_tokens,cache_write_tokens,error_code,error_message,api_key_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
+        sqlx::query("INSERT INTO request_logs(id,created_at,endpoint,alias,target,attempts,status,latency_ms,input_tokens,output_tokens,cache_read_tokens,cache_write_tokens,error_code,error_message,api_key_id,directory_user_id,estimated_cost_usd) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
             .bind(&log.id).bind(log.created_at.to_rfc3339()).bind(&log.endpoint).bind(&log.alias).bind(&log.target)
             .bind(log.attempts).bind(log.status).bind(log.latency_ms).bind(log.input_tokens).bind(log.output_tokens)
             .bind(log.cache_read_tokens).bind(log.cache_write_tokens).bind(&log.error_code).bind(&log.error_message).bind(&log.api_key_id)
+            .bind(&log.directory_user_id).bind(log.estimated_cost_usd)
             .execute(&self.pool).await?;
         Ok(())
     }
@@ -1291,7 +1318,7 @@ impl Store {
     }
 
     pub async fn logs(&self, limit: i64) -> anyhow::Result<Vec<RequestLog>> {
-        let rows = sqlx::query("SELECT l.*,k.name AS api_key_name FROM request_logs l LEFT JOIN local_api_keys k ON k.id=l.api_key_id ORDER BY l.created_at DESC LIMIT ?")
+        let rows = sqlx::query("SELECT l.*,k.name AS api_key_name,u.username AS directory_user_name FROM request_logs l LEFT JOIN local_api_keys k ON k.id=l.api_key_id LEFT JOIN directory_users u ON u.id=l.directory_user_id ORDER BY l.created_at DESC LIMIT ?")
             .bind(limit.clamp(1, 1000))
             .fetch_all(&self.pool)
             .await?;
@@ -1306,7 +1333,7 @@ impl Store {
         let total: i64 = count.build_query_scalar().fetch_one(&self.pool).await?;
 
         let mut select = QueryBuilder::<Sqlite>::new(
-            "SELECT l.*,k.name AS api_key_name FROM request_logs l LEFT JOIN local_api_keys k ON k.id=l.api_key_id",
+            "SELECT l.*,k.name AS api_key_name,u.username AS directory_user_name FROM request_logs l LEFT JOIN local_api_keys k ON k.id=l.api_key_id LEFT JOIN directory_users u ON u.id=l.directory_user_id",
         );
         push_log_filters(&mut select, query);
         select
@@ -2122,6 +2149,18 @@ fn row_to_request_log(row: sqlx::sqlite::SqliteRow) -> anyhow::Result<RequestLog
             }
         })),
         api_key_id,
+        directory_user_id: row
+            .try_get::<Option<String>, _>("directory_user_id")
+            .ok()
+            .flatten(),
+        directory_user_name: row
+            .try_get::<Option<String>, _>("directory_user_name")
+            .ok()
+            .flatten(),
+        estimated_cost_usd: row
+            .try_get::<Option<f64>, _>("estimated_cost_usd")
+            .ok()
+            .flatten(),
     })
 }
 
@@ -2244,6 +2283,7 @@ pub fn encode_kind(kind: &TargetKind) -> &'static str {
         TargetKind::Gguf => "gguf",
         TargetKind::Mlx => "mlx",
         TargetKind::Alias => "alias",
+        TargetKind::Uplink => "uplink",
     }
 }
 
@@ -2253,6 +2293,7 @@ pub fn decode_kind(value: &str) -> anyhow::Result<TargetKind> {
         "gguf" => Ok(TargetKind::Gguf),
         "mlx" => Ok(TargetKind::Mlx),
         "alias" => Ok(TargetKind::Alias),
+        "uplink" => Ok(TargetKind::Uplink),
         _ => anyhow::bail!("unknown target kind: {value}"),
     }
 }
@@ -2622,6 +2663,9 @@ mod tests {
                 error_message: None,
                 api_key_id: None,
                 api_key_name: None,
+                directory_user_id: None,
+                directory_user_name: None,
+                estimated_cost_usd: None,
             })
             .await
             .unwrap();
@@ -2666,6 +2710,9 @@ mod tests {
                 error_message: None,
                 api_key_id: None,
                 api_key_name: None,
+                directory_user_id: None,
+                directory_user_name: None,
+                estimated_cost_usd: None,
             })
             .await
             .unwrap();
@@ -2701,6 +2748,9 @@ mod tests {
                 error_message: Some("provider failed".into()),
                 api_key_id: Some("client-one".into()),
                 api_key_name: None,
+                directory_user_id: None,
+                directory_user_name: None,
+                estimated_cost_usd: None,
             })
             .await
             .unwrap();
@@ -2769,6 +2819,9 @@ mod tests {
                     error_message: None,
                     api_key_id: None,
                     api_key_name: None,
+                    directory_user_id: None,
+                    directory_user_name: None,
+                    estimated_cost_usd: None,
                 })
                 .await
                 .unwrap();
@@ -2827,6 +2880,9 @@ mod tests {
                     error_message: None,
                     api_key_id: Some(api_key_id.into()),
                     api_key_name: None,
+                    directory_user_id: None,
+                    directory_user_name: None,
+                    estimated_cost_usd: None,
                 }
             };
         store
@@ -3192,6 +3248,9 @@ mod tests {
             error_message: None,
             api_key_id: None,
             api_key_name: None,
+            directory_user_id: None,
+            directory_user_name: None,
+            estimated_cost_usd: None,
         };
         store
             .insert_log(&log(

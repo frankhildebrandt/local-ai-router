@@ -5,6 +5,7 @@ import type {
   ModelMetadata, ModelRoute, ModelTarget, Provider, ProviderModel, ProviderPreset, PublicModel,
   ResourcePolicy, RoutingAttempt, RoutingConfigExport, RoutingPolicy, RoutingTaskDefinition,
   SearchPage, TargetRoutingProfile, UsageData, AuthStatus, DirectoryGroup, DirectoryUser, OidcAllowlistEntry,
+  UplinkParent,
 } from "./types";
 
 export function createQueryClient() {
@@ -47,6 +48,7 @@ export const queryKeys = {
   directoryUsers: ["directory-users"] as const,
   directoryGroups: ["directory-groups"] as const,
   oidcAllowlist: ["oidc-allowlist"] as const,
+  uplink: ["uplink"] as const,
 };
 
 export function invalidateAppQueries(client: QueryClient) {
@@ -107,4 +109,5 @@ export const fetchers = {
   directoryUsers: () => command<DirectoryUser[]>("list_directory_users"),
   directoryGroups: () => command<DirectoryGroup[]>("list_directory_groups"),
   oidcAllowlist: () => command<OidcAllowlistEntry[]>("list_oidc_allowlist"),
+  uplinkStatus: () => command<UplinkParent | null>("uplink_status"),
 };

@@ -7,8 +7,14 @@ use std::{
 
 use anyhow::Context;
 use rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair, SanType};
-use rustls::ServerConfig;
+use rustls::{
+    client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
+    crypto::{verify_tls12_signature, verify_tls13_signature, CryptoProvider},
+    pki_types::{CertificateDer, ServerName, UnixTime},
+    ClientConfig, DigitallySignedStruct, ServerConfig, SignatureScheme,
+};
 use sha2::{Digest, Sha256};
+use subtle::ConstantTimeEq;
 
 #[derive(Debug, Clone)]
 pub struct TlsMaterial {
@@ -77,7 +83,9 @@ pub fn generate_self_signed_for(extra_ips: &[IpAddr]) -> anyhow::Result<TlsMater
     let mut sans = vec![
         SanType::DnsName("localhost".try_into()?),
         SanType::IpAddress(IpAddr::from([127, 0, 0, 1])),
-        SanType::IpAddress(IpAddr::from([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1])),
+        SanType::IpAddress(IpAddr::from([
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+        ])),
     ];
     for ip in extra_ips {
         if !ip.is_unspecified() && !ip.is_loopback() {
@@ -151,6 +159,92 @@ pub fn format_fingerprint(digest: &[u8]) -> String {
         .join(":")
 }
 
+pub fn parse_fingerprint(value: &str) -> anyhow::Result<[u8; 32]> {
+    let hex: String = value
+        .chars()
+        .filter(|ch| ch.is_ascii_hexdigit())
+        .collect::<String>()
+        .to_ascii_lowercase();
+    anyhow::ensure!(hex.len() == 64, "TLS fingerprint must be a SHA-256 digest");
+    let mut digest = [0u8; 32];
+    for (index, chunk) in hex.as_bytes().chunks(2).enumerate() {
+        digest[index] = u8::from_str_radix(std::str::from_utf8(chunk)?, 16)
+            .context("TLS fingerprint is not valid hex")?;
+    }
+    Ok(digest)
+}
+
+pub fn pinned_client_config(fingerprint: &str) -> anyhow::Result<ClientConfig> {
+    let expected = parse_fingerprint(fingerprint)?;
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let mut config = ClientConfig::builder_with_provider(provider.clone())
+        .with_safe_default_protocol_versions()
+        .context("building pinned TLS client")?
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(FingerprintVerifier { expected, provider }))
+        .with_no_client_auth();
+    config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    Ok(config)
+}
+
+#[derive(Debug)]
+struct FingerprintVerifier {
+    expected: [u8; 32],
+    provider: Arc<CryptoProvider>,
+}
+
+impl ServerCertVerifier for FingerprintVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: UnixTime,
+    ) -> Result<ServerCertVerified, rustls::Error> {
+        let digest = Sha256::digest(end_entity.as_ref());
+        if bool::from(digest.ct_eq(&self.expected)) {
+            Ok(ServerCertVerified::assertion())
+        } else {
+            Err(rustls::Error::General("TLS fingerprint mismatch".into()))
+        }
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.provider
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
+}
+
 pub struct TlsListener {
     listener: tokio::net::TcpListener,
     acceptor: tokio_rustls::TlsAcceptor,
@@ -216,7 +310,10 @@ pub fn bind_config(mode: &str, address: Option<&str>) -> anyhow::Result<BindConf
 }
 
 pub fn user_cert_paths(cert: Option<&str>, key: Option<&str>) -> Option<(PathBuf, PathBuf)> {
-    match (cert.filter(|value| !value.is_empty()), key.filter(|value| !value.is_empty())) {
+    match (
+        cert.filter(|value| !value.is_empty()),
+        key.filter(|value| !value.is_empty()),
+    ) {
         (Some(cert), Some(key)) => Some((PathBuf::from(cert), PathBuf::from(key))),
         _ => None,
     }
@@ -239,7 +336,11 @@ mod tests {
         let config = bind_config("address", Some("192.168.1.10")).unwrap();
         assert_eq!(config.ip.to_string(), "192.168.1.10");
         assert!(config.tls_required);
-        assert!(!bind_config("address", Some("127.0.0.1")).unwrap().tls_required);
+        assert!(
+            !bind_config("address", Some("127.0.0.1"))
+                .unwrap()
+                .tls_required
+        );
     }
 
     #[test]
@@ -248,7 +349,22 @@ mod tests {
         assert!(material.cert_pem.contains("BEGIN CERTIFICATE"));
         assert!(material.key_pem.contains("BEGIN"));
         assert_eq!(material.fingerprint.matches(':').count(), 31);
-        assert_eq!(fingerprint_pem(&material.cert_pem).unwrap(), material.fingerprint);
+        assert_eq!(
+            fingerprint_pem(&material.cert_pem).unwrap(),
+            material.fingerprint
+        );
+        assert_eq!(
+            parse_fingerprint(&material.fingerprint).unwrap().as_slice(),
+            Sha256::digest(
+                rustls_pemfile::certs(&mut material.cert_pem.as_bytes())
+                    .next()
+                    .unwrap()
+                    .unwrap()
+                    .as_ref()
+            )
+            .as_slice()
+        );
+        assert!(parse_fingerprint("not-a-fingerprint").is_err());
         material.server_config().unwrap();
     }
 

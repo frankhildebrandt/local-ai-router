@@ -352,9 +352,7 @@ impl RuntimeManager {
                 TargetKind::Mlx => "mlx_chat",
                 _ => "cloud",
             });
-        let binary = self
-            .bin_dir
-            .join(sidecar_binary_name(engine, target.kind)?);
+        let binary = self.bin_dir.join(sidecar_binary_name(engine, target.kind)?);
         if !binary.exists() {
             anyhow::bail!("runtime sidecar missing: {}", binary.display());
         }
