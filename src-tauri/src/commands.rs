@@ -2,7 +2,6 @@ use std::{collections::HashSet, path::PathBuf, sync::Arc};
 
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
-use tauri::State;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -30,6 +29,7 @@ use crate::{
     },
 };
 
+#[derive(Clone)]
 pub struct AppServices {
     pub core: Arc<AppCore>,
     pub runtimes: Arc<RuntimeManager>,
@@ -137,8 +137,7 @@ fn provider_model_from_discovery(
     }
 }
 
-#[tauri::command]
-pub async fn dashboard(state: State<'_, AppServices>) -> Result<Dashboard, String> {
+pub async fn dashboard(state: &AppServices) -> Result<Dashboard, String> {
     let providers = state.core.providers_with_credentials().await.map_err(err)?;
     let targets = state.core.store.targets().await.map_err(err)?;
     let routes = state.core.store.routes().await.map_err(err)?;
@@ -171,42 +170,29 @@ pub async fn dashboard(state: State<'_, AppServices>) -> Result<Dashboard, Strin
     })
 }
 
-#[tauri::command]
-pub async fn cancel_inflight_request(
-    state: State<'_, AppServices>,
-    id: String,
-) -> Result<(), String> {
+pub async fn cancel_inflight_request(state: &AppServices, id: String) -> Result<(), String> {
     state.core.traffic.cancel(&id);
     Ok(())
 }
 
-#[tauri::command]
-pub async fn cancel_all_inflight_requests(state: State<'_, AppServices>) -> Result<(), String> {
+pub async fn cancel_all_inflight_requests(state: &AppServices) -> Result<(), String> {
     state.core.traffic.cancel_all();
     Ok(())
 }
 
-#[tauri::command]
-pub async fn list_local_api_keys(
-    state: State<'_, AppServices>,
-) -> Result<Vec<LocalApiKey>, String> {
+pub async fn list_local_api_keys(state: &AppServices) -> Result<Vec<LocalApiKey>, String> {
     state.core.store.local_api_keys().await.map_err(err)
 }
 
-#[tauri::command]
 pub async fn create_local_api_key(
-    state: State<'_, AppServices>,
+    state: &AppServices,
     name: String,
 ) -> Result<LocalApiKeyWithToken, String> {
     let (key, token) = state.core.create_local_api_key(&name).await.map_err(err)?;
     Ok(LocalApiKeyWithToken { key, token })
 }
 
-#[tauri::command]
-pub async fn reveal_local_api_key(
-    state: State<'_, AppServices>,
-    id: String,
-) -> Result<String, String> {
+pub async fn reveal_local_api_key(state: &AppServices, id: String) -> Result<String, String> {
     let key = state
         .core
         .store
@@ -220,9 +206,8 @@ pub async fn reveal_local_api_key(
     state.core.reveal_local_api_key(&id).map_err(err)
 }
 
-#[tauri::command]
 pub async fn rename_local_api_key(
-    state: State<'_, AppServices>,
+    state: &AppServices,
     id: String,
     name: String,
 ) -> Result<LocalApiKey, String> {
@@ -233,22 +218,16 @@ pub async fn rename_local_api_key(
         .map_err(err)
 }
 
-#[tauri::command]
-pub async fn rotate_local_api_key(
-    state: State<'_, AppServices>,
-    id: String,
-) -> Result<String, String> {
+pub async fn rotate_local_api_key(state: &AppServices, id: String) -> Result<String, String> {
     state.core.rotate_local_api_key(&id).await.map_err(err)
 }
 
-#[tauri::command]
-pub async fn revoke_local_api_key(state: State<'_, AppServices>, id: String) -> Result<(), String> {
+pub async fn revoke_local_api_key(state: &AppServices, id: String) -> Result<(), String> {
     state.core.revoke_local_api_key(&id).await.map_err(err)
 }
 
-#[tauri::command]
 pub async fn client_chat(
-    state: State<'_, AppServices>,
+    state: &AppServices,
     input: ClientChatInput,
 ) -> Result<ClientChatResponse, String> {
     let model = input.model.trim();
@@ -328,19 +307,16 @@ pub async fn client_chat(
     })
 }
 
-#[tauri::command]
-pub async fn list_providers(state: State<'_, AppServices>) -> Result<Vec<Provider>, String> {
+pub async fn list_providers(state: &AppServices) -> Result<Vec<Provider>, String> {
     state.core.providers_with_credentials().await.map_err(err)
 }
 
-#[tauri::command]
 pub fn list_provider_presets() -> Vec<ProviderPreset> {
     provider_presets()
 }
 
-#[tauri::command]
 pub async fn save_provider(
-    state: State<'_, AppServices>,
+    state: &AppServices,
     input: SaveProviderInput,
 ) -> Result<Provider, String> {
     let preset = provider_preset(&input.preset_id).ok_or("unknown provider preset")?;
@@ -404,9 +380,8 @@ pub async fn save_provider(
     Ok(provider)
 }
 
-#[tauri::command]
 pub async fn test_provider_connection(
-    state: State<'_, AppServices>,
+    state: &AppServices,
     id: String,
 ) -> Result<Vec<String>, String> {
     let provider = state
@@ -428,9 +403,8 @@ pub async fn test_provider_connection(
         .map_err(err)
 }
 
-#[tauri::command]
 pub async fn begin_openai_subscription(
-    state: State<'_, AppServices>,
+    state: &AppServices,
     id: String,
 ) -> Result<crate::oauth::OAuthStart, String> {
     let provider = state
@@ -446,24 +420,18 @@ pub async fn begin_openai_subscription(
     state.core.oauth.begin(&id).await.map_err(err)
 }
 
-#[tauri::command]
 pub async fn openai_subscription_status(
-    state: State<'_, AppServices>,
+    state: &AppServices,
     id: String,
 ) -> Result<crate::oauth::OAuthStatus, String> {
     state.core.oauth.status(&id).await.map_err(err)
 }
 
-#[tauri::command]
-pub async fn logout_openai_subscription(
-    state: State<'_, AppServices>,
-    id: String,
-) -> Result<(), String> {
+pub async fn logout_openai_subscription(state: &AppServices, id: String) -> Result<(), String> {
     state.core.oauth.logout(&id).await.map_err(err)
 }
 
-#[tauri::command]
-pub async fn delete_provider(state: State<'_, AppServices>, id: String) -> Result<(), String> {
+pub async fn delete_provider(state: &AppServices, id: String) -> Result<(), String> {
     state.core.store.delete_provider(&id).await.map_err(err)?;
     state
         .core
@@ -472,9 +440,8 @@ pub async fn delete_provider(state: State<'_, AppServices>, id: String) -> Resul
         .map_err(err)
 }
 
-#[tauri::command]
 pub async fn sync_provider_models(
-    state: State<'_, AppServices>,
+    state: &AppServices,
     id: String,
 ) -> Result<Vec<ProviderModel>, String> {
     let provider = state
@@ -518,9 +485,8 @@ pub async fn sync_provider_models(
     Ok(models)
 }
 
-#[tauri::command]
 pub async fn cached_provider_models(
-    state: State<'_, AppServices>,
+    state: &AppServices,
     id: String,
 ) -> Result<Vec<ProviderModel>, String> {
     state.core.store.provider_models(&id).await.map_err(err)
@@ -583,9 +549,8 @@ fn civitai_http(state: &AppServices) -> Result<(reqwest::Client, Option<String>)
     ))
 }
 
-#[tauri::command]
 pub async fn list_local_catalog(
-    state: State<'_, AppServices>,
+    state: &AppServices,
 ) -> Result<crate::catalog::LocalCatalog, String> {
     let (percent, budget) = budget_from_store(&state.core.store).await.map_err(err)?;
     Ok(crate::catalog::LocalCatalog {
@@ -596,14 +561,13 @@ pub async fn list_local_catalog(
     })
 }
 
-#[tauri::command]
 pub async fn search_mlx_catalog(
-    state: State<'_, AppServices>,
+    state: &AppServices,
     input: SearchCatalogInput,
 ) -> Result<crate::hub::SearchPage, String> {
     let (_, budget) = budget_from_store(&state.core.store).await.map_err(err)?;
     if crate::civitai::CivitaiHost::parse(input.source.as_deref().unwrap_or("")).is_some() {
-        let (http, token) = civitai_http(&state)?;
+        let (http, token) = civitai_http(state)?;
         return crate::civitai::search(
             http,
             token,
@@ -614,7 +578,7 @@ pub async fn search_mlx_catalog(
         .await
         .map_err(err);
     }
-    hub_client(&state)
+    hub_client(state)
         .await?
         .search(
             input.query.as_deref().unwrap_or(""),
@@ -625,29 +589,27 @@ pub async fn search_mlx_catalog(
         .map_err(err)
 }
 
-#[tauri::command]
 pub async fn inspect_mlx_model(
-    state: State<'_, AppServices>,
+    state: &AppServices,
     input: InspectModelInput,
 ) -> Result<crate::hub::ModelInspection, String> {
     let (_, budget) = budget_from_store(&state.core.store).await.map_err(err)?;
     if crate::civitai::is_civitai_repo(&input.repo_id) {
-        let (http, token) = civitai_http(&state)?;
+        let (http, token) = civitai_http(state)?;
         return crate::civitai::inspect(http, token, &input.repo_id, budget)
             .await
             .map_err(err);
     }
     let has_token = state.core.secrets.get(HF_ACCOUNT).map_err(err)?.is_some();
-    hub_client(&state)
+    hub_client(state)
         .await?
         .inspect(&input.repo_id, input.revision.as_deref(), budget, has_token)
         .await
         .map_err(err)
 }
 
-#[tauri::command]
 pub async fn install_catalog_model(
-    state: State<'_, AppServices>,
+    state: &AppServices,
     input: InstallCatalogInput,
 ) -> Result<crate::storage::InstallJob, String> {
     let (_, budget) = budget_from_store(&state.core.store).await.map_err(err)?;
@@ -664,13 +626,13 @@ pub async fn install_catalog_model(
         }
     }
     let inspection = if crate::civitai::is_civitai_repo(&input.repo_id) {
-        let (http, token) = civitai_http(&state)?;
+        let (http, token) = civitai_http(state)?;
         crate::civitai::inspect(http, token, &input.repo_id, budget)
             .await
             .map_err(err)?
     } else {
         let has_token = state.core.secrets.get(HF_ACCOUNT).map_err(err)?.is_some();
-        hub_client(&state)
+        hub_client(state)
             .await?
             .inspect(&input.repo_id, input.revision.as_deref(), budget, has_token)
             .await
@@ -728,44 +690,38 @@ pub async fn install_catalog_model(
         .map_err(err)
 }
 
-#[tauri::command]
 pub async fn list_install_jobs(
-    state: State<'_, AppServices>,
+    state: &AppServices,
 ) -> Result<Vec<crate::storage::InstallJob>, String> {
     state.install.list().await.map_err(err)
 }
 
-#[tauri::command]
 pub async fn pause_install_job(
-    state: State<'_, AppServices>,
+    state: &AppServices,
     id: String,
 ) -> Result<crate::storage::InstallJob, String> {
     state.install.pause(&id).await.map_err(err)
 }
 
-#[tauri::command]
 pub async fn resume_install_job(
-    state: State<'_, AppServices>,
+    state: &AppServices,
     id: String,
 ) -> Result<crate::storage::InstallJob, String> {
     state.install.resume(&id).await.map_err(err)
 }
 
-#[tauri::command]
 pub async fn cancel_install_job(
-    state: State<'_, AppServices>,
+    state: &AppServices,
     id: String,
 ) -> Result<crate::storage::InstallJob, String> {
     state.install.cancel(&id).await.map_err(err)
 }
 
-#[tauri::command]
-pub async fn clear_install_job(state: State<'_, AppServices>, id: String) -> Result<(), String> {
+pub async fn clear_install_job(state: &AppServices, id: String) -> Result<(), String> {
     state.install.clear(&id).await.map_err(err)
 }
 
-#[tauri::command]
-pub async fn list_targets(state: State<'_, AppServices>) -> Result<Vec<ModelTarget>, String> {
+pub async fn list_targets(state: &AppServices) -> Result<Vec<ModelTarget>, String> {
     state.core.store.targets().await.map_err(err)
 }
 
@@ -830,23 +786,17 @@ async fn persist_target(store: &Store, mut target: ModelTarget) -> Result<ModelT
     Ok(target)
 }
 
-#[tauri::command]
 pub async fn lookup_model_metadata(
     model: String,
 ) -> Result<crate::model_catalog::ModelMetadata, String> {
     Ok(crate::model_catalog::resolve_model_metadata(&model, None))
 }
 
-#[tauri::command]
-pub async fn save_target(
-    state: State<'_, AppServices>,
-    target: ModelTarget,
-) -> Result<ModelTarget, String> {
+pub async fn save_target(state: &AppServices, target: ModelTarget) -> Result<ModelTarget, String> {
     persist_target(&state.core.store, target).await
 }
 
-#[tauri::command]
-pub async fn delete_target(state: State<'_, AppServices>, id: String) -> Result<(), String> {
+pub async fn delete_target(state: &AppServices, id: String) -> Result<(), String> {
     let dependents: Vec<String> = state
         .core
         .store
@@ -872,15 +822,14 @@ pub async fn delete_target(state: State<'_, AppServices>, id: String) -> Result<
     Ok(())
 }
 
-#[tauri::command]
 pub async fn import_local_model(
-    state: State<'_, AppServices>,
+    state: &AppServices,
     input: ImportModelInput,
 ) -> Result<ModelTarget, String> {
     let imported = library::import_model(
         PathBuf::from(&input.source).as_path(),
         &state.model_library,
-        input.kind.clone(),
+        input.kind,
     )
     .await
     .map_err(err)?;
@@ -902,9 +851,8 @@ pub async fn import_local_model(
     persist_target(&state.core.store, target).await
 }
 
-#[tauri::command]
 pub async fn download_local_model(
-    state: State<'_, AppServices>,
+    state: &AppServices,
     input: DownloadModelInput,
 ) -> Result<ModelTarget, String> {
     let imported = library::download_hugging_face(
@@ -913,7 +861,7 @@ pub async fn download_local_model(
         &input.repo_id,
         input.filename.as_deref(),
         &state.model_library,
-        input.kind.clone(),
+        input.kind,
     )
     .await
     .map_err(err)?;
@@ -935,11 +883,7 @@ pub async fn download_local_model(
     persist_target(&state.core.store, target).await
 }
 
-#[tauri::command]
-pub async fn start_local_model(
-    state: State<'_, AppServices>,
-    id: String,
-) -> Result<ModelTarget, String> {
+pub async fn start_local_model(state: &AppServices, id: String) -> Result<ModelTarget, String> {
     let mut target = state
         .core
         .store
@@ -974,11 +918,7 @@ pub async fn start_local_model(
     Ok(target)
 }
 
-#[tauri::command]
-pub async fn stop_local_model(
-    state: State<'_, AppServices>,
-    id: String,
-) -> Result<ModelTarget, String> {
+pub async fn stop_local_model(state: &AppServices, id: String) -> Result<ModelTarget, String> {
     state.runtimes.stop(&id).await.map_err(err)?;
     let mut target = state
         .core
@@ -993,25 +933,19 @@ pub async fn stop_local_model(
     Ok(target)
 }
 
-#[tauri::command]
-pub async fn list_routes(state: State<'_, AppServices>) -> Result<Vec<ModelRoute>, String> {
+pub async fn list_routes(state: &AppServices) -> Result<Vec<ModelRoute>, String> {
     state.core.store.routes().await.map_err(err)
 }
 
-#[tauri::command]
 pub async fn list_public_models(
-    state: State<'_, AppServices>,
+    state: &AppServices,
 ) -> Result<Vec<crate::public_models::PublicModel>, String> {
     crate::public_models::list_public_models(&state.core.store)
         .await
         .map_err(err)
 }
 
-#[tauri::command]
-pub async fn save_route(
-    state: State<'_, AppServices>,
-    mut route: ModelRoute,
-) -> Result<ModelRoute, String> {
+pub async fn save_route(state: &AppServices, mut route: ModelRoute) -> Result<ModelRoute, String> {
     if route.alias.trim().is_empty() || route.alias.contains(char::is_whitespace) {
         return Err("alias must be non-empty and contain no whitespace".into());
     }
@@ -1077,21 +1011,16 @@ pub async fn save_route(
     Ok(route)
 }
 
-#[tauri::command]
-pub async fn delete_route(state: State<'_, AppServices>, alias: String) -> Result<(), String> {
+pub async fn delete_route(state: &AppServices, alias: String) -> Result<(), String> {
     state.core.store.delete_route(&alias).await.map_err(err)
 }
 
-#[tauri::command]
-pub async fn list_routing_policies(
-    state: State<'_, AppServices>,
-) -> Result<Vec<RoutingPolicy>, String> {
+pub async fn list_routing_policies(state: &AppServices) -> Result<Vec<RoutingPolicy>, String> {
     state.core.store.routing_policies().await.map_err(err)
 }
 
-#[tauri::command]
 pub async fn save_routing_policy(
-    state: State<'_, AppServices>,
+    state: &AppServices,
     policy: RoutingPolicy,
 ) -> Result<RoutingPolicy, String> {
     let route = state
@@ -1138,9 +1067,8 @@ async fn prune_route_policy(store: &Store, route: &ModelRoute) -> Result<(), Str
     Ok(())
 }
 
-#[tauri::command]
 pub async fn list_target_routing_profiles(
-    state: State<'_, AppServices>,
+    state: &AppServices,
 ) -> Result<Vec<TargetRoutingProfile>, String> {
     state
         .core
@@ -1150,9 +1078,8 @@ pub async fn list_target_routing_profiles(
         .map_err(err)
 }
 
-#[tauri::command]
 pub async fn save_target_routing_profile(
-    state: State<'_, AppServices>,
+    state: &AppServices,
     profile: TargetRoutingProfile,
 ) -> Result<TargetRoutingProfile, String> {
     if state
@@ -1196,18 +1123,14 @@ pub async fn save_target_routing_profile(
     Ok(profile)
 }
 
-#[tauri::command]
-pub async fn list_routing_tasks(
-    state: State<'_, AppServices>,
-) -> Result<Vec<RoutingTaskDefinition>, String> {
+pub async fn list_routing_tasks(state: &AppServices) -> Result<Vec<RoutingTaskDefinition>, String> {
     let mut tasks = builtin_tasks();
     tasks.extend(state.core.store.custom_routing_tasks().await.map_err(err)?);
     Ok(tasks)
 }
 
-#[tauri::command]
 pub async fn save_routing_task(
-    state: State<'_, AppServices>,
+    state: &AppServices,
     mut task: RoutingTaskDefinition,
 ) -> Result<RoutingTaskDefinition, String> {
     task.id = task
@@ -1239,8 +1162,7 @@ pub async fn save_routing_task(
     Ok(task)
 }
 
-#[tauri::command]
-pub async fn delete_routing_task(state: State<'_, AppServices>, id: String) -> Result<(), String> {
+pub async fn delete_routing_task(state: &AppServices, id: String) -> Result<(), String> {
     if builtin_tasks().iter().any(|task| task.id == id) {
         return Err("built-in routing tasks cannot be deleted".into());
     }
@@ -1283,9 +1205,8 @@ pub struct RoutingSimulationInput {
     pub max_output_tokens: Option<u64>,
 }
 
-#[tauri::command]
 pub async fn simulate_routing(
-    state: State<'_, AppServices>,
+    state: &AppServices,
     input: RoutingSimulationInput,
 ) -> Result<crate::routing::RoutingEvaluation, String> {
     let resolved = crate::public_models::resolve_public_model(&state.core.store, &input.alias)
@@ -1366,9 +1287,8 @@ pub async fn simulate_routing(
     .map_err(err)
 }
 
-#[tauri::command]
 pub async fn list_routing_attempts(
-    state: State<'_, AppServices>,
+    state: &AppServices,
     request_id: Option<String>,
     limit: Option<i64>,
 ) -> Result<Vec<RoutingAttemptRecord>, String> {
@@ -1380,10 +1300,7 @@ pub async fn list_routing_attempts(
         .map_err(err)
 }
 
-#[tauri::command]
-pub async fn export_routing_config(
-    state: State<'_, AppServices>,
-) -> Result<RoutingConfigExport, String> {
+pub async fn export_routing_config(state: &AppServices) -> Result<RoutingConfigExport, String> {
     Ok(RoutingConfigExport {
         schema: "local-ai-router/routing-policy/v1".into(),
         tasks: state.core.store.custom_routing_tasks().await.map_err(err)?,
@@ -1406,9 +1323,8 @@ pub struct RoutingImportPreview {
     pub warnings: Vec<String>,
 }
 
-#[tauri::command]
 pub async fn import_routing_config(
-    state: State<'_, AppServices>,
+    state: &AppServices,
     config: RoutingConfigExport,
     apply: bool,
 ) -> Result<RoutingImportPreview, String> {
@@ -1506,11 +1422,7 @@ pub async fn import_routing_config(
     })
 }
 
-#[tauri::command]
-pub async fn list_logs(
-    state: State<'_, AppServices>,
-    query: Option<LogQuery>,
-) -> Result<LogResult, String> {
+pub async fn list_logs(state: &AppServices, query: Option<LogQuery>) -> Result<LogResult, String> {
     state
         .core
         .store
@@ -1519,9 +1431,8 @@ pub async fn list_logs(
         .map_err(err)
 }
 
-#[tauri::command]
 pub async fn get_usage(
-    state: State<'_, AppServices>,
+    state: &AppServices,
     period: String,
     target: Option<String>,
 ) -> Result<UsageData, String> {
@@ -1533,9 +1444,8 @@ pub async fn get_usage(
         .map_err(err)
 }
 
-#[tauri::command]
 pub async fn get_key_usage(
-    state: State<'_, AppServices>,
+    state: &AppServices,
     id: String,
     period: String,
 ) -> Result<KeyUsageData, String> {
@@ -1547,26 +1457,26 @@ pub async fn get_key_usage(
         .map_err(err)
 }
 
-#[tauri::command]
-pub async fn get_log_facets(state: State<'_, AppServices>) -> Result<LogFacets, String> {
+pub async fn get_log_facets(state: &AppServices) -> Result<LogFacets, String> {
     state.core.store.log_facets().await.map_err(err)
 }
 
-#[tauri::command]
-pub async fn clear_logs(state: State<'_, AppServices>) -> Result<(), String> {
+pub async fn clear_logs(state: &AppServices) -> Result<(), String> {
     state.core.store.clear_logs().await.map_err(err)
 }
 
-#[tauri::command]
 pub async fn export_logs_csv(
-    state: State<'_, AppServices>,
-    path: String,
+    state: &AppServices,
+    path: Option<String>,
     query: Option<LogQuery>,
-) -> Result<(), String> {
+) -> Result<String, String> {
     let csv = logs_csv(&state.core.store, query.unwrap_or_default())
         .await
         .map_err(err)?;
-    tokio::fs::write(path, csv).await.map_err(err)
+    if let Some(path) = path.filter(|value| !value.is_empty()) {
+        tokio::fs::write(path, &csv).await.map_err(err)?;
+    }
+    Ok(csv)
 }
 
 async fn logs_csv(store: &Store, mut query: LogQuery) -> anyhow::Result<String> {
@@ -1619,9 +1529,8 @@ async fn logs_csv(store: &Store, mut query: LogQuery) -> anyhow::Result<String> 
     Ok(csv)
 }
 
-#[tauri::command]
 pub async fn get_settings(
-    state: State<'_, AppServices>,
+    state: &AppServices,
 ) -> Result<std::collections::HashMap<String, String>, String> {
     let mut result = std::collections::HashMap::new();
     for key in [
@@ -1657,12 +1566,7 @@ pub async fn get_settings(
     Ok(result)
 }
 
-#[tauri::command]
-pub async fn save_setting(
-    state: State<'_, AppServices>,
-    key: String,
-    value: String,
-) -> Result<(), String> {
+pub async fn save_setting(state: &AppServices, key: String, value: String) -> Result<(), String> {
     if ![
         "memory_budget_percent",
         "idle_unload_minutes",
@@ -1686,8 +1590,7 @@ pub async fn save_setting(
         .map_err(err)
 }
 
-#[tauri::command]
-pub async fn get_resource_policy(state: State<'_, AppServices>) -> Result<ResourcePolicy, String> {
+pub async fn get_resource_policy(state: &AppServices) -> Result<ResourcePolicy, String> {
     let logical_cpus = crate::resource::host_performance_cpu_count();
     state
         .core
@@ -1697,7 +1600,6 @@ pub async fn get_resource_policy(state: State<'_, AppServices>) -> Result<Resour
         .map_err(err)
 }
 
-#[tauri::command]
 pub fn get_resource_profile_preset(profile: ResourceProfile) -> Result<ResourcePolicy, String> {
     if profile == ResourceProfile::Custom {
         return Err("custom is not a preset".into());
@@ -1708,9 +1610,8 @@ pub fn get_resource_profile_preset(profile: ResourceProfile) -> Result<ResourceP
     ))
 }
 
-#[tauri::command]
 pub async fn save_resource_policy(
-    state: State<'_, AppServices>,
+    state: &AppServices,
     policy: ResourcePolicy,
 ) -> Result<(), String> {
     policy.validate().map_err(err)?;
@@ -1741,9 +1642,8 @@ pub async fn save_resource_policy(
     state.runtimes.apply_policy(policy).map_err(err)
 }
 
-#[tauri::command]
 pub async fn save_model_resource_overrides(
-    state: State<'_, AppServices>,
+    state: &AppServices,
     id: String,
     overrides: Option<ResourceOverrides>,
     force_tool_support: Option<bool>,
@@ -1772,9 +1672,8 @@ pub async fn save_model_resource_overrides(
     Ok(target)
 }
 
-#[tauri::command]
 pub async fn save_model_speculative_config(
-    state: State<'_, AppServices>,
+    state: &AppServices,
     id: String,
     config: Option<SpeculativeConfig>,
 ) -> Result<ModelTarget, String> {
@@ -1807,11 +1706,7 @@ pub async fn save_model_speculative_config(
     Ok(target)
 }
 
-#[tauri::command]
-pub async fn clear_kv_cache(
-    state: State<'_, AppServices>,
-    target_id: Option<String>,
-) -> Result<(), String> {
+pub async fn clear_kv_cache(state: &AppServices, target_id: Option<String>) -> Result<(), String> {
     if let Some(id) = target_id.as_deref() {
         let target = state
             .core
@@ -1836,6 +1731,58 @@ fn csv_cell(mut value: String) -> String {
         value.insert(0, '\'');
     }
     format!("\"{}\"", value.replace('"', "\"\""))
+}
+
+pub fn save_hugging_face_token(state: &AppServices, token: String) -> Result<(), String> {
+    if token.trim().is_empty() {
+        state.core.secrets.delete(HF_ACCOUNT).map_err(err)
+    } else {
+        state
+            .core
+            .secrets
+            .set(HF_ACCOUNT, token.trim())
+            .map_err(err)
+    }
+}
+
+pub fn save_civitai_token(state: &AppServices, token: String) -> Result<(), String> {
+    if token.trim().is_empty() {
+        state.core.secrets.delete(CIVITAI_ACCOUNT).map_err(err)
+    } else {
+        state
+            .core
+            .secrets
+            .set(CIVITAI_ACCOUNT, token.trim())
+            .map_err(err)
+    }
+}
+
+pub async fn forget_all_credentials(state: &AppServices) -> Result<(), String> {
+    for provider in state.core.store.providers().await.map_err(err)? {
+        state
+            .core
+            .secrets
+            .delete(&provider_account(&provider.id))
+            .map_err(err)?;
+    }
+    for key in state.core.store.local_api_keys().await.map_err(err)? {
+        state
+            .core
+            .secrets
+            .delete(&local_api_key_account(&key.id))
+            .map_err(err)?;
+        if key.revoked_at.is_none() {
+            state
+                .core
+                .store
+                .revoke_local_api_key(&key.id)
+                .await
+                .map_err(err)?;
+        }
+    }
+    state.core.secrets.delete(HF_ACCOUNT).map_err(err)?;
+    state.core.secrets.delete(CIVITAI_ACCOUNT).map_err(err)?;
+    state.core.secrets.delete(LOCAL_API_KEY).map_err(err)
 }
 
 #[cfg(test)]
@@ -2013,59 +1960,4 @@ mod tests {
         let stored = store.routing_policy("assistant").await.unwrap().unwrap();
         assert_eq!(stored.candidate_target_ids, vec!["cloud".to_string()]);
     }
-}
-
-#[tauri::command]
-pub fn save_hugging_face_token(state: State<'_, AppServices>, token: String) -> Result<(), String> {
-    if token.trim().is_empty() {
-        state.core.secrets.delete(HF_ACCOUNT).map_err(err)
-    } else {
-        state
-            .core
-            .secrets
-            .set(HF_ACCOUNT, token.trim())
-            .map_err(err)
-    }
-}
-
-#[tauri::command]
-pub fn save_civitai_token(state: State<'_, AppServices>, token: String) -> Result<(), String> {
-    if token.trim().is_empty() {
-        state.core.secrets.delete(CIVITAI_ACCOUNT).map_err(err)
-    } else {
-        state
-            .core
-            .secrets
-            .set(CIVITAI_ACCOUNT, token.trim())
-            .map_err(err)
-    }
-}
-
-#[tauri::command]
-pub async fn forget_all_credentials(state: State<'_, AppServices>) -> Result<(), String> {
-    for provider in state.core.store.providers().await.map_err(err)? {
-        state
-            .core
-            .secrets
-            .delete(&provider_account(&provider.id))
-            .map_err(err)?;
-    }
-    for key in state.core.store.local_api_keys().await.map_err(err)? {
-        state
-            .core
-            .secrets
-            .delete(&local_api_key_account(&key.id))
-            .map_err(err)?;
-        if key.revoked_at.is_none() {
-            state
-                .core
-                .store
-                .revoke_local_api_key(&key.id)
-                .await
-                .map_err(err)?;
-        }
-    }
-    state.core.secrets.delete(HF_ACCOUNT).map_err(err)?;
-    state.core.secrets.delete(CIVITAI_ACCOUNT).map_err(err)?;
-    state.core.secrets.delete(LOCAL_API_KEY).map_err(err)
 }

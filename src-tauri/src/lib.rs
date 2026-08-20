@@ -1,12 +1,15 @@
+pub mod admin;
 pub mod catalog;
 pub mod civitai;
 pub mod commands;
 pub mod core;
 pub mod desktop;
 pub mod domain;
+pub mod engine;
 pub mod gateway;
 pub mod hub;
 pub mod install;
+mod ipc;
 pub mod library;
 pub mod media;
 pub mod model_catalog;
@@ -22,11 +25,16 @@ pub mod speculative;
 pub mod storage;
 pub mod tool_emulation;
 
-use std::{sync::Arc, time::Duration};
-
-use commands::AppServices;
+use engine::{Engine, EngineConfig};
 use tauri::{Emitter, Manager, RunEvent, WindowEvent};
-use tokio_util::sync::CancellationToken;
+
+pub fn serve_headless<I, S>(args: I) -> anyhow::Result<()>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    engine::serve_headless(args)
+}
 
 pub fn run() {
     tracing_subscriber::fmt()
@@ -44,43 +52,29 @@ pub fn run() {
         .setup(|app| {
             let app_data = app.path().app_data_dir()?;
             let resource_dir = app.path().resource_dir()?;
-            let database = app_data.join("router.sqlite3");
-            let core = tauri::async_runtime::block_on(core::AppCore::open(
-                &database,
-                secrets::shared_keychain(),
-            ))?;
-            tauri::async_runtime::block_on(core.store.reset_local_runtime_states())?;
-            let port = tauri::async_runtime::block_on(core.store.setting("port"))?
-                .and_then(|value| value.parse().ok())
-                .unwrap_or(11435);
-            let logical_cpus = resource::host_performance_cpu_count();
-            let resource_policy =
-                tauri::async_runtime::block_on(core.store.resource_policy(logical_cpus))?;
-            let core = Arc::new(core);
-            let runtimes = Arc::new(runtime::RuntimeManager::new(
-                runtime::bundled_bin_dir(&resource_dir),
-                app_data.join("kv-cache"),
-                resource_policy,
-                core.local_activity(),
-            ));
-            std::fs::create_dir_all(app_data.join("models"))?;
-            let install = Arc::new(install::InstallManager::new(
-                core.store.clone(),
-                hub::hub_http_client()?,
-                core.secrets.clone(),
-                app_data.join("models"),
-                "https://huggingface.co",
-            ));
-            tauri::async_runtime::block_on(install.interrupt_active())?;
-            let shutdown = CancellationToken::new();
+            let bundled_ui = resource_dir.join("ui");
+            let ui_dir = if bundled_ui.join("index.html").is_file() {
+                Some(bundled_ui)
+            } else {
+                engine::default_ui_dir()
+            };
+            let engine = tauri::async_runtime::block_on(Engine::open(EngineConfig {
+                data_dir: app_data,
+                resource_dir: resource_dir.clone(),
+                ui_dir,
+                port: None,
+                secrets: secrets::shared_keychain(),
+            }))?;
+            engine.spawn_maintenance();
+            let services = engine.services.clone();
             let handle = app.handle().clone();
-            let mut events = install.subscribe();
+            let mut events = services.install.subscribe();
             tauri::async_runtime::spawn(async move {
                 while let Ok(event) = events.recv().await {
                     let _ = handle.emit("install-job", event);
                 }
             });
-            let traffic_hub = core.traffic.clone();
+            let traffic_hub = services.core.traffic.clone();
             let traffic_handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
                 let mut events = traffic_hub.subscribe();
@@ -96,95 +90,21 @@ pub fn run() {
                     }
                 }
             });
-            app.manage(AppServices {
-                core: core.clone(),
-                runtimes: runtimes.clone(),
-                model_library: app_data.join("models"),
-                port,
-                install,
-                shutdown: shutdown.clone(),
-            });
-
-            let listener =
-                tauri::async_runtime::block_on(tokio::net::TcpListener::bind(("127.0.0.1", port)))?;
-            let shutdown_server = shutdown.clone();
-            let gateway_core = core.clone();
-            let gateway_runtimes = runtimes.clone();
+            let listener = tauri::async_runtime::block_on(tokio::net::TcpListener::bind((
+                "127.0.0.1",
+                services.port,
+            )))?;
+            let shutdown_server = services.shutdown.clone();
+            let router = engine.router();
             tauri::async_runtime::spawn(async move {
-                if let Err(error) = axum::serve(listener, gateway::managed_router(gateway_core, gateway_runtimes))
+                if let Err(error) = axum::serve(listener, router)
                     .with_graceful_shutdown(shutdown_server.cancelled_owned())
                     .await
                 {
                     tracing::error!(%error, "gateway stopped");
                 }
             });
-            let maintenance = runtimes.clone();
-            let maintenance_store = core.store.clone();
-            tauri::async_runtime::spawn(async move {
-                loop {
-                    tokio::time::sleep(Duration::from_secs(60)).await;
-                    for (id, may_restart) in maintenance.take_crashed() {
-                        if let Ok(Some(mut target)) = maintenance_store.target(&id).await {
-                            target.runtime_url = None;
-                            target.state = if may_restart { "restarting" } else { "error" }.into();
-                            let _ = maintenance_store.upsert_target(&target).await;
-                            if may_restart {
-                                match maintenance.start_resolved(&maintenance_store, &target).await {
-                                    Ok(url) => {
-                                        target.runtime_url = Some(url);
-                                        target.state = "ready".into();
-                                    }
-                                    Err(_) => {
-                                        target.state = "error".into();
-                                    }
-                                }
-                                let _ = maintenance_store.upsert_target(&target).await;
-                            }
-                        }
-                    }
-                    for id in maintenance.reap_pending_restarts().await {
-                        if let Ok(Some(mut target)) = maintenance_store.target(&id).await {
-                            target.runtime_url = None;
-                            target.state = "restarting".into();
-                            let _ = maintenance_store.upsert_target(&target).await;
-                            match maintenance.start_resolved(&maintenance_store, &target).await {
-                                Ok(url) => {
-                                    target.runtime_url = Some(url);
-                                    target.state = "ready".into();
-                                }
-                                Err(error) => {
-                                    tracing::error!(target = %id, %error, "resource-policy restart failed");
-                                    target.state = "error".into();
-                                }
-                            }
-                            let _ = maintenance_store.upsert_target(&target).await;
-                        }
-                    }
-                    for id in maintenance.reap_over_budget().await {
-                        if let Ok(Some(mut target)) = maintenance_store.target(&id).await {
-                            target.runtime_url = None;
-                            target.state = "stopped".into();
-                            let _ = maintenance_store.upsert_target(&target).await;
-                        }
-                    }
-                    for id in maintenance.reap_idle().await {
-                        if let Ok(Some(mut target)) = maintenance_store.target(&id).await {
-                            target.runtime_url = None;
-                            target.state = "stopped".into();
-                            let _ = maintenance_store.upsert_target(&target).await;
-                        }
-                    }
-                    let retention = maintenance_store
-                        .setting("log_retention_days")
-                        .await
-                        .ok()
-                        .flatten()
-                        .and_then(|value| value.parse().ok())
-                        .unwrap_or(30);
-                    let _ = maintenance_store.purge_old_logs(retention).await;
-                }
-            });
-
+            app.manage(services);
             desktop::install(app)?;
             Ok(())
         })
@@ -196,75 +116,75 @@ pub fn run() {
             }
         })
         .invoke_handler(tauri::generate_handler![
-            commands::dashboard,
-            commands::cancel_inflight_request,
-            commands::cancel_all_inflight_requests,
-            commands::list_local_api_keys,
-            commands::create_local_api_key,
-            commands::reveal_local_api_key,
-            commands::rename_local_api_key,
-            commands::rotate_local_api_key,
-            commands::revoke_local_api_key,
-            commands::client_chat,
-            commands::list_providers,
-            commands::list_provider_presets,
-            commands::save_provider,
-            commands::delete_provider,
-            commands::sync_provider_models,
-            commands::cached_provider_models,
-            commands::begin_openai_subscription,
-            commands::openai_subscription_status,
-            commands::logout_openai_subscription,
-            commands::test_provider_connection,
-            commands::list_targets,
-            commands::save_target,
-            commands::lookup_model_metadata,
-            commands::delete_target,
-            commands::import_local_model,
-            commands::download_local_model,
-            commands::list_local_catalog,
-            commands::search_mlx_catalog,
-            commands::inspect_mlx_model,
-            commands::install_catalog_model,
-            commands::list_install_jobs,
-            commands::pause_install_job,
-            commands::resume_install_job,
-            commands::cancel_install_job,
-            commands::clear_install_job,
-            commands::start_local_model,
-            commands::stop_local_model,
-            commands::list_routes,
-            commands::list_public_models,
-            commands::save_route,
-            commands::delete_route,
-            commands::list_routing_policies,
-            commands::save_routing_policy,
-            commands::list_target_routing_profiles,
-            commands::save_target_routing_profile,
-            commands::list_routing_tasks,
-            commands::save_routing_task,
-            commands::delete_routing_task,
-            commands::simulate_routing,
-            commands::list_routing_attempts,
-            commands::export_routing_config,
-            commands::import_routing_config,
-            commands::list_logs,
-            commands::get_usage,
-            commands::get_key_usage,
-            commands::get_log_facets,
-            commands::clear_logs,
-            commands::export_logs_csv,
-            commands::get_settings,
-            commands::save_setting,
-            commands::get_resource_policy,
-            commands::get_resource_profile_preset,
-            commands::save_resource_policy,
-            commands::save_model_resource_overrides,
-            commands::save_model_speculative_config,
-            commands::clear_kv_cache,
-            commands::save_hugging_face_token,
-            commands::save_civitai_token,
-            commands::forget_all_credentials
+            ipc::dashboard,
+            ipc::cancel_inflight_request,
+            ipc::cancel_all_inflight_requests,
+            ipc::list_local_api_keys,
+            ipc::create_local_api_key,
+            ipc::reveal_local_api_key,
+            ipc::rename_local_api_key,
+            ipc::rotate_local_api_key,
+            ipc::revoke_local_api_key,
+            ipc::client_chat,
+            ipc::list_providers,
+            ipc::list_provider_presets,
+            ipc::save_provider,
+            ipc::delete_provider,
+            ipc::sync_provider_models,
+            ipc::cached_provider_models,
+            ipc::begin_openai_subscription,
+            ipc::openai_subscription_status,
+            ipc::logout_openai_subscription,
+            ipc::test_provider_connection,
+            ipc::list_targets,
+            ipc::save_target,
+            ipc::lookup_model_metadata,
+            ipc::delete_target,
+            ipc::import_local_model,
+            ipc::download_local_model,
+            ipc::list_local_catalog,
+            ipc::search_mlx_catalog,
+            ipc::inspect_mlx_model,
+            ipc::install_catalog_model,
+            ipc::list_install_jobs,
+            ipc::pause_install_job,
+            ipc::resume_install_job,
+            ipc::cancel_install_job,
+            ipc::clear_install_job,
+            ipc::start_local_model,
+            ipc::stop_local_model,
+            ipc::list_routes,
+            ipc::list_public_models,
+            ipc::save_route,
+            ipc::delete_route,
+            ipc::list_routing_policies,
+            ipc::save_routing_policy,
+            ipc::list_target_routing_profiles,
+            ipc::save_target_routing_profile,
+            ipc::list_routing_tasks,
+            ipc::save_routing_task,
+            ipc::delete_routing_task,
+            ipc::simulate_routing,
+            ipc::list_routing_attempts,
+            ipc::export_routing_config,
+            ipc::import_routing_config,
+            ipc::list_logs,
+            ipc::get_usage,
+            ipc::get_key_usage,
+            ipc::get_log_facets,
+            ipc::clear_logs,
+            ipc::export_logs_csv,
+            ipc::get_settings,
+            ipc::save_setting,
+            ipc::get_resource_policy,
+            ipc::get_resource_profile_preset,
+            ipc::save_resource_policy,
+            ipc::save_model_resource_overrides,
+            ipc::save_model_speculative_config,
+            ipc::clear_kv_cache,
+            ipc::save_hugging_face_token,
+            ipc::save_civitai_token,
+            ipc::forget_all_credentials
         ])
         .build(tauri::generate_context!())
         .expect("error while running Local AI Router")

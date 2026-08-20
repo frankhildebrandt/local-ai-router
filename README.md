@@ -4,7 +4,7 @@ A private, multi-protocol model gateway for Apple Silicon Macs. Local AI Router 
 
 ## What works
 
-- Tauri 2 menu-bar app for macOS 15+
+- Tauri 2 menu-bar app for macOS 15+, plus a headless `serve` process that hosts the same engine and admin UI in a browser on loopback
 - Closing the window hides to the menu bar; quit from the app menu, tray, or Cmd+Q stops the gateway
 - Presets for OpenAI, Anthropic, OpenRouter, Poolside, MiniMax, Z.AI, OpenCode Zen, Gemini, Groq, Cerebras, Mistral, Hugging Face, NVIDIA NIM and SambaNova
 - API keys and experimental OpenAI Subscription OAuth tokens stored in macOS Keychain
@@ -23,7 +23,7 @@ A private, multi-protocol model gateway for Apple Silicon Macs. Local AI Router 
 - Native MLX chat, image and speech sidecars plus Metal-enabled llama.cpp
 - Optional speculative decoding for local chat models: pair a smaller draft from the library, or GGUF n-gram without an extra model
 
-The gateway listens only on `http://127.0.0.1:11435`. Every request requires a local token managed under **API keys**. Supply it as `Authorization: Bearer`, `x-api-key`, or `x-goog-api-key`; query-string keys are deliberately rejected because URLs are commonly logged.
+The gateway listens only on `http://127.0.0.1:11435`. Inference APIs require a local token managed under **API keys**. Supply it as `Authorization: Bearer`, `x-api-key`, or `x-goog-api-key`; query-string keys are deliberately rejected because URLs are commonly logged. The admin UI on that same loopback port is local-process privileged (like the desktop app’s IPC): it does not use a bearer token.
 
 ## Install
 
@@ -46,6 +46,29 @@ npm install
 npm run tauri dev
 ```
 
+Headless (no window or tray). Uses the same Application Support directory, loopback port and Keychain as the desktop app unless you override them:
+
+```bash
+npm run build
+cargo run --manifest-path src-tauri/Cargo.toml -- serve --ui-dir dist
+```
+
+Then open `http://127.0.0.1:11435/` in a browser. The packaged macOS binary accepts the same command:
+
+```bash
+"/Applications/Local AI Router.app/Contents/MacOS/local-ai-router" serve
+```
+
+| | Desktop / tray | Headless `serve` |
+| --- | --- | --- |
+| Data directory | `~/Library/Application Support/app.local-ai-router.desktop` | Same, or `--data-dir` |
+| Bind address | `127.0.0.1` (never LAN) | Same; `--port` overrides the saved setting (default `11435`) |
+| Secrets | macOS Keychain service `app.local-ai-router.desktop` | Same Keychain, or `--secrets-file` for an isolated 0600 JSON vault (CI / extra data dirs) |
+| Admin UI | Native window + tray | Browser at `http://127.0.0.1:<port>/` |
+| Inference APIs | `/v1/*` with a local API key | Same |
+
+Only one process can bind the port. Quit the menu-bar app before `serve`, or the reverse.
+
 Building both inference engines takes time. `swift build` compiles the MLX servers but skips Metal shaders, so `scripts/build-sidecars.sh` also compiles `mlx.metallib` next to the binaries. That step needs Xcode’s Metal toolchain (`xcodebuild -downloadComponent MetalToolchain`). The desktop shell and cloud router can be developed without sidecars; local model startup will report a missing binary or missing Metal kernels until the script has run.
 
 Run all fast checks:
@@ -54,6 +77,7 @@ Run all fast checks:
 npm test
 npm run build
 cargo test --manifest-path src-tauri/Cargo.toml
+./scripts/test-headless.sh
 ```
 
 ### SDK usage
@@ -147,11 +171,11 @@ Local chat models accept OpenAI `input_audio` and the Local AI Router extension 
 
 ## Data and security
 
-- Provider, Hugging Face, CivitAI and local API tokens are stored only in Keychain, together in a single `credentials` item. Logical keys stay separate inside that versioned record. Subscription access/refresh tokens, expiry and account ID are kept in the same vault under the provider key.
+- Provider, Hugging Face, CivitAI and local API tokens default to macOS Keychain, together in a single `credentials` item. Logical keys stay separate inside that versioned record. Subscription access/refresh tokens, expiry and account ID are kept in the same vault under the provider key. Headless `--secrets-file` is an optional 0600 JSON vault for isolated data directories and CI; it is not used by the desktop app.
 - SQLite stores configuration and request metadata, never request/response bodies or authorization headers.
 - Local bearer tokens are stored in that Keychain vault, compared in constant time and can be rotated or revoked immediately.
-- The gateway never binds to a LAN address.
-- Imported models are copied into the app-managed Application Support directory.
+- The gateway never binds to a LAN address. Headless mode uses the same loopback bind; pass `--port` to choose the port without writing it back to settings.
+- Imported models are copied into the app-managed Application Support directory. `--data-dir` relocates SQLite, the model library and KV snapshots for that process only.
 - Optional local KV snapshots (GGUF slots and MLX prefix hashes) can encode sensitive conversation state. They are unencrypted app-private files and can be removed from Settings at any time.
 - Cloud prompts and tool data are sent to the provider selected by the route and remain subject to that provider's retention, training and regional-processing terms. Fallback targets may send a request to a different provider only after an eligible pre-stream failure.
 
