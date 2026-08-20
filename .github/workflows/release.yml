@@ -216,10 +216,10 @@ jobs:
           ls -la src-tauri/target/release/bundle/nsis/*.exe
           test -s src-tauri/target/release/local-ai-router-windows-headless.zip
           src-tauri/target/release/local-ai-router.exe serve --help | grep -q -- "--secrets-file"
-          tar -tf src-tauri/target/release/local-ai-router-windows-headless.zip | grep -q 'ui/index.html'
-          tar -tf src-tauri/target/release/local-ai-router-windows-headless.zip | grep -q llama-server-
-          tar -tf src-tauri/target/release/local-ai-router-windows-headless.zip | grep -q local-ai-router.exe
-          tar -tf src-tauri/target/release/local-ai-router-windows-headless.zip | grep -q README.txt
+          unzip -l src-tauri/target/release/local-ai-router-windows-headless.zip | grep -q 'ui/index.html'
+          unzip -l src-tauri/target/release/local-ai-router-windows-headless.zip | grep -q llama-server-
+          unzip -l src-tauri/target/release/local-ai-router-windows-headless.zip | grep -q local-ai-router.exe
+          unzip -l src-tauri/target/release/local-ai-router-windows-headless.zip | grep -q README.txt
           ./scripts/check-windows-packaging.sh
       - name: Attach headless archive
         env:
