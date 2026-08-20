@@ -1,6 +1,6 @@
 [package]
 name = "local-ai-router"
-version = "0.4.0"
+version = "0.5.0"
 description = "A private OpenAI-compatible router for macOS, Linux, and Windows"
 authors = ["Local AI Router contributors"]
 edition = "2021"
