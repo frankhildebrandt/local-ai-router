@@ -7,6 +7,7 @@ pub mod desktop;
 pub mod domain;
 pub mod engine;
 pub mod gateway;
+pub mod gguf_backend;
 pub mod hub;
 pub mod identity;
 pub mod install;

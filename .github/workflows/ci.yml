@@ -123,7 +123,17 @@ jobs:
           workspaces: src-tauri
       - run: cmake --version
       - run: npm ci
-      - run: ./scripts/build-sidecars.sh
+      - name: Install Vulkan SDK
+        run: |
+          curl -L -o "$RUNNER_TEMP/vulkan-sdk.exe" "https://sdk.lunarg.com/sdk/download/1.3.296.0/windows/VulkanSDK-1.3.296.0-Installer.exe"
+          "$RUNNER_TEMP/vulkan-sdk.exe" --accept-eula --quiet
+          echo "VULKAN_SDK=C:/VulkanSDK/1.3.296.0" >> "$GITHUB_ENV"
+          echo "C:/VulkanSDK/1.3.296.0/Bin" >> "$GITHUB_PATH"
+      - uses: Jimver/cuda-toolkit@v0.2.16
+        with:
+          cuda: "12.4.0"
+          method: network
+      - run: BUILD_LLAMA_CUDA=1 BUILD_LLAMA_VULKAN=1 ./scripts/build-sidecars.sh
       - name: Build Windows desktop installer
         run: npm run tauri build -- --bundles nsis
       - run: ./scripts/package-windows-headless.sh
@@ -151,7 +161,11 @@ jobs:
           workspaces: src-tauri
       - run: ./scripts/install-linux-build-deps.sh
       - run: npm ci
-      - run: ./scripts/build-sidecars.sh
+      - uses: Jimver/cuda-toolkit@v0.2.16
+        with:
+          cuda: "12.4.0"
+          method: network
+      - run: BUILD_LLAMA_CUDA=1 BUILD_LLAMA_VULKAN=1 ./scripts/build-sidecars.sh
       - name: Build Linux desktop packages
         env:
           NO_STRIP: "true"
@@ -167,6 +181,8 @@ jobs:
           tar -tzf src-tauri/target/release/local-ai-router-linux-headless.tar.gz | grep -q local-ai-router.service
           tar -tzf src-tauri/target/release/local-ai-router-linux-headless.tar.gz | grep -q '/ui/index.html'
           tar -tzf src-tauri/target/release/local-ai-router-linux-headless.tar.gz | grep -q llama-server-
+          tar -tzf src-tauri/target/release/local-ai-router-linux-headless.tar.gz | grep -q llama-server-cuda-
+          tar -tzf src-tauri/target/release/local-ai-router-linux-headless.tar.gz | grep -q llama-server-vulkan-
           dpkg-deb -c src-tauri/target/release/bundle/deb/*.deb | grep -E 'ui/index.html'
           dpkg-deb -c src-tauri/target/release/bundle/deb/*.deb | grep -E 'llama-server-'
           dpkg-deb -c src-tauri/target/release/bundle/deb/*.deb | grep -E 'local-ai-router.service'

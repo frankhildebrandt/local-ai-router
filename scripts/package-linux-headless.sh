@@ -1,11 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Archive the headless binary, admin SPA, CPU llama.cpp sidecar, and systemd unit.
+# Archive the headless binary, admin SPA, and llama.cpp sidecars (CPU/CUDA/Vulkan when built).
 PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="${1:-$PROJECT_DIR/src-tauri/target/release/local-ai-router}"
 OUT="${2:-$PROJECT_DIR/src-tauri/target/release/local-ai-router-linux-headless.tar.gz}"
-HOST_TRIPLE="$(rustc -vV | awk '/^host:/{print $2}')"
 
 if [[ ! -x "$BIN" ]]; then
   echo "missing headless binary: $BIN" >&2
@@ -24,27 +23,13 @@ if [[ -z "$UI" ]]; then
   exit 1
 fi
 
-LLAMA=""
-for candidate in \
-  "$PROJECT_DIR/sidecars/bin/llama-server-$HOST_TRIPLE" \
-  "$PROJECT_DIR/src-tauri/target/release/sidecars/bin/llama-server-$HOST_TRIPLE"; do
-  if [[ -f "$candidate" ]]; then
-    LLAMA="$candidate"
-    break
-  fi
-done
-if [[ -z "$LLAMA" ]]; then
-  echo "missing llama-server-$HOST_TRIPLE (run ./scripts/build-sidecars.sh)" >&2
-  exit 1
-fi
-
 STAGE="$(mktemp -d)"
 trap 'rm -rf "$STAGE"' EXIT
 ROOT="$STAGE/local-ai-router"
 mkdir -p "$ROOT/ui" "$ROOT/sidecars/bin"
 cp "$BIN" "$ROOT/local-ai-router"
 cp -R "$UI/." "$ROOT/ui/"
-cp "$LLAMA" "$ROOT/sidecars/bin/"
+"$PROJECT_DIR/scripts/copy-llama-sidecars.sh" "$ROOT/sidecars/bin"
 cp "$PROJECT_DIR/packaging/linux/local-ai-router.service" "$ROOT/local-ai-router.service"
 cat >"$ROOT/README.txt" <<'EOF'
 Local AI Router (headless)
@@ -71,9 +56,11 @@ If you run the binary in place instead of installing to /usr:
 
   ./local-ai-router serve --data-dir ./data --secrets-file ./data/secrets.json
 
-It loads ./ui and ./sidecars/bin next to the executable. Desktop Secret
-Service is used when --secrets-file is omitted; systemd should always
-pass --secrets-file (the unit does).
+It loads ./ui and ./sidecars/bin next to the executable. sidecars/bin may include
+llama-server (CPU), llama-server-cuda (NVIDIA), and llama-server-vulkan (AMD).
+The router picks CUDA, then Vulkan, then CPU automatically. Override with
+LOCAL_AI_ROUTER_GGUF_BACKEND=cpu|cuda|vulkan. Desktop Secret Service is used when
+--secrets-file is omitted; systemd should always pass --secrets-file (the unit does).
 EOF
 
 mkdir -p "$(dirname "$OUT")"

@@ -1,6 +1,6 @@
 # Local AI Router
 
-A private, multi-protocol model gateway for Apple Silicon Macs, Linux, and Windows. Local AI Router combines hosted providers with on-device inference behind OpenAI-, Anthropic- and Gemini-compatible APIs. Local MLX stays Apple-only; Linux and Windows use GGUF via llama.cpp (CPU in this release; CUDA/Vulkan come later).
+A private, multi-protocol model gateway for Apple Silicon Macs, Linux, and Windows. Local AI Router combines hosted providers with on-device inference behind OpenAI-, Anthropic- and Gemini-compatible APIs. Local MLX stays Apple-only; Linux and Windows use GGUF via llama.cpp with NVIDIA CUDA, AMD Vulkan, and CPU fallback.
 
 ## What works
 
@@ -22,7 +22,7 @@ A private, multi-protocol model gateway for Apple Silicon Macs, Linux, and Windo
 - Usage dashboard plus filterable metadata-only request logs, filtered CSV export and automatic 30-day retention
 - Curated MLX catalog with RAM-aware install, live Hugging Face MLX search, CivitAI image downloads, managed imports and resumable downloads
 - Stealth, Balanced, Performance and Custom resource profiles with automatic loading, idle unloading, prompt concurrency and per-model overrides
-- Native MLX chat, image and speech sidecars plus Metal-enabled llama.cpp on macOS; CPU llama.cpp on Linux and Windows
+- Native MLX chat, image and speech sidecars plus Metal-enabled llama.cpp on macOS; CPU, CUDA, and Vulkan llama.cpp on Linux and Windows
 - Optional speculative decoding for local chat models: pair a smaller draft from the library, or GGUF n-gram without an extra model
 
 The gateway listens on `http://127.0.0.1:11435` by default. Inference APIs require a local token managed under **API keys**. Supply it as `Authorization: Bearer`, `x-api-key`, or `x-goog-api-key`; query-string keys are deliberately rejected because URLs are commonly logged. The admin UI on loopback is local-process privileged (like the desktop app’s IPC): it does not require a login. Sharing the node on a LAN is opt-in under **Settings → Network share** and always uses HTTPS plus a directory login.
@@ -40,7 +40,7 @@ GitHub Releases also ship a DMG. After a published release, the [homebrew-tap](h
 
 ### Linux
 
-GitHub Releases ship an **AppImage**, a **.deb**, and a **headless tarball** (binary, admin SPA, CPU llama.cpp sidecar, and systemd unit). Local MLX is not included; GGUF CPU inference is.
+GitHub Releases ship an **AppImage**, a **.deb**, and a **headless tarball** (binary, admin SPA, llama.cpp sidecars, and systemd unit). Local MLX is not included. GGUF inference uses bundled CPU, CUDA (NVIDIA), and Vulkan (AMD) sidecars when present; CPU always works as fallback.
 
 Debian/Ubuntu desktop:
 
@@ -74,7 +74,7 @@ Then open `http://127.0.0.1:11435/` in a browser on that machine. Headless Linux
 
 ### Windows
 
-GitHub Releases ship an **NSIS installer** and a **headless zip** (binary, admin SPA, and CPU llama.cpp sidecar). Local MLX is not included; GGUF CPU inference is. Windows 10/11 x64.
+GitHub Releases ship an **NSIS installer** and a **headless zip** (binary, admin SPA, and llama.cpp sidecars). Local MLX is not included. GGUF inference uses bundled CPU, CUDA (NVIDIA), and Vulkan (AMD/other) sidecars when present; CPU always works as fallback. Windows 10/11 x64.
 
 Desktop: run the installer from GitHub Releases, then start **Local AI Router** from the Start menu. SmartScreen may warn on unsigned builds; choose More info → Run anyway. WebView2 is installed by the NSIS bootstrapper if it is missing.
 
@@ -102,9 +102,9 @@ The packaged desktop app accepts the same command:
 
 macOS: Apple Silicon, macOS 15+, Node.js 22+, Rust 1.77+, Swift 6.2+, CMake, and Xcode command-line tools.
 
-Linux: x86_64, Node.js 22+, Rust 1.77+, CMake, and the GTK/WebKit packages in `scripts/install-linux-build-deps.sh`. MLX sidecars are skipped; `./scripts/build-sidecars.sh` builds CPU llama.cpp only.
+Linux: x86_64, Node.js 22+, Rust 1.77+, CMake, and the GTK/WebKit packages in `scripts/install-linux-build-deps.sh` (includes Vulkan dev packages). MLX sidecars are skipped. `./scripts/build-sidecars.sh` builds CPU llama.cpp always; CUDA and Vulkan variants build when the toolkits are present or when `BUILD_LLAMA_CUDA=1` / `BUILD_LLAMA_VULKAN=1`.
 
-Windows: x64, Windows 10/11, Node.js 22+, Rust (MSVC), CMake, Visual Studio Build Tools with the C++ workload, and WebView2. Git Bash is enough to run the repo scripts. MLX sidecars are skipped; `./scripts/build-sidecars.sh` builds CPU llama.cpp only.
+Windows: x64, Windows 10/11, Node.js 22+, Rust (MSVC), CMake, Visual Studio Build Tools with the C++ workload, and WebView2. Git Bash is enough to run the repo scripts. MLX sidecars are skipped. `./scripts/build-sidecars.sh` builds CPU llama.cpp always; set `BUILD_LLAMA_VULKAN=1` with the [Vulkan SDK](https://vulkan.lunarg.com/) installed, or `BUILD_LLAMA_CUDA=1` with the [NVIDIA CUDA toolkit](https://developer.nvidia.com/cuda-downloads) for NVIDIA GPU builds.
 
 ```bash
 npm install
@@ -149,11 +149,25 @@ local-ai-router serve
 | Secrets (Windows) | Windows Credential Manager | Same, or `--secrets-file` (CI, extra data dirs, or tasks without an interactive user) |
 | Admin UI | Native window + tray | Browser at `http://127.0.0.1:<port>/` |
 | Inference APIs | `/v1/*` with a local API key | Same |
-| Local inference | macOS: MLX + Metal GGUF; Linux/Windows: GGUF CPU | Same sidecars as desktop on that OS |
+| Local inference | macOS: MLX + Metal GGUF; Linux/Windows: GGUF CPU with optional CUDA (NVIDIA) or Vulkan (AMD) | Same sidecars as desktop on that OS |
 
 Only one process can bind the port. Quit the desktop app before `serve`, or the reverse.
 
-On macOS, building both inference engines takes time. `swift build` compiles the MLX servers but skips Metal shaders, so `scripts/build-sidecars.sh` also compiles `mlx.metallib` next to the binaries. That step needs Xcode’s Metal toolchain (`xcodebuild -downloadComponent MetalToolchain`). On Linux and Windows the same script builds CPU llama.cpp and skips MLX. The desktop shell and cloud router can be developed without sidecars; local model startup will report a missing binary until the script has run.
+On macOS, building both inference engines takes time. `swift build` compiles the MLX servers but skips Metal shaders, so `scripts/build-sidecars.sh` also compiles `mlx.metallib` next to the binaries. That step needs Xcode’s Metal toolchain (`xcodebuild -downloadComponent MetalToolchain`). On Linux and Windows the same script builds CPU llama.cpp and optional CUDA/Vulkan variants, and skips MLX. The desktop shell and cloud router can be developed without sidecars; local model startup will report a missing binary until the script has run.
+
+### GGUF GPU backends (Linux and Windows)
+
+Local GGUF chat uses llama.cpp sidecars bundled under `sidecars/bin/`:
+
+| Sidecar | GPU | Notes |
+| --- | --- | --- |
+| `llama-server-<triple>` | CPU | Always built; used when GPU layers are `0` or no GPU backend is available |
+| `llama-server-cuda-<triple>` | NVIDIA CUDA | Requires a recent NVIDIA driver (compute capability 5.0+); CUDA toolkit needed at build time |
+| `llama-server-vulkan-<triple>` | AMD/other Vulkan | Requires Vulkan 1.2+ drivers; Vulkan SDK or `libvulkan-dev` at build time |
+
+At runtime the router picks **CUDA → Vulkan → CPU** when GPU layers are auto (`-1`) or positive. Override with `LOCAL_AI_ROUTER_GGUF_BACKEND=cpu|cuda|vulkan`. MLX remains Apple-only; ROCm is out of scope.
+
+Release Linux and Windows artifacts include CPU, CUDA, and Vulkan sidecars when the release workflow builds them successfully.
 
 Run all fast checks:
 
@@ -234,7 +248,7 @@ The task header is validated and never forwarded upstream. Responses expose `X-L
 
 ### Background inference and persistent sessions
 
-New installations default to Stealth mode: local sidecars run at low process priority and are runnable for 100 ms of each 400 ms window while inference is active. This is a 25% scheduler duty cycle, not a guaranteed 25% Metal utilization value; macOS does not expose per-process GPU or Neural Engine compute quotas to these runtimes. GGUF additionally exposes GPU-layer and CPU-thread limits. MLX uses Metal and receives process memory/cache limits; the current engines do not target the Apple Neural Engine.
+New installations default to Stealth mode: local sidecars run at low process priority and are runnable for 100 ms of each 400 ms window while inference is active. This is a 25% scheduler duty cycle, not a guaranteed 25% Metal utilization value; macOS does not expose per-process GPU or Neural Engine compute quotas to these runtimes. GGUF exposes GPU-layer and CPU-thread limits. On Linux and Windows, `-1` GPU layers offloads to CUDA (NVIDIA) or Vulkan (AMD) when a matching sidecar and driver are present, then falls back to CPU. MLX uses Metal on Apple Silicon and receives process memory/cache limits; the current engines do not target the Apple Neural Engine.
 
 Stopped local models load automatically on their first request. Active prompts are limited per model, while additional authenticated requests wait in a FIFO queue until the client disconnects or the app shuts down. Resource changes restart loaded sidecars only after active and queued work has drained.
 
@@ -296,4 +310,4 @@ Updater archives are signed with `TAURI_SIGNING_PRIVATE_KEY` and `TAURI_SIGNING_
 
 ## Runtime notes
 
-`scripts/build-sidecars.sh` pins llama.cpp to a reviewed commit, MLX Swift LM to release `3.31.4`, FLUX.2 Swift MLX to release `v2.4.0`, and kokoro-swift to commit `20bf04c506e913ff129d7d2229398180ba24c690`. On macOS, Metal shaders are compiled into `sidecars/bin/mlx.metallib` because SwiftPM command-line builds skip them. On Linux and Windows the script builds CPU llama.cpp and skips MLX. FLUX.2 and Kokoro are prepared as local Swift packages (`scripts/prepare-flux-vendor.sh`, `scripts/prepare-kokoro-vendor.sh`) because unmodified git dependencies cannot be consumed as-is. Their licenses must accompany redistributed binaries; see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). Model weights are not shipped with the app.
+`scripts/build-sidecars.sh` pins llama.cpp to a reviewed commit, MLX Swift LM to release `3.31.4`, FLUX.2 Swift MLX to release `v2.4.0`, and kokoro-swift to commit `20bf04c506e913ff129d7d2229398180ba24c690`. On macOS, Metal shaders are compiled into `sidecars/bin/mlx.metallib` because SwiftPM command-line builds skip them. On Linux and Windows the script builds CPU llama.cpp plus optional CUDA and Vulkan variants (`BUILD_LLAMA_CUDA=1`, `BUILD_LLAMA_VULKAN=1`) and skips MLX. FLUX.2 and Kokoro are prepared as local Swift packages (`scripts/prepare-flux-vendor.sh`, `scripts/prepare-kokoro-vendor.sh`) because unmodified git dependencies cannot be consumed as-is. Their licenses must accompany redistributed binaries; see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). Model weights are not shipped with the app.

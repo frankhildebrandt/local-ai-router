@@ -369,7 +369,14 @@ impl RuntimeManager {
                 TargetKind::Mlx => "mlx_chat",
                 _ => "cloud",
             });
-        let binary = self.bin_dir.join(sidecar_binary_name(engine, target.kind)?);
+        let binary = match target.kind {
+            TargetKind::Gguf => {
+                crate::gguf_backend::resolve_gguf_sidecar_for_host(&self.bin_dir, policy.gguf_gpu_layers)
+            }
+            _ => self
+                .bin_dir
+                .join(sidecar_binary_name(engine, target.kind)?),
+        };
         if !binary.exists() {
             anyhow::bail!("runtime sidecar missing: {}", binary.display());
         }
