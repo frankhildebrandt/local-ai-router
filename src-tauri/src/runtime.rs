@@ -58,6 +58,8 @@ pub struct RuntimeManager {
     kv_cache_dir: PathBuf,
     policy: parking_lot::RwLock<ResourcePolicy>,
     activity: LocalActivityRegistry,
+    #[cfg(test)]
+    test_running: Mutex<HashSet<String>>,
 }
 
 impl RuntimeManager {
@@ -75,6 +77,8 @@ impl RuntimeManager {
             kv_cache_dir,
             policy: parking_lot::RwLock::new(policy),
             activity,
+            #[cfg(test)]
+            test_running: Mutex::new(HashSet::new()),
         }
     }
 
@@ -104,7 +108,20 @@ impl RuntimeManager {
     }
 
     pub fn is_running(&self, id: &str) -> bool {
-        self.entries.lock().contains_key(id)
+        if self.entries.lock().contains_key(id) {
+            return true;
+        }
+        #[cfg(test)]
+        {
+            return self.test_running.lock().contains(id);
+        }
+        #[cfg(not(test))]
+        false
+    }
+
+    #[cfg(test)]
+    pub(crate) fn mark_test_running(&self, id: &str) {
+        self.test_running.lock().insert(id.to_string());
     }
 
     #[cfg(test)]

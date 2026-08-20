@@ -152,6 +152,9 @@ fn assign_target_public_ids<'a>(
     ordered.sort_by(|left, right| left.name.cmp(&right.name).then(left.id.cmp(&right.id)));
     let mut assigned = Vec::with_capacity(ordered.len());
     for target in ordered {
+        if target.kind.is_replica() {
+            continue;
+        }
         let preferred = preferred_public_id(&target.provider_model, &target.name);
         let public_id = unique_alias(&preferred, &taken);
         taken.insert(public_id.clone());

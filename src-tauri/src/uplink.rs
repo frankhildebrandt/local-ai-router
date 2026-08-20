@@ -50,6 +50,8 @@ pub struct UplinkParent {
     pub joined_at: chrono::DateTime<Utc>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tls_fingerprint: Option<String>,
+    #[serde(default)]
+    pub may_publish: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -80,6 +82,8 @@ pub struct JoinResponse {
     pub username: String,
     pub models: Vec<UplinkModel>,
     pub quota: QuotaStatus,
+    #[serde(default)]
+    pub may_publish: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -113,6 +117,17 @@ pub async fn migrate(pool: &SqlitePool) -> anyhow::Result<()> {
         .any(|column| column.get::<String, _>("name") == "tls_fingerprint")
     {
         sqlx::query("ALTER TABLE uplink_parent ADD COLUMN tls_fingerprint TEXT")
+            .execute(pool)
+            .await?;
+    }
+    let parent_columns = sqlx::query("PRAGMA table_info(uplink_parent)")
+        .fetch_all(pool)
+        .await?;
+    if !parent_columns
+        .iter()
+        .any(|column| column.get::<String, _>("name") == "may_publish")
+    {
+        sqlx::query("ALTER TABLE uplink_parent ADD COLUMN may_publish INTEGER NOT NULL DEFAULT 0")
             .execute(pool)
             .await?;
     }
@@ -307,6 +322,7 @@ pub async fn accept_join(core: &AppCore, request: JoinRequest) -> anyhow::Result
     .await?;
     let models = granted_models(&core.store, &user).await?;
     let quota = quota_status(&core.store, &user).await?;
+    let permissions = core.store.permissions_for(&user).await?;
     Ok(JoinResponse {
         token,
         parent_node_id: parent_node_id.clone(),
@@ -315,6 +331,7 @@ pub async fn accept_join(core: &AppCore, request: JoinRequest) -> anyhow::Result
         username: user.username,
         models,
         quota,
+        may_publish: permissions.may_publish,
     })
 }
 
@@ -379,10 +396,10 @@ pub async fn authenticate_token(core: &AppCore, token: Option<&str>) -> Option<U
 
 pub async fn load_parent(store: &Store) -> anyhow::Result<Option<UplinkParent>> {
     let row = sqlx::query(
-        "SELECT base_url,parent_node_id,username,user_id,ancestor_node_ids,models,joined_at,tls_fingerprint FROM uplink_parent WHERE id=1",
+        "SELECT base_url,parent_node_id,username,user_id,ancestor_node_ids,models,joined_at,tls_fingerprint,may_publish FROM uplink_parent WHERE id=1",
     )
-    .fetch_optional(store.pool())
-    .await?;
+        .fetch_optional(store.pool())
+        .await?;
     let Some(row) = row else {
         return Ok(None);
     };
@@ -397,6 +414,10 @@ pub async fn load_parent(store: &Store) -> anyhow::Result<Option<UplinkParent>> 
         quota: None,
         joined_at: row.get::<String, _>("joined_at").parse()?,
         tls_fingerprint: row.get("tls_fingerprint"),
+        may_publish: row
+            .try_get::<i64, _>("may_publish")
+            .ok()
+            .is_some_and(|flag| flag != 0),
     }))
 }
 
@@ -450,7 +471,8 @@ pub async fn join_uplink(
     load_parent(&services.core.store)
         .await?
         .map(|mut parent| {
-            parent.quota = Some(joined.quota);
+            parent.quota = Some(joined.quota.clone());
+            parent.may_publish = joined.may_publish;
             parent
         })
         .context("uplink parent missing after join")
@@ -487,7 +509,8 @@ pub async fn refresh_uplink(services: &AppServices) -> anyhow::Result<UplinkPare
     load_parent(&services.core.store)
         .await?
         .map(|mut item| {
-            item.quota = Some(joined.quota);
+            item.quota = Some(joined.quota.clone());
+            item.may_publish = joined.may_publish;
             item
         })
         .context("uplink parent missing after refresh")
@@ -505,6 +528,7 @@ pub async fn disconnect_uplink(services: &AppServices) -> anyhow::Result<()> {
             .send()
             .await;
     }
+    let _ = crate::publish::clear_local_offers(services).await;
     sqlx::query("DELETE FROM uplink_parent")
         .execute(services.core.store.pool())
         .await?;
@@ -512,11 +536,20 @@ pub async fn disconnect_uplink(services: &AppServices) -> anyhow::Result<()> {
     unmount_models(&services.core.store).await
 }
 
-pub async fn revoke_session(store: &Store, token: &str) -> anyhow::Result<()> {
+pub async fn revoke_session(core: &crate::core::AppCore, token: &str) -> anyhow::Result<()> {
+    let child_node_id = sqlx::query_scalar::<_, String>(
+        "SELECT child_node_id FROM uplink_sessions WHERE token_hash=? LIMIT 1",
+    )
+    .bind(token_hash(token))
+    .fetch_optional(core.store.pool())
+    .await?;
     sqlx::query("DELETE FROM uplink_sessions WHERE token_hash=?")
         .bind(token_hash(token))
-        .execute(store.pool())
+        .execute(core.store.pool())
         .await?;
+    if let Some(child_node_id) = child_node_id {
+        crate::publish::drop_child_replicas(core, &child_node_id).await?;
+    }
     Ok(())
 }
 
@@ -535,8 +568,8 @@ async fn persist_parent(
         })
         .transpose()?;
     sqlx::query(
-        "INSERT INTO uplink_parent(id,base_url,parent_node_id,username,user_id,ancestor_node_ids,models,joined_at,tls_fingerprint)
-         VALUES(1,?,?,?,?,?,?,?,?)
+        "INSERT INTO uplink_parent(id,base_url,parent_node_id,username,user_id,ancestor_node_ids,models,joined_at,tls_fingerprint,may_publish)
+         VALUES(1,?,?,?,?,?,?,?,?,?)
          ON CONFLICT(id) DO UPDATE SET
             base_url=excluded.base_url,
             parent_node_id=excluded.parent_node_id,
@@ -544,7 +577,8 @@ async fn persist_parent(
             user_id=excluded.user_id,
             ancestor_node_ids=excluded.ancestor_node_ids,
             models=excluded.models,
-            tls_fingerprint=excluded.tls_fingerprint",
+            tls_fingerprint=excluded.tls_fingerprint,
+            may_publish=excluded.may_publish",
     )
     .bind(base_url)
     .bind(&joined.parent_node_id)
@@ -554,6 +588,7 @@ async fn persist_parent(
     .bind(serde_json::to_string(&joined.models)?)
     .bind(Utc::now().to_rfc3339())
     .bind(tls_fingerprint)
+    .bind(joined.may_publish as i64)
     .execute(services.core.store.pool())
     .await?;
     if !joined.token.is_empty() {

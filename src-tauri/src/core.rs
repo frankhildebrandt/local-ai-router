@@ -608,6 +608,20 @@ impl AppCore {
                     None,
                 ))
             }
+            crate::domain::TargetKind::Replica => {
+                let replica = crate::publish::replica_by_target(&self.store, &target.id)
+                    .await?
+                    .context("replica is no longer advertised")?;
+                let token = self
+                    .secrets
+                    .get(&crate::publish::callback_secret_account(&replica.child_node_id))?
+                    .context("replica session missing")?;
+                Ok((
+                    replica.callback_url.trim_end_matches('/').to_owned(),
+                    Some(token),
+                    None,
+                ))
+            }
         }
     }
 

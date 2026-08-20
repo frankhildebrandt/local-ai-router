@@ -27,7 +27,9 @@ pub fn tool_emulation_for(target: &ModelTarget, has_tools: bool) -> ToolEmulatio
     match target.kind {
         TargetKind::Mlx => ToolEmulation::MlxInject,
         TargetKind::Gguf => ToolEmulation::GgufSalvage,
-        TargetKind::Cloud | TargetKind::Alias | TargetKind::Uplink => ToolEmulation::None,
+        TargetKind::Cloud | TargetKind::Alias | TargetKind::Uplink | TargetKind::Replica => {
+            ToolEmulation::None
+        }
     }
 }
 

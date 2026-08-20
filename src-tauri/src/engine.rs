@@ -243,6 +243,13 @@ pub fn spawn_maintenance(services: Arc<AppServices>) {
             let _ = maintenance_store.purge_old_logs(retention).await;
         }
     });
+    let publish = services.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            let _ = crate::publish::maintain(&publish).await;
+        }
+    });
 }
 
 pub fn default_data_dir() -> PathBuf {

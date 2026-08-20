@@ -1,4 +1,4 @@
-export type TargetKind = "cloud" | "gguf" | "mlx" | "alias" | "uplink";
+export type TargetKind = "cloud" | "gguf" | "mlx" | "alias" | "uplink" | "replica";
 export type AuthMode = "api_key" | "open_ai_subscription";
 export type WireProtocol = "open_ai_chat" | "open_ai_responses" | "anthropic_messages" | "gemini_generate_content";
 export type AccessTier = "paid" | "subscription" | "free_tier" | "starter_credits" | "experimental";
@@ -510,6 +510,40 @@ export interface UplinkParent {
   quota: QuotaStatus | null;
   joined_at: string;
   tls_fingerprint?: string | null;
+  may_publish: boolean;
+}
+
+export interface ReplicaView {
+  child_node_id: string;
+  local_model_id: string;
+  callback_url: string;
+  healthy: boolean;
+  last_seen: string;
+}
+
+export interface NetworkModel {
+  id: string;
+  capabilities: string[];
+  replicas: ReplicaView[];
+}
+
+export interface SharedImageNode {
+  node_id: string;
+  installed_at: string;
+}
+
+export interface SharedImage {
+  id: string;
+  name: string;
+  source_kind: string;
+  source_ref: string;
+  revision: string | null;
+  filename: string | null;
+  kind: string;
+  capabilities: string[];
+  size_bytes: number | null;
+  nodes: SharedImageNode[];
+  created_at: string;
 }
 
 export interface AuthStatus {

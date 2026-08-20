@@ -114,6 +114,14 @@ wrap_async!(user_permissions(id: String) -> crate::identity::EffectivePermission
 wrap_async!(join_uplink(input: crate::uplink::JoinUplinkInput) -> crate::uplink::UplinkParent);
 wrap_async!(uplink_status() -> Option<crate::uplink::UplinkParent>);
 wrap_async!(disconnect_uplink() -> ());
+wrap_async!(publish_local_model(input: crate::publish::PublishLocalModelInput) -> crate::publish::NetworkModel);
+wrap_async!(unpublish_local_model(input: crate::publish::UnpublishInput) -> ());
+wrap_async!(list_network_models() -> Vec<crate::publish::NetworkModel>);
+wrap_async!(list_shared_images() -> Vec<crate::publish::SharedImage>);
+wrap_async!(list_parent_shared_images() -> Vec<crate::publish::SharedImage>);
+wrap_async!(register_shared_image(input: crate::publish::RegisterSharedImageInput) -> crate::publish::SharedImage);
+wrap_async!(pull_shared_image(input: crate::publish::PullSharedImageInput) -> ModelTarget);
+wrap_async!(report_shared_image_installed(input: crate::publish::PullSharedImageInput) -> ());
 wrap_async!(reveal_operator_bootstrap() -> Option<String>);
 wrap_async!(list_oidc_allowlist() -> Vec<crate::identity::OidcAllowlistEntry>);
 wrap_async!(invite_oidc_identity(provider: String, identifier: String, user_id: Option<String>) -> crate::identity::OidcAllowlistEntry);

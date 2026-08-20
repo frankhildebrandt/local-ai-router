@@ -4,7 +4,7 @@ import type {
   DashboardData, InstallJob, KeyUsageData, LocalApiKey, LocalCatalog, LogFacets, LogQuery, LogResult,
   ModelMetadata, ModelRoute, ModelTarget, Provider, ProviderModel, ProviderPreset, PublicModel,
   ResourcePolicy, RoutingAttempt, RoutingConfigExport, RoutingPolicy, RoutingTaskDefinition,
-  SearchPage, TargetRoutingProfile, UsageData, AuthStatus, DirectoryGroup, DirectoryUser, OidcAllowlistEntry,
+  SearchPage, TargetRoutingProfile, UsageData,   AuthStatus, DirectoryGroup, DirectoryUser, NetworkModel, OidcAllowlistEntry, SharedImage,
   UplinkParent,
 } from "./types";
 
@@ -49,6 +49,9 @@ export const queryKeys = {
   directoryGroups: ["directory-groups"] as const,
   oidcAllowlist: ["oidc-allowlist"] as const,
   uplink: ["uplink"] as const,
+  networkModels: ["network-models"] as const,
+  sharedImages: ["shared-images"] as const,
+  parentSharedImages: ["parent-shared-images"] as const,
 };
 
 export function invalidateAppQueries(client: QueryClient) {
@@ -110,4 +113,7 @@ export const fetchers = {
   directoryGroups: () => command<DirectoryGroup[]>("list_directory_groups"),
   oidcAllowlist: () => command<OidcAllowlistEntry[]>("list_oidc_allowlist"),
   uplinkStatus: () => command<UplinkParent | null>("uplink_status"),
+  networkModels: () => command<NetworkModel[]>("list_network_models"),
+  sharedImages: () => command<SharedImage[]>("list_shared_images"),
+  parentSharedImages: () => command<SharedImage[]>("list_parent_shared_images"),
 };

@@ -34,6 +34,7 @@ pub enum TargetKind {
     Mlx,
     Alias,
     Uplink,
+    Replica,
 }
 
 impl TargetKind {
@@ -49,8 +50,12 @@ impl TargetKind {
         matches!(self, Self::Uplink)
     }
 
+    pub fn is_replica(&self) -> bool {
+        matches!(self, Self::Replica)
+    }
+
     pub fn is_remote(&self) -> bool {
-        matches!(self, Self::Cloud | Self::Uplink)
+        matches!(self, Self::Cloud | Self::Uplink | Self::Replica)
     }
 }
 

@@ -6,7 +6,7 @@ use std::{
 
 use axum::{
     body::{Body, Bytes},
-    extract::{OriginalUri, State},
+    extract::{OriginalUri, Path, State},
     http::{header, HeaderMap, HeaderValue, StatusCode},
     response::Response,
     routing::{get, post},
@@ -97,6 +97,12 @@ fn router_with_state(state: GatewayState) -> Router {
         .route("/uplink/join", post(uplink_join))
         .route("/uplink/models", get(uplink_models))
         .route("/uplink/leave", post(uplink_leave))
+        .route("/uplink/publish", post(uplink_publish))
+        .route("/uplink/unpublish", post(uplink_unpublish))
+        .route("/uplink/replicas/heartbeat", post(uplink_replica_heartbeat))
+        .route("/uplink/images", get(uplink_images).post(uplink_register_image))
+        .route("/uplink/images/{id}/blob", get(uplink_image_blob).post(uplink_image_blob_upload))
+        .route("/uplink/images/{id}/installed", post(uplink_image_installed))
         .with_state(state)
 }
 
@@ -291,6 +297,9 @@ async fn proxy(
     };
     let route = resolved.route;
     if let Err(response) = enforce_uplink_access(&core, &caller, public_protocol, &alias).await {
+        return response;
+    }
+    if let Err(response) = enforce_replica_access(&core, &caller, public_protocol, &alias).await {
         return response;
     }
     let capability = endpoint_capability(uri.path());
@@ -819,6 +828,9 @@ async fn proxy(
                 }
             };
             let Ok((base_url, credential, account_id)) = core.target_endpoint(&target).await else {
+                if target.kind.is_replica() {
+                    let _ = crate::publish::mark_replica_unhealthy(&core.store, &target.id).await;
+                }
                 record_skipped_hop(
                     &core,
                     &evaluation,
@@ -930,7 +942,7 @@ async fn proxy(
             } else {
                 None
             };
-            let upstream_path = if target.kind.is_uplink() {
+            let upstream_path = if target.kind.is_uplink() || target.kind.is_replica() {
                 crate::uplink::uplink_upstream_path(uri.path(), &target.provider_model)
             } else if provider
                 .as_ref()
@@ -959,7 +971,7 @@ async fn proxy(
                 .unwrap_or_else(|_| core.client.clone());
             let mut request = client.post(upstream_url);
             if let Some(payload) = json_payload.as_mut() {
-                let mut outbound = if target.kind.is_uplink() {
+                let mut outbound = if target.kind.is_uplink() || target.kind.is_replica() {
                     let mut native = payload.clone();
                     if native.get("model").is_some() {
                         native["model"] = Value::String(target.provider_model.clone());
@@ -2425,6 +2437,12 @@ fn with_routing_headers(
             HeaderValue::from_static("uplink"),
         );
     }
+    if crate::publish::is_replica_target_id(target_id) {
+        response.headers_mut().insert(
+            axum::http::HeaderName::from_static("x-local-ai-hop"),
+            HeaderValue::from_static("replica"),
+        );
+    }
     response
 }
 
@@ -2649,6 +2667,9 @@ async fn authenticated_caller(core: &AppCore, headers: &HeaderMap) -> Option<Gat
     if let Some(id) = core.authorized_token(candidate).await {
         return Some(GatewayCaller::LocalApiKey { id });
     }
+    if crate::publish::authenticate_replica_inbound(core, candidate).await {
+        return Some(GatewayCaller::ReplicaInbound);
+    }
     crate::uplink::authenticate_token(core, candidate)
         .await
         .map(GatewayCaller::Uplink)
@@ -2658,6 +2679,7 @@ async fn authenticated_caller(core: &AppCore, headers: &HeaderMap) -> Option<Gat
 enum GatewayCaller {
     LocalApiKey { id: String },
     Uplink(crate::uplink::UplinkCaller),
+    ReplicaInbound,
 }
 
 impl GatewayCaller {
@@ -2665,20 +2687,21 @@ impl GatewayCaller {
         match self {
             Self::LocalApiKey { id } => id.clone(),
             Self::Uplink(caller) => format!("uplink:{}", caller.user_id),
+            Self::ReplicaInbound => "replica-inbound".into(),
         }
     }
 
     fn api_key_id(&self) -> Option<&str> {
         match self {
             Self::LocalApiKey { id } => Some(id),
-            Self::Uplink(_) => None,
+            Self::Uplink(_) | Self::ReplicaInbound => None,
         }
     }
 
     fn directory_user_id(&self) -> Option<&str> {
         match self {
             Self::Uplink(caller) => Some(caller.user_id.as_str()),
-            Self::LocalApiKey { .. } => None,
+            Self::LocalApiKey { .. } | Self::ReplicaInbound => None,
         }
     }
 }
@@ -2689,6 +2712,8 @@ async fn hop_http_client(
 ) -> anyhow::Result<reqwest::Client> {
     if target.kind.is_uplink() {
         crate::uplink::parent_http_client(&core.store).await
+    } else if target.kind.is_replica() {
+        crate::publish::replica_http_client(&core.store, &target.id).await
     } else {
         Ok(core.client.clone())
     }
@@ -2699,19 +2724,30 @@ async fn filter_routes_for_caller(
     caller: &GatewayCaller,
     routes: Vec<crate::domain::ModelRoute>,
 ) -> Vec<crate::domain::ModelRoute> {
-    let GatewayCaller::Uplink(uplink) = caller else {
-        return routes;
-    };
-    let Ok(Some(user)) = core.store.directory_user(&uplink.user_id).await else {
-        return Vec::new();
-    };
-    let Ok(permissions) = core.store.permissions_for(&user).await else {
-        return Vec::new();
-    };
-    routes
-        .into_iter()
-        .filter(|route| permissions.allows_model(&route.alias))
-        .collect()
+    match caller {
+        GatewayCaller::LocalApiKey { .. } => routes,
+        GatewayCaller::ReplicaInbound => {
+            let offered = crate::publish::offered_local_model_ids(&core.store)
+                .await
+                .unwrap_or_default();
+            routes
+                .into_iter()
+                .filter(|route| offered.iter().any(|id| id == &route.alias))
+                .collect()
+        }
+        GatewayCaller::Uplink(uplink) => {
+            let Ok(Some(user)) = core.store.directory_user(&uplink.user_id).await else {
+                return Vec::new();
+            };
+            let Ok(permissions) = core.store.permissions_for(&user).await else {
+                return Vec::new();
+            };
+            routes
+                .into_iter()
+                .filter(|route| permissions.allows_model(&route.alias))
+                .collect()
+        }
+    }
 }
 
 async fn enforce_uplink_access(
@@ -2824,6 +2860,13 @@ async fn uplink_models(State(state): State<GatewayState>, headers: HeaderMap) ->
             let parent_node_id = crate::uplink::node_id(&state.core.store)
                 .await
                 .unwrap_or_default();
+            let may_publish = state
+                .core
+                .store
+                .permissions_for(&user)
+                .await
+                .map(|permissions| permissions.may_publish)
+                .unwrap_or(false);
             json_response(
                 StatusCode::OK,
                 serde_json::to_value(crate::uplink::JoinResponse {
@@ -2846,6 +2889,7 @@ async fn uplink_models(State(state): State<GatewayState>, headers: HeaderMap) ->
                         daily_usd_budget: None,
                         daily_usd_used: 0.0,
                     }),
+                    may_publish,
                 })
                 .unwrap_or(json!({})),
             )
@@ -2864,9 +2908,204 @@ async fn uplink_leave(State(state): State<GatewayState>, headers: HeaderMap) -> 
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.strip_prefix("Bearer "));
     if let Some(token) = candidate {
-        let _ = crate::uplink::revoke_session(&state.core.store, token).await;
+        let _ = crate::uplink::revoke_session(&state.core, token).await;
     }
     json_response(StatusCode::OK, json!({"ok": true}))
+}
+
+async fn require_uplink(
+    core: &AppCore,
+    headers: &HeaderMap,
+) -> Result<crate::uplink::UplinkCaller, Response<Body>> {
+    match authenticated_caller(core, headers).await {
+        Some(GatewayCaller::Uplink(caller)) => Ok(caller),
+        _ => Err(openai_error(
+            StatusCode::UNAUTHORIZED,
+            "invalid_api_key",
+            "Invalid uplink session",
+        )),
+    }
+}
+
+fn publish_error_response(error: anyhow::Error) -> Response<Body> {
+    let message = error.to_string();
+    let status = if message.contains("not allowed") {
+        StatusCode::FORBIDDEN
+    } else if message.contains("not found") || message.contains("unknown") {
+        StatusCode::NOT_FOUND
+    } else {
+        StatusCode::BAD_REQUEST
+    };
+    json_response(
+        status,
+        json!({"error": {"code": "publish_failed", "message": message}}),
+    )
+}
+
+async fn uplink_publish(
+    State(state): State<GatewayState>,
+    headers: HeaderMap,
+    Json(request): Json<crate::publish::AdvertiseRequest>,
+) -> Response<Body> {
+    let caller = match require_uplink(&state.core, &headers).await {
+        Ok(caller) => caller,
+        Err(response) => return response,
+    };
+    match crate::publish::accept_publish(&state.core, &caller, request).await {
+        Ok(model) => json_response(StatusCode::OK, serde_json::to_value(model).unwrap_or(json!({}))),
+        Err(error) => publish_error_response(error),
+    }
+}
+
+async fn uplink_unpublish(
+    State(state): State<GatewayState>,
+    headers: HeaderMap,
+    Json(request): Json<serde_json::Value>,
+) -> Response<Body> {
+    let caller = match require_uplink(&state.core, &headers).await {
+        Ok(caller) => caller,
+        Err(response) => return response,
+    };
+    let Some(network_model_id) = request
+        .get("network_model_id")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+    else {
+        return publish_error_response(anyhow::anyhow!("network_model_id is required"));
+    };
+    match crate::publish::accept_unpublish(&state.core, &caller, &network_model_id).await {
+        Ok(()) => json_response(StatusCode::OK, json!({"ok": true})),
+        Err(error) => publish_error_response(error),
+    }
+}
+
+async fn uplink_replica_heartbeat(
+    State(state): State<GatewayState>,
+    headers: HeaderMap,
+) -> Response<Body> {
+    let caller = match require_uplink(&state.core, &headers).await {
+        Ok(caller) => caller,
+        Err(response) => return response,
+    };
+    match crate::publish::accept_heartbeat(&state.core, &caller).await {
+        Ok(replicas) => {
+            json_response(StatusCode::OK, serde_json::to_value(replicas).unwrap_or(json!([])))
+        }
+        Err(error) => publish_error_response(error),
+    }
+}
+
+async fn uplink_images(State(state): State<GatewayState>, headers: HeaderMap) -> Response<Body> {
+    if require_uplink(&state.core, &headers).await.is_err() {
+        return openai_error(
+            StatusCode::UNAUTHORIZED,
+            "invalid_api_key",
+            "Invalid uplink session",
+        );
+    }
+    match crate::publish::list_shared_images(&state.core.store).await {
+        Ok(images) => json_response(StatusCode::OK, serde_json::to_value(images).unwrap_or(json!([]))),
+        Err(error) => publish_error_response(error),
+    }
+}
+
+async fn uplink_register_image(
+    State(state): State<GatewayState>,
+    headers: HeaderMap,
+    Json(input): Json<crate::publish::RegisterSharedImageInput>,
+) -> Response<Body> {
+    let caller = match require_uplink(&state.core, &headers).await {
+        Ok(caller) => caller,
+        Err(response) => return response,
+    };
+    match crate::publish::accept_register_image(&state.core, &caller, input).await {
+        Ok(image) => json_response(StatusCode::OK, serde_json::to_value(image).unwrap_or(json!({}))),
+        Err(error) => publish_error_response(error),
+    }
+}
+
+async fn uplink_image_blob(
+    State(state): State<GatewayState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> Response<Body> {
+    if require_uplink(&state.core, &headers).await.is_err() {
+        return openai_error(
+            StatusCode::UNAUTHORIZED,
+            "invalid_api_key",
+            "Invalid uplink session",
+        );
+    }
+    match crate::publish::shared_image_blob(&state.core.store, &id).await {
+        Ok(bytes) => Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "application/octet-stream")
+            .body(Body::from(bytes))
+            .unwrap_or_else(|_| openai_error(StatusCode::INTERNAL_SERVER_ERROR, "storage_error", "Unable to return catalog blob")),
+        Err(error) => publish_error_response(error),
+    }
+}
+
+async fn uplink_image_blob_upload(
+    State(state): State<GatewayState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response<Body> {
+    let caller = match require_uplink(&state.core, &headers).await {
+        Ok(caller) => caller,
+        Err(response) => return response,
+    };
+    match crate::publish::accept_image_blob(&state.core, &caller, &id, &body).await {
+        Ok(image) => json_response(StatusCode::OK, serde_json::to_value(image).unwrap_or(json!({}))),
+        Err(error) => publish_error_response(error),
+    }
+}
+
+async fn uplink_image_installed(
+    State(state): State<GatewayState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> Response<Body> {
+    let caller = match require_uplink(&state.core, &headers).await {
+        Ok(caller) => caller,
+        Err(response) => return response,
+    };
+    match crate::publish::mark_image_installed(&state.core.store, &id, &caller.child_node_id).await {
+        Ok(()) => json_response(StatusCode::OK, json!({"ok": true})),
+        Err(error) => publish_error_response(error),
+    }
+}
+
+async fn enforce_replica_access(
+    core: &AppCore,
+    caller: &GatewayCaller,
+    public_protocol: Option<crate::protocol::PublicProtocol>,
+    alias: &str,
+) -> Result<(), Response<Body>> {
+    if !matches!(caller, GatewayCaller::ReplicaInbound) {
+        return Ok(());
+    }
+    let offered = match crate::publish::offered_local_model_ids(&core.store).await {
+        Ok(ids) => ids,
+        Err(_) => {
+            return Err(request_error(
+                public_protocol,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "storage_error",
+                "Unable to read published offers",
+            ))
+        }
+    };
+    if offered.iter().any(|id| id == alias) {
+        return Ok(());
+    }
+    Err(request_error(
+        public_protocol,
+        StatusCode::FORBIDDEN,
+        "model_not_allowed",
+        "This replica session is not allowed to call that model",
+    ))
 }
 
 fn protocol_for_path(path: &str) -> Option<PublicProtocol> {
