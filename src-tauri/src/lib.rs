@@ -57,11 +57,15 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
-        .plugin(
-            tauri_plugin_autostart::Builder::new()
+        .plugin({
+            #[cfg(target_os = "macos")]
+            let plugin = tauri_plugin_autostart::Builder::new()
                 .macos_launcher(tauri_plugin_autostart::MacosLauncher::LaunchAgent)
-                .build(),
-        )
+                .build();
+            #[cfg(not(target_os = "macos"))]
+            let plugin = tauri_plugin_autostart::Builder::new().build();
+            plugin
+        })
         .setup(|app| {
             let app_data = app.path().app_data_dir()?;
             let resource_dir = app.path().resource_dir()?;
@@ -229,6 +233,7 @@ pub fn run() {
         .expect("error while running Local AI Router")
         .run(|app, event| match event {
             RunEvent::ExitRequested { .. } => desktop::shutdown(app),
+            #[cfg(target_os = "macos")]
             RunEvent::Reopen { .. } => desktop::show_main_window(app),
             _ => {}
         });
