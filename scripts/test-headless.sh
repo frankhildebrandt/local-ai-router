@@ -5,7 +5,15 @@ cd "$(dirname "$0")/.."
 ROOT="$(pwd)"
 DATA="$(mktemp -d "${TMPDIR:-/tmp}/lar-headless.XXXXXX")"
 UI="$DATA/ui"
-PORT="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')"
+if command -v python3 >/dev/null 2>&1; then
+  PYTHON_BIN=python3
+elif command -v python >/dev/null 2>&1; then
+  PYTHON_BIN=python
+else
+  echo "python3 or python is required" >&2
+  exit 1
+fi
+PORT="$("$PYTHON_BIN" -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')"
 cleanup() {
   if [ -n "${PID:-}" ]; then
     kill "$PID" 2>/dev/null || true
@@ -23,7 +31,11 @@ else
 fi
 
 cargo build --manifest-path src-tauri/Cargo.toml --quiet
-"$ROOT/src-tauri/target/debug/local-ai-router" serve \
+BIN="$ROOT/src-tauri/target/debug/local-ai-router"
+if [ -f "$BIN.exe" ]; then
+  BIN="$BIN.exe"
+fi
+"$BIN" serve \
   --port "$PORT" \
   --data-dir "$DATA/data" \
   --ui-dir "$UI" \
@@ -55,7 +67,7 @@ esac
 created="$(curl -fsS -H "Content-Type: application/json" \
   -d '{"name":"Smoke"}' \
   "http://127.0.0.1:$PORT/admin/create_local_api_key")"
-token="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["token"])' "$created")"
+token="$("$PYTHON_BIN" -c 'import json,sys; print(json.loads(sys.argv[1])["token"])' "$created")"
 case "$token" in
   lar_*) ;;
   *)

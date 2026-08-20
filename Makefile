@@ -1,4 +1,4 @@
-.PHONY: dev test build build-dmg build-linux
+.PHONY: dev test build build-dmg build-linux build-windows
 
 dev:
 	npm run tauri dev
@@ -16,3 +16,6 @@ build-dmg:
 
 build-linux:
 	npm run tauri build -- --bundles appimage,deb
+
+build-windows:
+	npm run tauri build -- --bundles nsis

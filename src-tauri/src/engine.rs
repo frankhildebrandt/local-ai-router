@@ -242,6 +242,7 @@ pub(crate) fn resource_dir_from_exe_dir(exe_dir: &Path) -> PathBuf {
             return linux;
         }
     }
+    // Windows NSIS/MSI and the headless zip place ui/ and sidecars/ next to the exe.
     exe_dir.to_path_buf()
 }
 
@@ -332,6 +333,8 @@ Defaults match the desktop app:
 fn default_data_dir_help() -> &'static str {
     if cfg!(target_os = "macos") {
         "~/Library/Application Support/app.local-ai-router.desktop"
+    } else if cfg!(windows) {
+        r"%APPDATA%\app.local-ai-router.desktop"
     } else {
         "$XDG_DATA_HOME/app.local-ai-router.desktop (default ~/.local/share/...)"
     }
@@ -342,6 +345,8 @@ fn default_secrets_help() -> &'static str {
         "macOS Keychain service app.local-ai-router.desktop"
     } else if cfg!(target_os = "linux") {
         "Secret Service (GNOME Keyring/KWallet), or --secrets-file for headless/systemd"
+    } else if cfg!(windows) {
+        "Windows Credential Manager, or --secrets-file for an isolated JSON vault"
     } else {
         "the platform keyring, or --secrets-file for an isolated 0600 JSON vault"
     }
@@ -495,6 +500,46 @@ mod tests {
     }
 
     #[test]
+    fn packaged_windows_layout_resolves_ui_and_sidecars_next_to_the_exe() {
+        let root = tempfile::tempdir().unwrap();
+        let exe_dir = root.path().join("Local AI Router");
+        let ui = exe_dir.join("ui");
+        let sidecars = exe_dir.join("sidecars/bin");
+        std::fs::create_dir_all(&ui).unwrap();
+        std::fs::create_dir_all(&sidecars).unwrap();
+        std::fs::write(ui.join("index.html"), "<title>Local AI Router</title>").unwrap();
+        std::fs::write(
+            sidecars.join("llama-server-x86_64-pc-windows-msvc.exe"),
+            b"",
+        )
+        .unwrap();
+
+        let resolved = resource_dir_from_exe_dir(&exe_dir);
+        assert_eq!(
+            resolved.canonicalize().unwrap(),
+            exe_dir.canonicalize().unwrap()
+        );
+        assert_eq!(
+            ui_dir_from_resource_dir(&resolved)
+                .unwrap()
+                .canonicalize()
+                .unwrap(),
+            ui.canonicalize().unwrap()
+        );
+        assert!(sidecars
+            .join("llama-server-x86_64-pc-windows-msvc.exe")
+            .is_file());
+    }
+
+    #[test]
+    fn tauri_conf_lists_nsis_for_windows_installers() {
+        let conf = include_str!("../tauri.conf.json");
+        assert!(conf.contains("\"nsis\""));
+        assert!(conf.contains("icon.ico"));
+        assert!(conf.contains("scripts/sync-ui.mjs"));
+    }
+
+    #[test]
     fn serve_args_parse_port_data_and_secrets() {
         let args = parse_serve_args([
             "--port",
@@ -533,6 +578,11 @@ mod tests {
             assert!(help.contains(".local/share") || help.contains("XDG_DATA_HOME"));
             assert!(help.contains("secret service") || help.contains("Secret Service"));
         }
+        #[cfg(windows)]
+        {
+            assert!(help.contains("APPDATA"));
+            assert!(help.contains("Credential Manager"));
+        }
     }
 
     #[test]
@@ -549,6 +599,15 @@ mod tests {
                 assert_eq!(dir, xdg.join("app.local-ai-router.desktop"));
             } else {
                 assert!(rendered.contains(".local/share"));
+            }
+        }
+        #[cfg(windows)]
+        {
+            let appdata = std::env::var_os("APPDATA").map(PathBuf::from);
+            if let Some(appdata) = appdata {
+                assert_eq!(dir, appdata.join("app.local-ai-router.desktop"));
+            } else {
+                assert!(rendered.contains("app.local-ai-router.desktop"));
             }
         }
     }
