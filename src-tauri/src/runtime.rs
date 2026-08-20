@@ -445,6 +445,11 @@ impl RuntimeManager {
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::piped());
+        #[cfg(windows)]
+        {
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            command.creation_flags(CREATE_NO_WINDOW);
+        }
         let mut child = command.spawn().context("starting inference sidecar")?;
         let pid = child.id().context("inference sidecar has no process id")?;
         set_background_priority(pid, policy.process_priority);
@@ -495,7 +500,7 @@ impl RuntimeManager {
         self.restart_attempted.lock().remove(id);
         if let Some(mut entry) = entry {
             entry.governor.cancel();
-            signal_process(entry.pid, libc::SIGCONT);
+            resume_sidecar(entry.pid);
             entry.child.kill().await?;
         }
         Ok(())
@@ -505,7 +510,7 @@ impl RuntimeManager {
         let entries = std::mem::take(&mut *self.entries.lock());
         for (_, mut entry) in entries {
             entry.governor.cancel();
-            signal_process(entry.pid, libc::SIGCONT);
+            resume_sidecar(entry.pid);
             let _ = entry.child.kill().await;
         }
     }
@@ -561,7 +566,7 @@ impl RuntimeManager {
             .map(|id| {
                 if let Some(entry) = entries.remove(&id) {
                     entry.governor.cancel();
-                    signal_process(entry.pid, libc::SIGCONT);
+                    resume_sidecar(entry.pid);
                 }
                 let may_restart = attempted.insert(id.clone());
                 (id, may_restart)
@@ -742,14 +747,14 @@ fn spawn_duty_governor(
                 break;
             }
             if activity.active(&target_id) == 0 {
-                signal_process(pid, libc::SIGCONT);
+                resume_sidecar(pid);
                 tokio::select! {
                     _ = cancellation.cancelled() => break,
                     _ = sleep(Duration::from_millis(50)) => {}
                 }
                 continue;
             }
-            signal_process(pid, libc::SIGCONT);
+            resume_sidecar(pid);
             tokio::select! {
                 _ = cancellation.cancelled() => break,
                 _ = sleep(active_slice) => {}
@@ -757,13 +762,13 @@ fn spawn_duty_governor(
             if cancellation.is_cancelled() {
                 break;
             }
-            signal_process(pid, libc::SIGSTOP);
+            pause_sidecar(pid);
             tokio::select! {
                 _ = cancellation.cancelled() => break,
                 _ = sleep(paused_slice) => {}
             }
         }
-        signal_process(pid, libc::SIGCONT);
+        resume_sidecar(pid);
     });
 }
 
@@ -773,6 +778,16 @@ fn duty_slices(duty_percent: u8) -> (Duration, Duration) {
     (active, window.saturating_sub(active))
 }
 
+fn resume_sidecar(_pid: u32) {
+    #[cfg(unix)]
+    signal_process(_pid, libc::SIGCONT);
+}
+
+fn pause_sidecar(_pid: u32) {
+    #[cfg(unix)]
+    signal_process(_pid, libc::SIGSTOP);
+}
+
 #[cfg(unix)]
 fn signal_process(pid: u32, signal: libc::c_int) {
     // The PID comes directly from the child we spawned and is never user-controlled.
@@ -780,9 +795,6 @@ fn signal_process(pid: u32, signal: libc::c_int) {
         libc::kill(pid as libc::pid_t, signal);
     }
 }
-
-#[cfg(not(unix))]
-fn signal_process(_pid: u32, _signal: libc::c_int) {}
 
 #[cfg(unix)]
 fn set_background_priority(pid: u32, priority: i8) {
@@ -975,6 +987,14 @@ pub fn image_pipeline_for(target: &ModelTarget) -> &'static str {
     "flux2"
 }
 
+fn host_sidecar_filename(stem: &str) -> String {
+    let mut name = format!("{stem}-{}", env!("TARGET"));
+    if cfg!(windows) {
+        name.push_str(".exe");
+    }
+    name
+}
+
 pub fn sidecar_binary_name(engine: &str, kind: TargetKind) -> anyhow::Result<String> {
     let stem = match engine {
         "mlx_image" => "mlx-image-server",
@@ -986,15 +1006,15 @@ pub fn sidecar_binary_name(engine: &str, kind: TargetKind) -> anyhow::Result<Str
             _ => anyhow::bail!("not a local target"),
         },
     };
-    Ok(format!("{stem}-{}", env!("TARGET")))
+    Ok(host_sidecar_filename(stem))
 }
 
 fn host_sidecar_names() -> [String; 4] {
     [
-        format!("llama-server-{}", env!("TARGET")),
-        format!("mlx-server-{}", env!("TARGET")),
-        format!("mlx-image-server-{}", env!("TARGET")),
-        format!("mlx-speech-server-{}", env!("TARGET")),
+        host_sidecar_filename("llama-server"),
+        host_sidecar_filename("mlx-server"),
+        host_sidecar_filename("mlx-image-server"),
+        host_sidecar_filename("mlx-speech-server"),
     ]
 }
 
@@ -1018,21 +1038,29 @@ mod tests {
     fn local_sidecars_are_named_for_the_compile_target() {
         assert_eq!(
             sidecar_binary_name("llama", TargetKind::Gguf).unwrap(),
-            format!("llama-server-{}", env!("TARGET"))
+            host_sidecar_filename("llama-server")
         );
         assert_eq!(
             sidecar_binary_name("mlx_chat", TargetKind::Mlx).unwrap(),
-            format!("mlx-server-{}", env!("TARGET"))
+            host_sidecar_filename("mlx-server")
         );
         assert_eq!(
             sidecar_binary_name("mlx_image", TargetKind::Mlx).unwrap(),
-            format!("mlx-image-server-{}", env!("TARGET"))
+            host_sidecar_filename("mlx-image-server")
         );
         assert_eq!(
             sidecar_binary_name("mlx_speech", TargetKind::Mlx).unwrap(),
-            format!("mlx-speech-server-{}", env!("TARGET"))
+            host_sidecar_filename("mlx-speech-server")
         );
         assert!(sidecar_binary_name("cloud", TargetKind::Cloud).is_err());
+        #[cfg(windows)]
+        assert!(sidecar_binary_name("llama", TargetKind::Gguf)
+            .unwrap()
+            .ends_with(".exe"));
+        #[cfg(not(windows))]
+        assert!(!sidecar_binary_name("llama", TargetKind::Gguf)
+            .unwrap()
+            .ends_with(".exe"));
     }
 
     #[test]

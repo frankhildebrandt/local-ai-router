@@ -15,6 +15,8 @@ job_count() {
     nproc
   elif command -v sysctl >/dev/null 2>&1; then
     sysctl -n hw.logicalcpu
+  elif [[ -n "${NUMBER_OF_PROCESSORS:-}" ]]; then
+    echo "$NUMBER_OF_PROCESSORS"
   else
     echo 4
   fi
@@ -47,14 +49,40 @@ llama_cmake_flags=(-DCMAKE_BUILD_TYPE=Release -DLLAMA_BUILD_SERVER=ON -DLLAMA_BU
 if [[ "$OS" == Darwin ]]; then
   llama_cmake_flags+=(-DGGML_METAL=ON)
 else
-  # CPU GGUF only on Linux for this slice; CUDA/Vulkan ship in later issues.
-  llama_cmake_flags+=(-DGGML_METAL=OFF -DGGML_CUDA=OFF -DGGML_VULKAN=OFF)
+  # CPU GGUF only on Linux/Windows for this slice; CUDA/Vulkan ship in later issues.
+  llama_cmake_flags+=(-DGGML_METAL=OFF -DGGML_CUDA=OFF -DGGML_VULKAN=OFF -DBUILD_SHARED_LIBS=OFF)
 fi
 cmake -S "$BUILD_DIR/llama.cpp" -B "$BUILD_DIR/llama.cpp/build" "${llama_cmake_flags[@]}"
 cmake --build "$BUILD_DIR/llama.cpp/build" --config Release --target llama-server -j "$(job_count)"
-cp "$BUILD_DIR/llama.cpp/build/bin/llama-server" "$BIN_DIR/llama-server-$HOST_TRIPLE"
+
+llama_server=""
+for candidate in \
+  "$BUILD_DIR/llama.cpp/build/bin/llama-server" \
+  "$BUILD_DIR/llama.cpp/build/bin/llama-server.exe" \
+  "$BUILD_DIR/llama.cpp/build/bin/Release/llama-server.exe" \
+  "$BUILD_DIR/llama.cpp/build/Release/llama-server.exe"; do
+  if [[ -f "$candidate" ]]; then
+    llama_server="$candidate"
+    break
+  fi
+done
+if [[ -z "$llama_server" ]]; then
+  echo "missing llama-server after cmake build" >&2
+  exit 1
+fi
+llama_dest="$BIN_DIR/llama-server-$HOST_TRIPLE"
+case "$llama_server" in
+  *.exe) llama_dest="$llama_dest.exe" ;;
+esac
+cp "$llama_server" "$llama_dest"
+llama_dir="$(dirname "$llama_server")"
+shopt -s nullglob
+for dll in "$llama_dir"/*.dll; do
+  cp "$dll" "$BIN_DIR/"
+done
+shopt -u nullglob
 cp "$BUILD_DIR/llama.cpp/LICENSE" "$LICENSE_DIR/llama.cpp-LICENSE"
-chmod +x "$BIN_DIR/llama-server-$HOST_TRIPLE"
+chmod +x "$llama_dest"
 
 if [[ "$OS" != Darwin ]]; then
   echo "Skipping MLX sidecars on $OS (Apple Silicon only)."

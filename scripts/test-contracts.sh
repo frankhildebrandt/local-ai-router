@@ -14,7 +14,16 @@ curl --silent --fail http://127.0.0.1:11436/health >/dev/null
 node "$PROJECT_DIR/tests/openai-contract.mjs"
 node "$PROJECT_DIR/tests/multiprotocol-contract.mjs"
 
-PYTHON_BIN="${PYTHON_BIN:-python3}"
+PYTHON_BIN="${PYTHON_BIN:-}"
+if [ -z "$PYTHON_BIN" ]; then
+  if command -v python3 >/dev/null 2>&1; then
+    PYTHON_BIN=python3
+  elif command -v python >/dev/null 2>&1; then
+    PYTHON_BIN=python
+  else
+    PYTHON_BIN=python3
+  fi
+fi
 if "$PYTHON_BIN" -c 'import openai' >/dev/null 2>&1; then
   "$PYTHON_BIN" "$PROJECT_DIR/tests/openai_contract.py"
 elif [[ "${REQUIRE_PYTHON_CONTRACT:-0}" == "1" ]]; then

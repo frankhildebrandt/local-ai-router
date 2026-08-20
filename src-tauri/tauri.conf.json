@@ -6,7 +6,7 @@
   "build": {
     "beforeDevCommand": "npm run dev",
     "devUrl": "http://localhost:1420",
-    "beforeBuildCommand": "npm run build && rm -rf src-tauri/ui && cp -R dist src-tauri/ui",
+    "beforeBuildCommand": "npm run build && node scripts/sync-ui.mjs",
     "frontendDist": "../dist"
   },
   "app": {
@@ -27,7 +27,7 @@
   },
   "bundle": {
     "active": true,
-    "targets": ["dmg", "app", "appimage", "deb"],
+    "targets": ["dmg", "app", "appimage", "deb", "nsis"],
     "icon": [
       "icons/icon.icns",
       "icons/icon.png",
