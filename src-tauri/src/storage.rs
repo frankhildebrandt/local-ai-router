@@ -563,6 +563,7 @@ impl Store {
             .await?;
         crate::identity::migrate(&self.pool).await?;
         crate::uplink::migrate(&self.pool).await?;
+        crate::publish::migrate(&self.pool).await?;
         self.set_default("port", "11435").await?;
         self.set_default("bind_mode", "loopback").await?;
         self.set_default("memory_budget_percent", "70").await?;
@@ -2284,6 +2285,7 @@ pub fn encode_kind(kind: &TargetKind) -> &'static str {
         TargetKind::Mlx => "mlx",
         TargetKind::Alias => "alias",
         TargetKind::Uplink => "uplink",
+        TargetKind::Replica => "replica",
     }
 }
 
@@ -2294,6 +2296,7 @@ pub fn decode_kind(value: &str) -> anyhow::Result<TargetKind> {
         "mlx" => Ok(TargetKind::Mlx),
         "alias" => Ok(TargetKind::Alias),
         "uplink" => Ok(TargetKind::Uplink),
+        "replica" => Ok(TargetKind::Replica),
         _ => anyhow::bail!("unknown target kind: {value}"),
     }
 }

@@ -272,6 +272,14 @@ async fn deny_if_needed(
             return Some((StatusCode::FORBIDDEN, "admin permission required").into_response());
         }
     }
+    if is_publish_command(name) {
+        let Ok(permissions) = state.services.core.store.permissions_for(user).await else {
+            return Some((StatusCode::FORBIDDEN, "publish permission required").into_response());
+        };
+        if !permissions.may_publish {
+            return Some((StatusCode::FORBIDDEN, "publish permission required").into_response());
+        }
+    }
     None
 }
 
@@ -280,6 +288,10 @@ fn is_public_command(name: &str) -> bool {
         name,
         "auth_status" | "login" | "logout" | "begin_oidc_login"
     )
+}
+
+fn is_publish_command(name: &str) -> bool {
+    matches!(name, "register_shared_image")
 }
 
 fn is_admin_command(name: &str) -> bool {
@@ -635,6 +647,20 @@ async fn dispatch(services: &AppServices, name: &str, args: Value) -> Result<Val
         "uplink_status" => ok(commands::uplink_status(services).await?),
         "disconnect_uplink" => {
             commands::disconnect_uplink(services).await?;
+            Ok(Value::Null)
+        }
+        "publish_local_model" => ok(commands::publish_local_model(services, field(&args, "input")?).await?),
+        "unpublish_local_model" => {
+            commands::unpublish_local_model(services, field(&args, "input")?).await?;
+            Ok(Value::Null)
+        }
+        "list_network_models" => ok(commands::list_network_models(services).await?),
+        "list_shared_images" => ok(commands::list_shared_images(services).await?),
+        "list_parent_shared_images" => ok(commands::list_parent_shared_images(services).await?),
+        "register_shared_image" => ok(commands::register_shared_image(services, field(&args, "input")?).await?),
+        "pull_shared_image" => ok(commands::pull_shared_image(services, field(&args, "input")?).await?),
+        "report_shared_image_installed" => {
+            commands::report_shared_image_installed(services, field(&args, "input")?).await?;
             Ok(Value::Null)
         }
         "reveal_operator_bootstrap" => ok(commands::reveal_operator_bootstrap(services).await?),

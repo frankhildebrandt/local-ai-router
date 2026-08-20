@@ -2,7 +2,7 @@ import { useEffect, useMemo, useState, type FormEvent } from "react";
 import { keepPreviousData, useQuery, useQueryClient } from "@tanstack/react-query";
 import { open } from "@tauri-apps/plugin-dialog";
 import {
-  Box, Download, FileDown, LoaderCircle, Pause, Play, Search, Settings, Square, Trash2,
+  Box, Download, FileDown, LoaderCircle, Pause, Play, Search, Settings, Share2, Square, Trash2,
 } from "lucide-react";
 import { command, isTauri, listenInstallJobs } from "./api";
 import type {
@@ -167,11 +167,27 @@ function InstallJobs({ jobs, onChange, fail }: { jobs: InstallJob[]; onChange: (
 
 function InstalledLibrary({ local, resourcePolicy, refresh, success, fail }: { local: ModelTarget[] } & Pick<Common, "resourcePolicy" | "refresh" | "success" | "fail">) {
   const [editing, setEditing] = useState<ModelTarget | null>(null);
+  const [offering, setOffering] = useState<ModelTarget | null>(null);
+  const [networkId, setNetworkId] = useState("");
+  const uplinkQuery = useQuery({ queryKey: queryKeys.uplink, queryFn: fetchers.uplinkStatus });
+  const uplink = uplinkQuery.data ?? null;
   const toggle = async (model: ModelTarget) => { try { await command(model.state === "ready" ? "stop_local_model" : "start_local_model", { id: model.id }); await refresh(); success(model.state === "ready" ? "Model unloaded" : "Model loaded"); } catch (e) { fail(e); } };
+  const offer = async (event: FormEvent) => {
+    event.preventDefault();
+    if (!offering) return;
+    try {
+      await command("publish_local_model", { input: { localModelId: offering.provider_model || offering.name, networkModelId: networkId, callbackUrl: null, tlsFingerprint: null } });
+      setOffering(null);
+      setNetworkId("");
+      await refresh();
+      success(`Offered ${offering.name} as ${networkId}`);
+    } catch (error) { fail(error); }
+  };
   return <>
-    <div className="model-grid">{local.map(model => <article className="model-card" key={model.id}><div className="model-icon"><Box /></div><div className="grow"><div className="row"><h3>{model.name}</h3><span className={`badge ${model.state === "ready" ? "good" : "neutral"}`}>{model.state}</span>{model.resource_overrides && <span className="badge neutral">Custom resources</span>}{model.speculative_config && <span className="badge neutral">Speculative</span>}</div><p>{model.kind.toUpperCase()} · {formatBytes(model.size_bytes)}{model.provider_model ? ` · ${model.provider_model}` : ""}</p><div className="capabilities">{model.capabilities.map(item => <span key={item}>{item}</span>)}</div></div><button className="icon-button" title="Resource overrides" onClick={() => setEditing(model)}><Settings size={16} /></button><button className={model.state === "ready" ? "secondary" : "primary"} onClick={() => void toggle(model)}>{model.state === "ready" ? <Square size={15} /> : <Play size={15} />}{model.state === "ready" ? "Unload" : "Load"}</button><button className="icon-button danger" onClick={async () => { if (!confirm("Delete this model target?")) return; try { await command("delete_target", { id: model.id }); await refresh(); success("Model target deleted"); } catch (e) { fail(e); } }}><Trash2 size={16} /></button></article>)}</div>
+    <div className="model-grid">{local.map(model => <article className="model-card" key={model.id}><div className="model-icon"><Box /></div><div className="grow"><div className="row"><h3>{model.name}</h3><span className={`badge ${model.state === "ready" ? "good" : "neutral"}`}>{model.state}</span>{model.resource_overrides && <span className="badge neutral">Custom resources</span>}{model.speculative_config && <span className="badge neutral">Speculative</span>}</div><p>{model.kind.toUpperCase()} · {formatBytes(model.size_bytes)}{model.provider_model ? ` · ${model.provider_model}` : ""}</p><div className="capabilities">{model.capabilities.map(item => <span key={item}>{item}</span>)}</div></div>{uplink?.may_publish && <button className="secondary" onClick={() => { setOffering(model); setNetworkId(model.provider_model || model.name); }}><Share2 size={15} />Offer to parent</button>}<button className="icon-button" title="Resource overrides" onClick={() => setEditing(model)}><Settings size={16} /></button><button className={model.state === "ready" ? "secondary" : "primary"} onClick={() => void toggle(model)}>{model.state === "ready" ? <Square size={15} /> : <Play size={15} />}{model.state === "ready" ? "Unload" : "Load"}</button><button className="icon-button danger" onClick={async () => { if (!confirm("Delete this model target?")) return; try { await command("delete_target", { id: model.id }); await refresh(); success("Model target deleted"); } catch (e) { fail(e); } }}><Trash2 size={16} /></button></article>)}</div>
     {!local.length && <div className="empty"><div><Box /></div><h3>Your local library is empty</h3><p>Install a catalog model, import a GGUF file, or download from Hugging Face.</p></div>}
     {editing && <ModelResourceEditor model={editing} local={local} global={resourcePolicy} close={() => setEditing(null)} done={async () => { setEditing(null); await refresh(); success("Model resource overrides saved; a loaded runtime restarts after active requests finish"); }} success={success} fail={fail} />}
+    {offering && <div className="modal-backdrop" onMouseDown={() => setOffering(null)}><div className="modal" onMouseDown={event => event.stopPropagation()}><div className="modal-head"><h2>Offer to parent</h2><button className="icon-button" onClick={() => setOffering(null)}>×</button></div><form className="form" onSubmit={offer}><p>Advertise this running local model as a live replica. The parent must be able to reach this node (enable LAN HTTPS share). Unique imports belong in the shared image catalog, not here.</p><label className="field"><span>Network model ID</span><input aria-label="Network model ID" value={networkId} onChange={event => setNetworkId(event.target.value)} required /></label><div className="modal-actions"><button type="button" className="secondary" onClick={() => setOffering(null)}>Cancel</button><button className="primary" disabled={!networkId.trim()}>Offer</button></div></form></div></div>}
   </>;
 }
 

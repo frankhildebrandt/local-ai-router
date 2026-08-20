@@ -46,6 +46,8 @@ beforeEach(() => {
     if (name === "list_logs") return Promise.resolve({ total: 1, items: [{ id: "request", created_at: "2026-08-17T10:00:00Z", endpoint: "/v1/chat/completions", alias: "assistant", target: "cloud", attempts: 1, status: 200, latency_ms: 12, input_tokens: 3, output_tokens: 5, error_code: null, error_message: null, api_key_id: "default", api_key_name: "Default" }] });
     if (name === "get_settings") return Promise.resolve({});
     if (name === "uplink_status") return Promise.resolve(null);
+    if (name === "list_network_models" || name === "list_shared_images" || name === "list_parent_shared_images") return Promise.resolve([]);
+    if (name === "report_shared_image_installed") return Promise.resolve(null);
     if (name === "auth_status") return Promise.resolve({ login_required: false, authenticated: false, user: null, permissions: null, bind_mode: "loopback", bind_address: "127.0.0.1", tls_fingerprint: null, oidc_providers: [], operator_bootstrap_pending: false });
     if (name === "list_directory_users") return Promise.resolve([{ id: "op", username: "operator", display_name: "Operator", is_operator: true, disabled_at: null, created_at: "2026-08-20T00:00:00Z", group_ids: [], allowed_model_ids: null, may_publish: null, may_admin: null, has_password: true }]);
     if (name === "list_directory_groups" || name === "list_oidc_allowlist") return Promise.resolve([]);
@@ -316,6 +318,8 @@ describe("Local AI Router shell", () => {
     fireEvent.click(screen.getByRole("button", { name: "Settings" }));
     expect(await screen.findByLabelText("Inference profile")).toHaveValue("stealth");
     expect(screen.getByRole("heading", { name: "Uplink parent" })).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "Live network models" })).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "Shared image catalog" })).toBeInTheDocument();
     expect(screen.getByLabelText("Uplink parent URL")).toBeInTheDocument();
     expect(screen.getByRole("heading", { name: "Persistent local KV" })).toBeInTheDocument();
     expect(screen.queryByRole("heading", { name: "Local API keys" })).not.toBeInTheDocument();
@@ -454,6 +458,81 @@ describe("Local AI Router shell", () => {
     expect(screen.getByRole("button", { name: /Clear KV cache/ })).toBeInTheDocument();
     expect(screen.queryByText(/not supported by the MLX runtime/i)).not.toBeInTheDocument();
     expect(screen.getByText(/Metal/)).toBeInTheDocument();
+  });
+
+  it("offers a local model to the uplink parent when publishing is allowed", async () => {
+    const previous = command.getMockImplementation();
+    command.mockImplementation((name: string, args?: unknown) => {
+      if (name === "list_targets") {
+        return Promise.resolve([
+          { id: "local-qwen", provider_id: null, name: "Qwen 3.5", kind: "mlx", wire_protocol: "open_ai_chat", provider_model: "qwen", local_path: "/models/qwen", runtime_url: "http://127.0.0.1:12100/v1", capabilities: ["chat", "streaming"], enabled: true, state: "ready", size_bytes: 4_000_000_000 },
+        ]);
+      }
+      if (name === "uplink_status") {
+        return Promise.resolve({
+          base_url: "https://parent.local:11435",
+          parent_node_id: "parent",
+          username: "alice",
+          user_id: "alice",
+          ancestor_node_ids: [],
+          models: [],
+          quota: null,
+          joined_at: "2026-08-20T00:00:00Z",
+          may_publish: true,
+        });
+      }
+      if (name === "publish_local_model") return Promise.resolve({ id: "team-llama", capabilities: ["chat"], replicas: [] });
+      return previous?.(name, args);
+    });
+    render(<App />);
+    await screen.findByText("Your models, one local endpoint.");
+    fireEvent.click(screen.getByRole("button", { name: "Local models" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Library" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Offer to parent" }));
+    expect(await screen.findByRole("heading", { name: "Offer to parent" })).toBeInTheDocument();
+    fireEvent.change(screen.getByLabelText("Network model ID"), { target: { value: "team-llama" } });
+    fireEvent.click(screen.getByRole("button", { name: "Offer" }));
+    await waitFor(() => expect(command).toHaveBeenCalledWith("publish_local_model", expect.objectContaining({ input: expect.objectContaining({ localModelId: "qwen", networkModelId: "team-llama" }) })));
+  });
+
+  it("lists shared catalog images with revision, size, and nodes, and installs a hub source from the parent", async () => {
+    const previous = command.getMockImplementation();
+    command.mockImplementation((name: string, args?: unknown) => {
+      if (name === "list_shared_images") {
+        return Promise.resolve([
+          { id: "llama-70b", name: "Llama 70B", source_kind: "huggingface", source_ref: "org/llama-70b", revision: "main", filename: null, kind: "gguf", capabilities: ["chat"], size_bytes: 40_000_000_000, nodes: [{ node_id: "child-aaaa", installed_at: "2026-08-20T00:00:00Z" }], created_at: "2026-08-20T00:00:00Z" },
+        ]);
+      }
+      if (name === "list_parent_shared_images") {
+        return Promise.resolve([
+          { id: "llama-70b", name: "Llama 70B", source_kind: "huggingface", source_ref: "org/llama-70b", revision: "main", filename: null, kind: "gguf", capabilities: ["chat"], size_bytes: null, nodes: [], created_at: "2026-08-20T00:00:00Z" },
+        ]);
+      }
+      if (name === "uplink_status") {
+        return Promise.resolve({
+          base_url: "https://parent.local:11435",
+          parent_node_id: "parent",
+          username: "alice",
+          user_id: "alice",
+          ancestor_node_ids: [],
+          models: [],
+          quota: null,
+          joined_at: "2026-08-20T00:00:00Z",
+          may_publish: true,
+        });
+      }
+      return previous?.(name, args);
+    });
+    render(<App />);
+    await screen.findByText("Your models, one local endpoint.");
+    fireEvent.click(screen.getByRole("button", { name: "Settings" }));
+    expect(await screen.findByRole("button", { name: "Install" })).toBeInTheDocument();
+    expect(screen.getAllByText("Llama 70B")).toHaveLength(2);
+    expect(screen.getByText(/huggingface · org\/llama-70b @ main · 37.3 GB · child-aa/)).toBeInTheDocument();
+    expect(screen.getByLabelText("Catalog source kind")).toHaveValue("huggingface");
+    fireEvent.click(screen.getByRole("button", { name: "Install" }));
+    await waitFor(() => expect(command).toHaveBeenCalledWith("install_catalog_model", expect.objectContaining({ input: expect.objectContaining({ repoId: "org/llama-70b", revision: "main", name: "Llama 70B" }) })));
+    await waitFor(() => expect(command).toHaveBeenCalledWith("report_shared_image_installed", expect.objectContaining({ input: expect.objectContaining({ id: "llama-70b" }) })));
   });
 
   it("enables adaptive routing per alias and keeps performance by default", async () => {

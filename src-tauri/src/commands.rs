@@ -1973,9 +1973,16 @@ pub async fn update_directory_user(
     id: String,
     input: UpdateUserInput,
 ) -> Result<DirectoryUser, String> {
-    identity::update_user(&state.core.store, state.core.secrets.as_ref(), &id, input)
+    let user = identity::update_user(&state.core.store, state.core.secrets.as_ref(), &id, input)
         .await
-        .map_err(err)
+        .map_err(err)?;
+    let permissions = state.core.store.permissions_for(&user).await.map_err(err)?;
+    if !permissions.may_publish {
+        crate::publish::drop_replicas_for_user(&state.core, &user.id)
+            .await
+            .map_err(err)?;
+    }
+    Ok(user)
 }
 
 pub async fn list_directory_groups(state: &AppServices) -> Result<Vec<DirectoryGroup>, String> {
@@ -1987,9 +1994,11 @@ pub async fn save_directory_group(
     id: Option<String>,
     input: UpsertGroupInput,
 ) -> Result<DirectoryGroup, String> {
-    identity::upsert_group(&state.core.store, id, input)
+    let group = identity::upsert_group(&state.core.store, id, input)
         .await
-        .map_err(err)
+        .map_err(err)?;
+    drop_replicas_missing_publish(state).await?;
+    Ok(group)
 }
 
 pub async fn delete_directory_group(state: &AppServices, id: String) -> Result<(), String> {
@@ -2001,6 +2010,20 @@ pub async fn delete_directory_group(state: &AppServices, id: String) -> Result<(
         .map_err(err)?
     {
         return Err("group not found".into());
+    }
+    drop_replicas_missing_publish(state).await?;
+    Ok(())
+}
+
+async fn drop_replicas_missing_publish(state: &AppServices) -> Result<(), String> {
+    let users = state.core.store.directory_users().await.map_err(err)?;
+    for user in users {
+        let permissions = state.core.store.permissions_for(&user).await.map_err(err)?;
+        if !permissions.may_publish {
+            crate::publish::drop_replicas_for_user(&state.core, &user.id)
+                .await
+                .map_err(err)?;
+        }
     }
     Ok(())
 }
@@ -2043,6 +2066,75 @@ pub async fn uplink_status(
 
 pub async fn disconnect_uplink(state: &AppServices) -> Result<(), String> {
     crate::uplink::disconnect_uplink(state).await.map_err(err)
+}
+
+pub async fn publish_local_model(
+    state: &AppServices,
+    input: crate::publish::PublishLocalModelInput,
+) -> Result<crate::publish::NetworkModel, String> {
+    crate::publish::publish_local_model(state, input)
+        .await
+        .map_err(err)
+}
+
+pub async fn unpublish_local_model(
+    state: &AppServices,
+    input: crate::publish::UnpublishInput,
+) -> Result<(), String> {
+    crate::publish::unpublish_local_model(state, input)
+        .await
+        .map_err(err)
+}
+
+pub async fn list_network_models(
+    state: &AppServices,
+) -> Result<Vec<crate::publish::NetworkModel>, String> {
+    crate::publish::list_network_models(&state.core.store)
+        .await
+        .map_err(err)
+}
+
+pub async fn list_shared_images(
+    state: &AppServices,
+) -> Result<Vec<crate::publish::SharedImage>, String> {
+    crate::publish::list_shared_images(&state.core.store)
+        .await
+        .map_err(err)
+}
+
+pub async fn list_parent_shared_images(
+    state: &AppServices,
+) -> Result<Vec<crate::publish::SharedImage>, String> {
+    crate::publish::list_parent_shared_images(state)
+        .await
+        .map_err(err)
+}
+
+pub async fn register_shared_image(
+    state: &AppServices,
+    input: crate::publish::RegisterSharedImageInput,
+) -> Result<crate::publish::SharedImage, String> {
+    crate::publish::register_shared_image(state, input)
+        .await
+        .map_err(err)
+}
+
+pub async fn pull_shared_image(
+    state: &AppServices,
+    input: crate::publish::PullSharedImageInput,
+) -> Result<crate::storage::ModelTarget, String> {
+    crate::publish::pull_shared_image(state, input)
+        .await
+        .map_err(err)
+}
+
+pub async fn report_shared_image_installed(
+    state: &AppServices,
+    input: crate::publish::PullSharedImageInput,
+) -> Result<(), String> {
+    crate::publish::report_shared_image_installed(state, input)
+        .await
+        .map_err(err)
 }
 
 pub async fn reveal_operator_bootstrap(state: &AppServices) -> Result<Option<String>, String> {

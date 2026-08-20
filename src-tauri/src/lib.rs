@@ -18,6 +18,7 @@ pub mod oauth;
 pub mod oidc;
 pub mod protocol;
 pub mod providers;
+pub mod publish;
 pub mod public_models;
 pub mod resource;
 pub mod routing;
@@ -208,6 +209,14 @@ pub fn run() {
             ipc::join_uplink,
             ipc::uplink_status,
             ipc::disconnect_uplink,
+            ipc::publish_local_model,
+            ipc::unpublish_local_model,
+            ipc::list_network_models,
+            ipc::list_shared_images,
+            ipc::list_parent_shared_images,
+            ipc::register_shared_image,
+            ipc::pull_shared_image,
+            ipc::report_shared_image_installed,
             ipc::reveal_operator_bootstrap,
             ipc::list_oidc_allowlist,
             ipc::invite_oidc_identity,

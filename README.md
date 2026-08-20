@@ -13,6 +13,7 @@ A private, multi-protocol model gateway for Apple Silicon Macs, Linux, and Windo
 - Custom aliases remain optional named stacks. Primaries form the routing pool; fallbacks are sequential failover after the pool is exhausted. Each alias can use Performance (listed primary order) or Adaptive ranking; Adaptive stays off by default
 - Built-in `adaptive-routing` ranks every enabled model by task quality, price and inferred task
 - Uplink federation: a node can join one parent as a directory user, mount granted public model IDs, stream chat and other protocols through the parent, and enforce per-user/group quotas without sharing credentials. Self-signed LAN parents require pinning the SHA-256 TLS fingerprint shown in Settings.
+- Network-published local models: a child with `may_publish` can offer a running local model to its parent as a **live replica**. The parent exposes one public ID and fails over between healthy replicas. The parent authenticates to the child with a replica session token, never the child's local API keys. The child must be reachable (enable **Settings → Network share** LAN HTTPS). Unique local imports can be catalogued on the parent as metadata-only hub sources or stored-byte copies; disconnecting a child drops its replica and node row, not the catalog entry.
 - `/v1/chat/completions`, `/v1/responses`, Anthropic `/v1/messages`, and Gemini `/v1beta/models/*` with non-streaming, SSE, vision, audio/video input and tool translation
 - Local `/v1/images/generations` and `/v1/audio/speech` for installed MLX image and TTS models
 - Cloud proxying for Images, Audio and Moderations, including multipart uploads
@@ -250,6 +251,15 @@ Each node has a single-tenant user directory. First run creates a local `operato
 Loopback remains HTTP with an unlocked admin UI. **Settings → Network share** can bind all interfaces or a specific address. That bind requires HTTPS. If you do not supply a certificate and key, the node writes a self-signed pair under the data directory (`tls/server.crt` and `tls/server.key`, mode 0600 on Unix) and shows the SHA-256 fingerprint in Settings and on the login screen. Pin that fingerprint in browsers and HTTP clients (`curl --cacert` or `--pinnedpubkey` / TOFU). Browsers still warn if the hostname is not on the certificate (LAN share often uses a private IP); pin the fingerprint and continue, or supply a certificate whose SAN matches the share address. A specific-address bind adds that IP to the generated certificate. Tailscale is the intended overlay if you need reachability off the LAN: join the tailnet, enable LAN share, pin the fingerprint. Register the gateway callback `https://<host>:11435/auth/oidc/callback` (or the loopback HTTP equivalent) on the OAuth app. OpenID sign-in is for browsers against the hosted gateway; the desktop webview stays a local unlocked console. Unknown GitHub/Google accounts cannot sign in until invited on the Users page. Local operator passwords still work with OpenID disabled or when the node is offline. Local API keys authenticate inference only; they are never uploaded to a parent.
 
 Restart the desktop app or `serve` process after changing bind mode. Clients against a shared node use `https://<host>:11435/v1` and the same local API key.
+
+### Network-published models
+
+Live replicas and the shared image catalog are different:
+
+- **Live replica.** Local models → Library → **Offer to parent** advertises a model that is already loaded on this node. The parent serves a shared public ID (for example `team-llama-70b`) and proxies each request to a healthy child. If that hop fails, later requests try another replica. An in-flight stream does not fail over. Enable **Settings → Network share** so the parent can reach this node; a LAN bind advertises the address this machine uses toward the parent. Loopback callbacks only work when both processes are on the same machine. Grant `may_publish` on the directory user or group. The publisher's finite model allowlist is auto-granted the network ID.
+- **Shared image catalog.** **Settings → Shared image catalog** records a model image so other nodes can install the same weights. Hugging Face, CivitAI, and curated catalog entries store metadata only (source ref and revision); a child installs them with **Install**. A unique local import stores the bytes on the parent in SQLite so a peer can **Pull bytes** without fetching from a hub. Disconnecting a child removes that node's installed row; the catalog entry stays.
+
+Local API keys stay on the node that created them. Replica proxying uses a separate `lar_replica_*` session.
 
 ## Provider notes
 
