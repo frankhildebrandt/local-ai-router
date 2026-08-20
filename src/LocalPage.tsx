@@ -1,74 +1,68 @@
-import { useCallback, useEffect, useMemo, useState, type FormEvent } from "react";
+import { useEffect, useMemo, useState, type FormEvent } from "react";
+import { keepPreviousData, useQuery, useQueryClient } from "@tanstack/react-query";
 import { open } from "@tauri-apps/plugin-dialog";
 import {
   Box, Download, FileDown, LoaderCircle, Pause, Play, Search, Settings, Square, Trash2,
 } from "lucide-react";
-import { command, listenInstallJobs } from "./api";
+import { command, isTauri, listenInstallJobs } from "./api";
 import type {
-  CatalogCategory, CatalogEntry, InstallJob, InstallJobEvent, LocalCatalog, ModelInspection,
-  ModelTarget, RamFit, ResourceOverrides, ResourcePolicy, SearchPage, SpeculativeConfig, SpeculativeMode, TargetKind,
+  CatalogCategory, CatalogEntry, InstallJob, InstallJobEvent, ModelInspection,
+  ModelTarget, RamFit, ResourceOverrides, ResourcePolicy, SpeculativeConfig, SpeculativeMode, TargetKind,
 } from "./types";
 import { displayModelName, groupCatalogEntries, preferredQuantization } from "./catalogGroups";
+import { emptyCatalog, fetchers, queryKeys } from "./queries";
+import { useDebouncedValue } from "./useDebouncedValue";
 
 type Common = { targets: ModelTarget[]; resourcePolicy: ResourcePolicy; refresh: () => Promise<void>; success: (text: string) => void; fail: (error: unknown) => void };
 type CatalogTab = "chat_vision" | "image" | "speech" | "library" | "import";
 type DownloadSource = "huggingface" | "civitai";
 
-const emptyCatalog: LocalCatalog = {
-  platform: { apple_silicon: true, macos_15_plus: true, compatible: true, reason: null },
-  memory_budget_bytes: 0,
-  memory_budget_percent: 70,
-  entries: [],
-};
-
 export function LocalPage({ targets, resourcePolicy, refresh, success, fail }: Common) {
+  const queryClient = useQueryClient();
   const local = targets.filter(target => target.kind === "gguf" || target.kind === "mlx");
   const [tab, setTab] = useState<CatalogTab>("chat_vision");
-  const [catalog, setCatalog] = useState(emptyCatalog);
-  const [jobs, setJobs] = useState<InstallJob[]>([]);
   const [query, setQuery] = useState("");
   const [family, setFamily] = useState("");
   const [task, setTask] = useState("");
-  const [searchHits, setSearchHits] = useState<CatalogEntry[]>([]);
-  const [searching, setSearching] = useState(false);
   const [downloadSource, setDownloadSource] = useState<DownloadSource>("huggingface");
+  const catalogQuery = useQuery({ queryKey: queryKeys.catalog, queryFn: fetchers.catalog, enabled: isTauri() });
+  const jobsQuery = useQuery({ queryKey: queryKeys.installJobs, queryFn: fetchers.installJobs, enabled: isTauri() });
+  const catalog = catalogQuery.data ?? emptyCatalog;
+  const jobs = jobsQuery.data ?? [];
+  const debouncedQuery = useDebouncedValue(query.trim(), 400);
+  const source = tab === "image" ? downloadSource : "huggingface";
+  const searchingEnabled = isTauri() && debouncedQuery.length >= 2 && tab !== "library" && tab !== "import";
+  const searchQuery = useQuery({
+    queryKey: queryKeys.catalogSearch(source, debouncedQuery),
+    queryFn: () => fetchers.catalogSearch(debouncedQuery, source),
+    enabled: searchingEnabled,
+    staleTime: 10 * 60_000,
+    gcTime: 30 * 60_000,
+    placeholderData: keepPreviousData,
+  });
+  const searchHits = searchingEnabled ? (searchQuery.data?.items ?? []) : [];
+  const searching = searchingEnabled && searchQuery.isFetching;
+  useEffect(() => { if (catalogQuery.error) fail(catalogQuery.error); }, [catalogQuery.error, fail]);
+  useEffect(() => { if (jobsQuery.error) fail(jobsQuery.error); }, [jobsQuery.error, fail]);
+  useEffect(() => { if (searchQuery.error) fail(searchQuery.error); }, [searchQuery.error, fail]);
 
-  const load = useCallback(async () => {
-    try {
-      const [nextCatalog, nextJobs] = await Promise.all([
-        command<LocalCatalog>("list_local_catalog"),
-        command<InstallJob[]>("list_install_jobs"),
-      ]);
-      setCatalog(nextCatalog);
-      setJobs(nextJobs);
-    } catch (error) { fail(error); }
-  }, [fail]);
-
-  useEffect(() => { void load(); }, [load]);
+  const reloadJobs = () => queryClient.invalidateQueries({ queryKey: queryKeys.installJobs });
   useEffect(() => {
     let unlisten: (() => void) | undefined;
     void listenInstallJobs((event: InstallJobEvent) => {
-      setJobs(current => current.map(job => job.id === event.job_id
+      queryClient.setQueryData<InstallJob[]>(queryKeys.installJobs, current => (current ?? []).map(job => job.id === event.job_id
         ? { ...job, status: event.status, current_file: event.file, bytes_downloaded: event.bytes_downloaded, bytes_total: event.bytes_total }
         : job));
-      if (event.status === "completed") void Promise.all([load(), refresh()]);
+      if (event.status === "completed") {
+        void Promise.all([
+          queryClient.invalidateQueries({ queryKey: queryKeys.catalog }),
+          queryClient.invalidateQueries({ queryKey: queryKeys.installJobs }),
+          refresh(),
+        ]);
+      }
     }).then(fn => { unlisten = fn; }).catch(() => undefined);
     return () => unlisten?.();
-  }, [load, refresh]);
-
-  useEffect(() => {
-    if (!query.trim() || tab === "library" || tab === "import") { setSearchHits([]); return; }
-    const timer = window.setTimeout(async () => {
-      setSearching(true);
-      try {
-        const source = tab === "image" ? downloadSource : "huggingface";
-        const page = await command<SearchPage>("search_mlx_catalog", { input: { query, cursor: null, source } });
-        setSearchHits(page.items);
-      } catch (error) { fail(error); }
-      finally { setSearching(false); }
-    }, 280);
-    return () => window.clearTimeout(timer);
-  }, [query, fail, tab, downloadSource]);
+  }, [queryClient, refresh]);
 
   const families = useMemo(() => Array.from(new Set(catalog.entries.map(item => item.family))), [catalog.entries]);
   const tasks = useMemo(() => Array.from(new Set(catalog.entries.map(item => item.task))), [catalog.entries]);
@@ -95,7 +89,7 @@ export function LocalPage({ targets, resourcePolicy, refresh, success, fail }: C
     if (entry.ram_fit !== "fits" && !confirm(`${entry.name} is ${entry.ram_fit === "tight" ? "tight" : entry.ram_fit === "unknown" ? "unknown size" : "unsuitable"} for the current memory budget. Install anyway? Loading remains blocked if the budget is exceeded.`)) return;
     try {
       await command("install_catalog_model", { input: { repoId: entry.repo_id, catalogId: entry.trust_status === "curated" ? entry.id : null, confirmOverBudget: entry.ram_fit !== "fits", name: entry.name } });
-      await load();
+      await queryClient.invalidateQueries({ queryKey: queryKeys.installJobs });
       success(`Installing ${entry.name}`);
     } catch (error) { fail(error); }
   };
@@ -120,7 +114,7 @@ export function LocalPage({ targets, resourcePolicy, refresh, success, fail }: C
           <small>Budget {catalog.memory_budget_percent}% · {formatBytes(catalog.memory_budget_bytes)}</small>
         </div>
       </section>
-      {!!jobs.length && <InstallJobs jobs={jobs} onChange={load} fail={fail} />}
+      {!!jobs.length && <InstallJobs jobs={jobs} onChange={async () => { await reloadJobs(); }} fail={fail} />}
       <div className="catalog-grid">{curated.map(group => <CatalogCard key={quantizationGroupKey(group)} variants={group} onInstall={entry => void install(entry)} />)}</div>
       {searching && <p className="catalog-hint">{tab === "image" && downloadSource !== "huggingface" ? "Searching CivitAI…" : "Searching Hugging Face…"}</p>}
       {!!visibleSearch.length && <><h3 className="catalog-section">{tab === "image" && downloadSource !== "huggingface" ? "Untested CivitAI matches" : "Untested Hugging Face matches"}</h3><p className="catalog-hint">{tab === "image" && downloadSource !== "huggingface" ? "SD and SDXL checkpoints download from CivitAI. Diffusers-layout models can generate immediately; classic single-file checkpoints are stored for the SD/SDXL engine." : "Visibility does not mean the model can be installed or run. Architecture, files and license are checked first."}</p><div className="catalog-grid">{visibleSearch.map(group => <CatalogCard key={quantizationGroupKey(group)} variants={group} onInstall={entry => void install(entry)} />)}</div></>}

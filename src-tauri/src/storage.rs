@@ -264,6 +264,10 @@ pub struct KeyUsageData {
     pub summary: UsageSummary,
     pub buckets: Vec<UsageBucket>,
     pub by_model: Vec<ModelUsage>,
+    #[serde(default)]
+    pub throughput_candles: Vec<UsageCandle>,
+    #[serde(default)]
+    pub cost_candles: Vec<UsageCandle>,
 }
 
 #[derive(Clone)]
@@ -1366,7 +1370,7 @@ impl Store {
         ));
         push_usage_filters(&mut by_key_query, cutoff, target);
         by_key_query.push(" GROUP BY l.api_key_id,k.name ORDER BY request_count DESC,api_key_name");
-        let by_key = by_key_query
+        let mut by_key: Vec<KeyUsage> = by_key_query
             .build()
             .fetch_all(&self.pool)
             .await?
@@ -1384,7 +1388,7 @@ impl Store {
         push_usage_cutoff(&mut by_model_query, cutoff);
         by_model_query
             .push(" GROUP BY l.alias,l.target ORDER BY request_count DESC,l.alias,l.target");
-        let mut by_model = by_model_query
+        let mut by_model: Vec<ModelUsage> = by_model_query
             .build()
             .fetch_all(&self.pool)
             .await?
@@ -1421,7 +1425,7 @@ impl Store {
             })
             .collect::<anyhow::Result<_>>()?;
 
-        let samples = self.usage_samples(cutoff, None).await?;
+        let samples = self.usage_samples(cutoff, None, None).await?;
         let rates = self.cost_rate_map().await?;
         let filtered: Vec<&UsageSample> = samples
             .iter()
@@ -1440,6 +1444,15 @@ impl Store {
                 .collect();
             model.summary.tokens_per_second = current_tokens_per_second(&group, now);
             model.summary.estimated_cost_usd = total_estimated_cost(&group, &rates);
+        }
+        for key in &mut by_key {
+            let group: Vec<&UsageSample> = filtered
+                .iter()
+                .copied()
+                .filter(|sample| sample.api_key_id == key.api_key_id)
+                .collect();
+            key.summary.tokens_per_second = current_tokens_per_second(&group, now);
+            key.summary.estimated_cost_usd = total_estimated_cost(&group, &rates);
         }
 
         Ok(UsageData {
@@ -1461,7 +1474,7 @@ impl Store {
         now: DateTime<Utc>,
     ) -> anyhow::Result<std::collections::HashMap<String, f64>> {
         let cutoff = now - chrono::Duration::hours(24);
-        let samples = self.usage_samples(Some(cutoff), None).await?;
+        let samples = self.usage_samples(Some(cutoff), None, None).await?;
         let mut grouped: std::collections::HashMap<String, Vec<&UsageSample>> =
             std::collections::HashMap::new();
         for sample in &samples {
@@ -1482,11 +1495,21 @@ impl Store {
         &self,
         cutoff: Option<DateTime<Utc>>,
         target: Option<&str>,
+        api_key_id: Option<&str>,
     ) -> anyhow::Result<Vec<UsageSample>> {
         let mut query = QueryBuilder::<Sqlite>::new(
-            "SELECT created_at,alias,target,status,latency_ms,input_tokens,output_tokens,cache_read_tokens,cache_write_tokens FROM request_logs l",
+            "SELECT created_at,alias,target,api_key_id,status,latency_ms,input_tokens,output_tokens,cache_read_tokens,cache_write_tokens FROM request_logs l",
         );
         push_usage_filters(&mut query, cutoff, target);
+        if let Some(id) = api_key_id.filter(|value| !value.is_empty()) {
+            if cutoff.is_some() || target.filter(|value| !value.is_empty()).is_some() {
+                query.push(" AND l.api_key_id = ").push_bind(id.to_owned());
+            } else {
+                query
+                    .push(" WHERE l.api_key_id = ")
+                    .push_bind(id.to_owned());
+            }
+        }
         query.push(" ORDER BY created_at");
         query
             .build()
@@ -1498,6 +1521,7 @@ impl Store {
                     created_at: parse_timestamp(row.get("created_at"))?,
                     alias: row.get("alias"),
                     target: row.get("target"),
+                    api_key_id: row.get("api_key_id"),
                     status: row.get("status"),
                     latency_ms: row.get("latency_ms"),
                     input_tokens: row.get("input_tokens"),
@@ -1565,13 +1589,14 @@ impl Store {
             .local_api_key(id)
             .await?
             .ok_or_else(|| anyhow::anyhow!("local API key not found"))?;
-        let (cutoff, hourly, _) = usage_period(period, now)?;
+        let (cutoff, hourly, candle_step) = usage_period(period, now)?;
 
         let metrics = usage_metrics_sql();
         let mut summary_query =
             QueryBuilder::<Sqlite>::new(format!("SELECT {metrics} FROM request_logs l"));
         push_key_usage_filters(&mut summary_query, id, cutoff);
-        let summary = usage_summary_from_row(summary_query.build().fetch_one(&self.pool).await?);
+        let mut summary =
+            usage_summary_from_row(summary_query.build().fetch_one(&self.pool).await?);
 
         let mut by_model_query = QueryBuilder::<Sqlite>::new(format!(
             "SELECT l.alias,l.target,{metrics} FROM request_logs l"
@@ -1579,7 +1604,7 @@ impl Store {
         push_key_usage_filters(&mut by_model_query, id, cutoff);
         by_model_query
             .push(" GROUP BY l.alias,l.target ORDER BY request_count DESC,l.alias,l.target");
-        let by_model = by_model_query
+        let mut by_model: Vec<ModelUsage> = by_model_query
             .build()
             .fetch_all(&self.pool)
             .await?
@@ -1616,11 +1641,31 @@ impl Store {
             })
             .collect::<anyhow::Result<_>>()?;
 
+        let samples = self.usage_samples(cutoff, None, Some(id)).await?;
+        let rates = self.cost_rate_map().await?;
+        let filtered: Vec<&UsageSample> = samples.iter().collect();
+        summary.tokens_per_second = current_tokens_per_second(&filtered, now);
+        summary.estimated_cost_usd = total_estimated_cost(&filtered, &rates);
+        for model in &mut by_model {
+            let group: Vec<&UsageSample> = samples
+                .iter()
+                .filter(|sample| sample.alias == model.alias && sample.target == model.target)
+                .collect();
+            model.summary.tokens_per_second = current_tokens_per_second(&group, now);
+            model.summary.estimated_cost_usd = total_estimated_cost(&group, &rates);
+        }
+
         Ok(KeyUsageData {
             key,
             summary,
             buckets,
             by_model,
+            throughput_candles: usage_candles(&filtered, candle_step, |sample| {
+                sample.tokens_per_second()
+            }),
+            cost_candles: usage_candles(&filtered, candle_step, |sample| {
+                estimated_request_cost(sample, &rates)
+            }),
         })
     }
 
@@ -1854,6 +1899,7 @@ struct UsageSample {
     created_at: DateTime<Utc>,
     alias: Option<String>,
     target: Option<String>,
+    api_key_id: Option<String>,
     status: i64,
     latency_ms: i64,
     input_tokens: Option<i64>,
@@ -2862,6 +2908,8 @@ mod tests {
         assert_eq!(day.summary.input_tokens, 40);
         assert_eq!(day.summary.output_tokens, 68);
         assert_eq!(day.buckets.len(), 1);
+        assert!(day.summary.tokens_per_second.is_some());
+        assert!(!day.throughput_candles.is_empty());
     }
 
     #[tokio::test]
