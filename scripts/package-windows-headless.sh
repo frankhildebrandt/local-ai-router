@@ -1,14 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Archive the headless binary, admin SPA, and CPU llama.cpp sidecar for Windows.
+# Archive the headless binary, admin SPA, and llama.cpp sidecars (CPU/CUDA/Vulkan when built).
 PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="${1:-$PROJECT_DIR/src-tauri/target/release/local-ai-router.exe}"
 if [[ ! -f "$BIN" && -f "${BIN%.exe}" ]]; then
   BIN="${BIN%.exe}"
 fi
 OUT="${2:-$PROJECT_DIR/src-tauri/target/release/local-ai-router-windows-headless.zip}"
-HOST_TRIPLE="$(rustc -vV | awk '/^host:/{print $2}')"
 
 if [[ ! -f "$BIN" ]]; then
   echo "missing headless binary: $BIN" >&2
@@ -27,34 +26,13 @@ if [[ -z "$UI" ]]; then
   exit 1
 fi
 
-LLAMA=""
-for candidate in \
-  "$PROJECT_DIR/sidecars/bin/llama-server-$HOST_TRIPLE.exe" \
-  "$PROJECT_DIR/sidecars/bin/llama-server-$HOST_TRIPLE" \
-  "$PROJECT_DIR/src-tauri/target/release/sidecars/bin/llama-server-$HOST_TRIPLE.exe" \
-  "$PROJECT_DIR/src-tauri/target/release/sidecars/bin/llama-server-$HOST_TRIPLE"; do
-  if [[ -f "$candidate" ]]; then
-    LLAMA="$candidate"
-    break
-  fi
-done
-if [[ -z "$LLAMA" ]]; then
-  echo "missing llama-server-$HOST_TRIPLE (run ./scripts/build-sidecars.sh)" >&2
-  exit 1
-fi
-
 STAGE="$(mktemp -d)"
 trap 'rm -rf "$STAGE"' EXIT
 ROOT="$STAGE/local-ai-router"
 mkdir -p "$ROOT/ui" "$ROOT/sidecars/bin"
 cp "$BIN" "$ROOT/local-ai-router.exe"
 cp -R "$UI/." "$ROOT/ui/"
-cp "$LLAMA" "$ROOT/sidecars/bin/"
-shopt -s nullglob
-for dll in "$(dirname "$LLAMA")"/*.dll "$PROJECT_DIR/sidecars/bin"/*.dll; do
-  cp "$dll" "$ROOT/sidecars/bin/"
-done
-shopt -u nullglob
+"$PROJECT_DIR/scripts/copy-llama-sidecars.sh" "$ROOT/sidecars/bin"
 cat >"$ROOT/README.txt" <<'EOF'
 Local AI Router (headless, Windows)
 
@@ -64,7 +42,10 @@ Extract this archive and start the gateway in the foreground:
 
 Then open http://127.0.0.1:11435/ in a browser on this machine.
 
-It loads .\ui and .\sidecars\bin next to the executable. Data lives in
+It loads .\ui and .\sidecars\bin next to the executable. sidecars\bin may include
+llama-server (CPU), llama-server-cuda (NVIDIA), and llama-server-vulkan (AMD).
+The router picks CUDA, then Vulkan, then CPU automatically. Override with
+LOCAL_AI_ROUTER_GGUF_BACKEND=cpu|cuda|vulkan. Data lives in
 %APPDATA%\app.local-ai-router.desktop. Secrets use Windows Credential
 Manager unless you pass --secrets-file:
 
@@ -78,8 +59,9 @@ run without an interactive user session.
 The desktop NSIS installer is a separate GitHub Release asset. Only one
 process can bind port 11435; quit the tray app before serve, or the reverse.
 
-Local MLX is not included. GGUF CPU inference uses the bundled llama-server.
-CUDA and Vulkan are later releases.
+Local MLX is not included. GGUF inference uses the bundled llama-server variants.
+NVIDIA GPUs need a recent driver; AMD GPUs need a Vulkan 1.2+ driver. ROCm is
+not supported. MLX remains Apple-only.
 EOF
 
 mkdir -p "$(dirname "$OUT")"

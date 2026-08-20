@@ -16,4 +16,7 @@ sudo apt-get install -y \
   librsvg2-dev \
   patchelf \
   pkg-config \
-  wget
+  wget \
+  libvulkan-dev \
+  vulkan-tools \
+  glslang-tools
