@@ -8,7 +8,9 @@
     "build": "tsc && vite build",
     "test": "vitest run",
     "test:contract": "./scripts/test-contracts.sh",
+    "test:headless": "./scripts/test-headless.sh",
     "test:watch": "vitest",
+    "serve": "cargo run --manifest-path src-tauri/Cargo.toml -- serve --ui-dir dist",
     "tauri": "tauri"
   },
   "dependencies": {

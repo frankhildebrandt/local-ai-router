@@ -6,7 +6,7 @@
   "build": {
     "beforeDevCommand": "npm run dev",
     "devUrl": "http://localhost:1420",
-    "beforeBuildCommand": "npm run build",
+    "beforeBuildCommand": "npm run build && rm -rf src-tauri/ui && cp -R dist src-tauri/ui",
     "frontendDist": "../dist"
   },
   "app": {
@@ -38,7 +38,8 @@
     "resources": {
       "../sidecars/bin/": "sidecars/bin/",
       "../sidecars/licenses/": "sidecars/licenses/",
-      "../THIRD_PARTY_NOTICES.md": "THIRD_PARTY_NOTICES.md"
+      "../THIRD_PARTY_NOTICES.md": "THIRD_PARTY_NOTICES.md",
+      "ui/": "ui/"
     },
     "macOS": {
       "minimumSystemVersion": "15.0",

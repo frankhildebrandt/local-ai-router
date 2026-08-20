@@ -46,17 +46,15 @@ struct GatewayState {
 }
 
 pub fn router(core: Arc<AppCore>) -> Router {
-    router_with_state(GatewayState {
-        core,
-        runtimes: None,
-    })
+    inference_router(core, None).fallback(not_found)
 }
 
 pub fn managed_router(core: Arc<AppCore>, runtimes: Arc<RuntimeManager>) -> Router {
-    router_with_state(GatewayState {
-        core,
-        runtimes: Some(runtimes),
-    })
+    inference_router(core, Some(runtimes)).fallback(not_found)
+}
+
+pub fn inference_router(core: Arc<AppCore>, runtimes: Option<Arc<RuntimeManager>>) -> Router {
+    router_with_state(GatewayState { core, runtimes })
 }
 
 async fn sync_runtime_states(core: &AppCore, runtimes: &RuntimeManager) {
@@ -96,7 +94,6 @@ fn router_with_state(state: GatewayState) -> Router {
         .route("/v1/audio/transcriptions", post(proxy))
         .route("/v1/audio/translations", post(proxy))
         .route("/v1/moderations", post(proxy))
-        .fallback(not_found)
         .with_state(state)
 }
 
@@ -140,7 +137,7 @@ async fn health() -> Json<Value> {
     Json(json!({ "status": "ok" }))
 }
 
-async fn not_found() -> Response<Body> {
+pub(crate) async fn not_found() -> Response<Body> {
     openai_error(
         StatusCode::NOT_FOUND,
         "route_not_found",

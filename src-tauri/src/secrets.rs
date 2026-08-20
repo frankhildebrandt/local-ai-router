@@ -1,4 +1,4 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, io::Write, path::PathBuf, sync::Arc};
 
 use anyhow::Context;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
@@ -226,6 +226,81 @@ pub fn shared_keychain() -> Arc<dyn SecretStore> {
     Arc::new(KeychainSecrets::new("app.local-ai-router.desktop"))
 }
 
+struct FileItems {
+    path: PathBuf,
+}
+
+impl SecretStore for FileItems {
+    fn get(&self, account: &str) -> anyhow::Result<Option<String>> {
+        if account != VAULT_ACCOUNT {
+            return Ok(None);
+        }
+        match std::fs::read_to_string(&self.path) {
+            Ok(raw) if raw.trim().is_empty() => Ok(None),
+            Ok(raw) => Ok(Some(raw)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error).context("reading secrets file"),
+        }
+    }
+
+    fn set(&self, _account: &str, value: &str) -> anyhow::Result<()> {
+        if let Some(parent) = self.path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        options
+            .open(&self.path)?
+            .write_all(value.as_bytes())
+            .context("writing secrets file")?;
+        Ok(())
+    }
+
+    fn delete(&self, _account: &str) -> anyhow::Result<()> {
+        match std::fs::remove_file(&self.path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error.into()),
+        }
+    }
+}
+
+pub struct FileSecrets {
+    store: BundledStore<FileItems>,
+}
+
+impl FileSecrets {
+    pub fn new(path: PathBuf) -> Self {
+        Self {
+            store: BundledStore::new(FileItems { path }),
+        }
+    }
+}
+
+impl SecretStore for FileSecrets {
+    fn get(&self, account: &str) -> anyhow::Result<Option<String>> {
+        self.store.get(account)
+    }
+    fn set(&self, account: &str, value: &str) -> anyhow::Result<()> {
+        self.store.set(account, value)
+    }
+    fn delete(&self, account: &str) -> anyhow::Result<()> {
+        self.store.delete(account)
+    }
+    fn migrate_legacy_accounts(&self, accounts: &[String]) -> anyhow::Result<()> {
+        self.store.migrate_legacy_accounts(accounts)
+    }
+}
+
+pub fn file_secrets(path: PathBuf) -> Arc<dyn SecretStore> {
+    Arc::new(FileSecrets::new(path))
+}
+
 pub fn generate_local_token() -> String {
     let mut bytes = [0u8; 32];
     rand::rng().fill_bytes(&mut bytes);
@@ -341,5 +416,25 @@ mod tests {
             store.inner.get("provider:openai").unwrap().as_deref(),
             Some("old")
         );
+    }
+
+    #[test]
+    fn file_secrets_roundtrip_in_the_data_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("secrets.json");
+        let store = FileSecrets::new(path.clone());
+        store.set("local-api-key:default", "lar_file").unwrap();
+        drop(store);
+        let reopened = FileSecrets::new(path.clone());
+        assert_eq!(
+            reopened.get("local-api-key:default").unwrap().as_deref(),
+            Some("lar_file")
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
     }
 }

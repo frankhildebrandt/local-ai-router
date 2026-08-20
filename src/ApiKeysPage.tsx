@@ -4,7 +4,7 @@ import {
   Activity, ArrowLeft, BarChart3, Check, Copy, Download, Eye, EyeOff, Gauge, KeyRound,
   Pencil, Plus, RefreshCw, Trash2, Wallet, Zap,
 } from "lucide-react";
-import { command, isTauri } from "./api";
+import { command } from "./api";
 import { CandleLineChart } from "./CandleLineChart";
 import { emptyUsage, fetchers, queryKeys } from "./queries";
 import type { LocalApiKey, LocalApiKeyWithToken } from "./types";
@@ -26,13 +26,13 @@ export function ApiKeysPage({ localKeys, refresh, success, fail }: Props) {
   const usageQuery = useQuery({
     queryKey: queryKeys.usage(period),
     queryFn: () => fetchers.usage(period),
-    enabled: isTauri() && !selectedId,
+    enabled: !selectedId,
     refetchInterval: 10_000,
   });
   const detailQuery = useQuery({
     queryKey: queryKeys.keyUsage(selectedId ?? "", period),
     queryFn: () => fetchers.keyUsage(selectedId ?? "", period),
-    enabled: isTauri() && !!selectedId,
+    enabled: !!selectedId,
     refetchInterval: 10_000,
   });
   const usage = usageQuery.data ?? emptyUsage;
