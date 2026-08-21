@@ -188,8 +188,12 @@ jobs:
           "VULKAN_SDK=$sdk" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
           "$sdk\Bin" | Out-File $env:GITHUB_PATH -Append -Encoding utf8
           $spirv = Join-Path $env:RUNNER_TEMP 'SPIRV-Headers'
+          $spirvBuild = Join-Path $env:RUNNER_TEMP 'SPIRV-Headers-build'
+          $spirvInstall = Join-Path $env:RUNNER_TEMP 'SPIRV-Headers-install'
           git clone --depth 1 https://github.com/KhronosGroup/SPIRV-Headers.git $spirv
-          "SPIRV_HEADERS_DIR=$spirv\cmake" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+          cmake -S $spirv -B $spirvBuild -DCMAKE_INSTALL_PREFIX=$spirvInstall
+          cmake --build $spirvBuild --target install
+          "SPIRV_HEADERS_DIR=$spirvInstall/share/cmake/SPIRV-Headers" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
       - name: Install CUDA toolkit
         shell: pwsh
         run: ./scripts/install-windows-cuda-toolkit.ps1
