@@ -170,10 +170,21 @@ pub fn hosted_router(services: Arc<AppServices>, ui_dir: Option<PathBuf>) -> Rou
         })
 }
 
+fn spawn_background<F>(future: F)
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        handle.spawn(future);
+    } else {
+        tauri::async_runtime::spawn(future);
+    }
+}
+
 pub fn spawn_maintenance(services: Arc<AppServices>) {
     let maintenance = services.runtimes.clone();
     let maintenance_store = services.core.store.clone();
-    tokio::spawn(async move {
+    spawn_background(async move {
         loop {
             tokio::time::sleep(Duration::from_secs(60)).await;
             for (id, may_restart) in maintenance.take_crashed() {
@@ -244,7 +255,7 @@ pub fn spawn_maintenance(services: Arc<AppServices>) {
         }
     });
     let publish = services.clone();
-    tokio::spawn(async move {
+    spawn_background(async move {
         loop {
             tokio::time::sleep(Duration::from_secs(10)).await;
             let _ = crate::publish::maintain(&publish).await;
