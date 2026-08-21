@@ -97,7 +97,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - run: ./scripts/install-linux-build-deps.sh
       - name: Install AppImage and Vulkan shader tooling
-        run: sudo apt-get install -y libfuse2 google-shaderc
+        run: |
+          sudo apt-get install -y libfuse2
+          ./scripts/install-linux-glslc.sh
       - run: npm ci
       - name: Verify bundle icons
         working-directory: src-tauri
