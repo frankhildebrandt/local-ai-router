@@ -133,6 +133,9 @@ build_llama_variant() {
       if [[ -n "${VULKAN_SDK:-}" ]]; then
         cmake_flags+=(-DCMAKE_PREFIX_PATH="$VULKAN_SDK")
       fi
+      if [[ -n "${SPIRV-Headers_DIR:-}" ]]; then
+        cmake_flags+=(-DSPIRV-Headers_DIR="$SPIRV-Headers_DIR")
+      fi
       ;;
     *)
       echo "unknown llama variant: $variant" >&2
