@@ -165,12 +165,20 @@ else
   build_llama_variant cpu
   cp "$BUILD_DIR/llama.cpp-cpu/LICENSE" "$LICENSE_DIR/llama.cpp-LICENSE"
   if should_build_llama_variant cuda; then
-    build_llama_variant cuda || echo "warning: CUDA llama-server build failed; CPU fallback remains" >&2
+    if [[ "$BUILD_LLAMA_CUDA" =~ ^(1|true|yes|on)$ ]]; then
+      build_llama_variant cuda
+    else
+      build_llama_variant cuda || echo "warning: CUDA llama-server build failed; CPU fallback remains" >&2
+    fi
   else
     echo "Skipping CUDA llama-server (set BUILD_LLAMA_CUDA=1 and install the CUDA toolkit to enable)."
   fi
   if should_build_llama_variant vulkan; then
-    build_llama_variant vulkan || echo "warning: Vulkan llama-server build failed; CPU fallback remains" >&2
+    if [[ "$BUILD_LLAMA_VULKAN" =~ ^(1|true|yes|on)$ ]]; then
+      build_llama_variant vulkan
+    else
+      build_llama_variant vulkan || echo "warning: Vulkan llama-server build failed; CPU fallback remains" >&2
+    fi
   else
     echo "Skipping Vulkan llama-server (set BUILD_LLAMA_VULKAN=1 and install Vulkan dev packages to enable)."
   fi

@@ -13,6 +13,6 @@ wget -qO- https://packages.lunarg.com/lunarg-signing-key-pub.asc \
 echo "deb [signed-by=/usr/share/keyrings/lunarg.gpg] https://packages.lunarg.com/vulkan/ jammy main" \
   | sudo tee /etc/apt/sources.list.d/lunarg-vulkan-jammy.list >/dev/null
 sudo apt-get update
-sudo apt-get install -y shaderc
+sudo apt-get install -y shaderc spirv-headers spirv-tools
 command -v glslc
 glslc --version | head -1
