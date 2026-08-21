@@ -104,7 +104,7 @@ copy_llama_runtime_libs() {
 build_llama_variant() {
   local variant="$1"
   local stem="llama-server"
-  local cmake_flags=(-DCMAKE_BUILD_TYPE=Release -DLLAMA_BUILD_SERVER=ON -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF)
+  local cmake_flags=(-DCMAKE_BUILD_TYPE=Release -DLLAMA_BUILD_SERVER=ON -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_UI=OFF)
   case "$variant" in
     cpu)
       cmake_flags+=(-DGGML_METAL=OFF -DGGML_CUDA=OFF -DGGML_VULKAN=OFF -DBUILD_SHARED_LIBS=OFF)
@@ -112,10 +112,18 @@ build_llama_variant() {
     cuda)
       stem="llama-server-cuda"
       cmake_flags+=(-DGGML_METAL=OFF -DGGML_CUDA=ON -DGGML_VULKAN=OFF -DBUILD_SHARED_LIBS=OFF)
+      if [[ -n "${CUDA_PATH:-}" ]]; then
+        local nvcc="$CUDA_PATH/bin/nvcc"
+        [[ "$HOST_TRIPLE" == *windows* ]] && nvcc="${nvcc}.exe"
+        cmake_flags+=(-DCMAKE_CUDA_COMPILER="$nvcc")
+      fi
       ;;
     vulkan)
       stem="llama-server-vulkan"
       cmake_flags+=(-DGGML_METAL=OFF -DGGML_CUDA=OFF -DGGML_VULKAN=ON -DBUILD_SHARED_LIBS=OFF)
+      if [[ -n "${VULKAN_SDK:-}" ]]; then
+        cmake_flags+=(-DCMAKE_PREFIX_PATH="$VULKAN_SDK")
+      fi
       ;;
     *)
       echo "unknown llama variant: $variant" >&2
@@ -155,6 +163,7 @@ if [[ "$OS" == Darwin ]]; then
     -DLLAMA_BUILD_SERVER=ON \
     -DLLAMA_BUILD_TESTS=OFF \
     -DLLAMA_BUILD_EXAMPLES=OFF \
+    -DLLAMA_BUILD_UI=OFF \
     -DGGML_METAL=ON
   cmake --build "$BUILD_DIR/llama.cpp/build" --config Release --target llama-server -j "$(job_count)"
   llama_server="$(find_llama_server "$BUILD_DIR/llama.cpp/build")"
