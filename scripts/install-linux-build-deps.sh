@@ -20,4 +20,4 @@ sudo apt-get install -y \
   libvulkan-dev \
   vulkan-tools \
   glslang-tools \
-  libfuse2
+  libfuse2t64

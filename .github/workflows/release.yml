@@ -85,6 +85,8 @@ jobs:
 
   linux:
     runs-on: ubuntu-24.04
+    env:
+      APPIMAGE_EXTRACT_AND_RUN: "1"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
