@@ -105,6 +105,9 @@ build_llama_variant() {
   local variant="$1"
   local stem="llama-server"
   local cmake_flags=(-DCMAKE_BUILD_TYPE=Release -DLLAMA_BUILD_SERVER=ON -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_UI=OFF)
+  if [[ "$HOST_TRIPLE" == *windows* ]]; then
+    cmake_flags+=(-G Ninja)
+  fi
   case "$variant" in
     cpu)
       cmake_flags+=(-DGGML_METAL=OFF -DGGML_CUDA=OFF -DGGML_VULKAN=OFF -DBUILD_SHARED_LIBS=OFF)

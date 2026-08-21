@@ -196,7 +196,7 @@ jobs:
           $url = "https://developer.download.nvidia.com/compute/cuda/$version/network_installers/cuda_${version}_windows_network.exe"
           Invoke-WebRequest -Uri $url -OutFile cuda_installer.exe -UseBasicParsing
           $p = Start-Process -FilePath .\cuda_installer.exe -ArgumentList @(
-            '-s', "nvcc_$short", "cudart_$short", "cublas_$short"
+            '-s', "nvcc_$short", "cudart_$short", "cublas_$short", "visual_studio_integration_$short"
           ) -Wait -PassThru -NoNewWindow
           if ($p.ExitCode -ne 0) { throw "CUDA installer exited $($p.ExitCode)" }
           $cudaPath = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v$short"
