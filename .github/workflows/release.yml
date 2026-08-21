@@ -188,21 +188,8 @@ jobs:
           "VULKAN_SDK=$sdk" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
           "$sdk\Bin" | Out-File $env:GITHUB_PATH -Append -Encoding utf8
       - name: Install CUDA toolkit
-        id: cuda-toolkit
         shell: pwsh
-        run: |
-          $version = "12.8.1"
-          $short = "12.8"
-          $url = "https://developer.download.nvidia.com/compute/cuda/$version/network_installers/cuda_${version}_windows_network.exe"
-          Invoke-WebRequest -Uri $url -OutFile cuda_installer.exe -UseBasicParsing
-          $p = Start-Process -FilePath .\cuda_installer.exe -ArgumentList @(
-            '-s', "nvcc_$short", "cudart_$short", "cublas_$short", "visual_studio_integration_$short"
-          ) -Wait -PassThru -NoNewWindow
-          if ($p.ExitCode -ne 0) { throw "CUDA installer exited $($p.ExitCode)" }
-          $cudaPath = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v$short"
-          "CUDA_PATH=$cudaPath" | Out-File -Append $env:GITHUB_OUTPUT
-          "CUDA_PATH=$cudaPath" | Out-File -Append $env:GITHUB_ENV
-          "$cudaPath\bin" | Out-File -Append $env:GITHUB_PATH
+        run: ./scripts/install-windows-cuda-toolkit.ps1
       - name: Build GGUF sidecars (CPU, CUDA, and Vulkan)
         run: BUILD_LLAMA_CUDA=1 BUILD_LLAMA_VULKAN=1 ./scripts/build-sidecars.sh
       - uses: tauri-apps/tauri-action@v0

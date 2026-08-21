@@ -118,7 +118,13 @@ build_llama_variant() {
       if [[ -n "${CUDA_PATH:-}" ]]; then
         local nvcc="$CUDA_PATH/bin/nvcc"
         [[ "$HOST_TRIPLE" == *windows* ]] && nvcc="${nvcc}.exe"
-        cmake_flags+=(-DCMAKE_CUDA_COMPILER="$nvcc")
+        cmake_flags+=(
+          -DCMAKE_CUDA_COMPILER="$nvcc"
+          -DCUDAToolkit_ROOT="$CUDA_PATH"
+        )
+        if [[ "$HOST_TRIPLE" == *windows* ]]; then
+          cmake_flags+=(-DCMAKE_CUDA_ARCHITECTURES=86)
+        fi
       fi
       ;;
     vulkan)
