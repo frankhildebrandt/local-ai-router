@@ -7,7 +7,7 @@ import {
 import { command } from "./api";
 import { CandleLineChart } from "./CandleLineChart";
 import { emptyUsage, fetchers, queryKeys } from "./queries";
-import type { LocalApiKey, LocalApiKeyWithToken } from "./types";
+import type { AgentIdentity, LocalApiKey, LocalApiKeyWithToken } from "./types";
 
 type Props = {
   localKeys: LocalApiKey[];
@@ -18,6 +18,7 @@ type Props = {
 
 export function ApiKeysPage({ localKeys, refresh, success, fail }: Props) {
   const [name, setName] = useState("");
+  const [agentIdentity, setAgentIdentity] = useState<AgentIdentity>("router");
   const [busy, setBusy] = useState(false);
   const [created, setCreated] = useState<LocalApiKeyWithToken | null>(null);
   const [period, setPeriod] = useState<"24h" | "7d" | "30d" | "all">("7d");
@@ -41,9 +42,10 @@ export function ApiKeysPage({ localKeys, refresh, success, fail }: Props) {
     if (!name.trim()) return;
     setBusy(true);
     try {
-      const result = await command<LocalApiKeyWithToken>("create_local_api_key", { name });
+      const result = await command<LocalApiKeyWithToken>("create_local_api_key", { name, agent_identity: agentIdentity });
       setCreated(result);
       setName("");
+      setAgentIdentity("router");
       await refresh();
       success("Local API key created");
     } catch (error) { fail(error); }
@@ -74,6 +76,14 @@ export function ApiKeysPage({ localKeys, refresh, success, fail }: Props) {
       if (!confirm(`Revoke “${key.name}”? This cannot be undone.`)) return;
       try { await command("revoke_local_api_key", { id: key.id }); setToken(null); setSelectedId(null); await refresh(); success("API key revoked"); } catch (error) { fail(error); }
     };
+    const setIdentity = async (next: AgentIdentity) => {
+      if (!key || key.agent_identity === next) return;
+      try {
+        await command("set_local_api_key_agent_identity", { id: key.id, agent_identity: next });
+        await refresh();
+        success(next === "client" ? "Client agent will be forwarded" : "Requests identify as Local AI Router");
+      } catch (error) { fail(error); }
+    };
     const successRate = detail?.request_count ? `${Math.round(detail.success_count / detail.request_count * 100)}%` : "—";
     return <>
       <button className="text-button keys-back" onClick={() => { setSelectedId(null); setToken(null); }}><ArrowLeft size={15} />Back to API keys</button>
@@ -81,6 +91,9 @@ export function ApiKeysPage({ localKeys, refresh, success, fail }: Props) {
       {key && !key.revoked_at && <section className="panel key-secret-panel">
         <div className="secret"><code>{token ?? "••••••••••••••••••••••••"}</code><button className="icon-button" title={token ? "Hide" : "Reveal"} onClick={() => void reveal()}>{token ? <EyeOff size={15} /> : <Eye size={15} />}</button>{token && <CopyButton value={token} />}</div>
         <div className="api-key-actions"><button className="icon-button" title="Rename" onClick={() => void rename()}><Pencil size={15} /></button><button className="secondary" onClick={() => void rotate()}><RefreshCw size={15} />Rotate</button><button className="icon-button danger" title="Revoke" onClick={() => void revoke()}><Trash2 size={15} /></button></div>
+      </section>}
+      {key && !key.revoked_at && <section className="panel">
+        <div className="panel-title"><div><h3>Agent identity</h3><p>Upstream providers see Local AI Router, or the original client User-Agent, originator, and OpenRouter title headers.</p></div><AgentIdentityPicker value={key.agent_identity} onChange={value => void setIdentity(value)} /></div>
       </section>}
       <div className="metric-grid usage-metrics">
         <Metric icon={<Activity />} value={formatNumber(detail?.request_count ?? 0)} label="Requests" />
@@ -121,8 +134,8 @@ export function ApiKeysPage({ localKeys, refresh, success, fail }: Props) {
       <Metric icon={<Download />} value={formatNumber(usage.cache_read_tokens ?? 0)} label="Cache read" />
     </div>
     <section className="panel api-keys-create">
-      <div className="panel-title"><div><h3>Create a key</h3><p>Give each client its own token so usage stays attributable.</p></div></div>
-      <div className="inline-form"><input value={name} onChange={event => setName(event.target.value)} placeholder="New key name" maxLength={80} /><button className="primary" disabled={!name.trim() || busy} onClick={() => void create()}><Plus size={16} />Create key</button></div>
+      <div className="panel-title"><div><h3>Create a key</h3><p>Give each client its own token so usage stays attributable. Choose whether upstream sees Local AI Router or the original client agent.</p></div></div>
+      <div className="inline-form"><input value={name} onChange={event => setName(event.target.value)} placeholder="New key name" maxLength={80} /><AgentIdentityPicker value={agentIdentity} onChange={setAgentIdentity} /><button className="primary" disabled={!name.trim() || busy} onClick={() => void create()}><Plus size={16} />Create key</button></div>
       {created && <div className="created-token"><div><strong>{created.name}</strong><small>Copy this token now. You can reveal it again from the key details.</small></div><div className="secret"><code>{created.token}</code><CopyButton value={created.token} /></div></div>}
     </section>
     <section className="panel">
@@ -158,6 +171,12 @@ export function ApiKeysPage({ localKeys, refresh, success, fail }: Props) {
   </>;
 }
 
+function AgentIdentityPicker({ value, onChange }: { value: AgentIdentity; onChange: (value: AgentIdentity) => void }) {
+  return <div className="segmented small" role="group" aria-label="Agent identity">
+    <button type="button" className={value === "router" ? "selected" : ""} aria-pressed={value === "router"} onClick={() => onChange("router")}>Router</button>
+    <button type="button" className={value === "client" ? "selected" : ""} aria-pressed={value === "client"} onClick={() => onChange("client")}>Client agent</button>
+  </div>;
+}
 function PageHead({ eyebrow, title, description, action }: { eyebrow: string; title: string; description: string; action?: ReactNode }) {
   return <div className="page-head"><div><span className="eyebrow">{eyebrow}</span><h1>{title}</h1><p>{description}</p></div>{action}</div>;
 }

@@ -425,9 +425,12 @@ async fn dispatch(services: &AppServices, name: &str, args: Value) -> Result<Val
             Ok(Value::Null)
         }
         "list_local_api_keys" => ok(commands::list_local_api_keys(services).await?),
-        "create_local_api_key" => {
-            ok(commands::create_local_api_key(services, field(&args, "name")?).await?)
-        }
+        "create_local_api_key" => ok(commands::create_local_api_key(
+            services,
+            field(&args, "name")?,
+            optional(&args, "agent_identity")?,
+        )
+        .await?),
         "reveal_local_api_key" => {
             ok(commands::reveal_local_api_key(services, field(&args, "id")?).await?)
         }
@@ -435,6 +438,12 @@ async fn dispatch(services: &AppServices, name: &str, args: Value) -> Result<Val
             services,
             field(&args, "id")?,
             field(&args, "name")?,
+        )
+        .await?),
+        "set_local_api_key_agent_identity" => ok(commands::set_local_api_key_agent_identity(
+            services,
+            field(&args, "id")?,
+            field(&args, "agent_identity")?,
         )
         .await?),
         "rotate_local_api_key" => {
@@ -649,7 +658,9 @@ async fn dispatch(services: &AppServices, name: &str, args: Value) -> Result<Val
             commands::disconnect_uplink(services).await?;
             Ok(Value::Null)
         }
-        "publish_local_model" => ok(commands::publish_local_model(services, field(&args, "input")?).await?),
+        "publish_local_model" => {
+            ok(commands::publish_local_model(services, field(&args, "input")?).await?)
+        }
         "unpublish_local_model" => {
             commands::unpublish_local_model(services, field(&args, "input")?).await?;
             Ok(Value::Null)
@@ -657,8 +668,12 @@ async fn dispatch(services: &AppServices, name: &str, args: Value) -> Result<Val
         "list_network_models" => ok(commands::list_network_models(services).await?),
         "list_shared_images" => ok(commands::list_shared_images(services).await?),
         "list_parent_shared_images" => ok(commands::list_parent_shared_images(services).await?),
-        "register_shared_image" => ok(commands::register_shared_image(services, field(&args, "input")?).await?),
-        "pull_shared_image" => ok(commands::pull_shared_image(services, field(&args, "input")?).await?),
+        "register_shared_image" => {
+            ok(commands::register_shared_image(services, field(&args, "input")?).await?)
+        }
+        "pull_shared_image" => {
+            ok(commands::pull_shared_image(services, field(&args, "input")?).await?)
+        }
         "report_shared_image_installed" => {
             commands::report_shared_image_installed(services, field(&args, "input")?).await?;
             Ok(Value::Null)

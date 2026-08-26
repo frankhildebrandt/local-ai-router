@@ -42,7 +42,7 @@ beforeEach(() => {
     }
     if (name === "export_routing_config") return Promise.resolve({ schema: "local-ai-router/routing-policy/v1", tasks: [], profiles: [], policies: [] });
     if (name === "list_provider_presets") return Promise.resolve([]);
-    if (name === "list_local_api_keys") return Promise.resolve([{ id: "default", name: "Default", created_at: "2026-08-17T10:00:00Z", last_used_at: null, revoked_at: null }]);
+    if (name === "list_local_api_keys") return Promise.resolve([{ id: "default", name: "Default", created_at: "2026-08-17T10:00:00Z", last_used_at: null, revoked_at: null, agent_identity: "router" }]);
     if (name === "list_logs") return Promise.resolve({ total: 1, items: [{ id: "request", created_at: "2026-08-17T10:00:00Z", endpoint: "/v1/chat/completions", alias: "assistant", target: "cloud", attempts: 1, status: 200, latency_ms: 12, input_tokens: 3, output_tokens: 5, error_code: null, error_message: null, api_key_id: "default", api_key_name: "Default" }] });
     if (name === "get_settings") return Promise.resolve({});
     if (name === "uplink_status") return Promise.resolve(null);
@@ -56,9 +56,9 @@ beforeEach(() => {
     if (name === "get_resource_profile_preset") return Promise.resolve({ version: 1, profile: "balanced", memory_budget_percent: 70, memory_budget_mib: null, auto_load: true, idle_unload_minutes: 15, compute_duty_percent: 60, cpu_threads: 8, max_parallel_prompts: 2, process_priority: 0, gguf_gpu_layers: -1, disk_kv_enabled: false, disk_kv_max_bytes: 10 * 1024 ** 3 });
     if (name === "get_log_facets") return Promise.resolve({ aliases: ["assistant"], targets: ["cloud"], endpoints: ["/v1/chat/completions"] });
     if (name === "get_usage") return Promise.resolve({ request_count: 17, success_count: 16, average_latency_ms: 12, input_tokens: 128, output_tokens: 256, cache_read_tokens: 16, cache_write_tokens: 0, unknown_usage_count: 0, tokens_per_second: 21.3, estimated_cost_usd: 0.012, buckets: [{ start: "2026-08-17T10:00:00Z", request_count: 17, input_tokens: 128, output_tokens: 256 }], by_key: [{ api_key_id: "default", api_key_name: "Default", request_count: 17, success_count: 16, average_latency_ms: 12, input_tokens: 128, output_tokens: 256, unknown_usage_count: 0 }], by_model: [{ alias: "assistant", target: "coding", request_count: 17, success_count: 16, average_latency_ms: 12, input_tokens: 32, output_tokens: 64, unknown_usage_count: 0, tokens_per_second: 21.3, estimated_cost_usd: 0.012 }], throughput_candles: [{ start: "2026-08-17T10:00:00Z", open: 18, high: 24, low: 12, close: 21.3, avg: 20 }], cost_candles: [{ start: "2026-08-17T10:00:00Z", open: 0.01, high: 0.02, low: 0.008, close: 0.012, avg: 0.012 }] });
-    if (name === "create_local_api_key") return Promise.resolve({ id: "new-key", name: "Automation", created_at: "2026-08-17T11:00:00Z", last_used_at: null, revoked_at: null, token: "lar_new" });
+    if (name === "create_local_api_key") return Promise.resolve({ id: "new-key", name: "Automation", created_at: "2026-08-17T11:00:00Z", last_used_at: null, revoked_at: null, agent_identity: "router", token: "lar_new" });
     if (name === "get_key_usage") return Promise.resolve({
-      id: "default", name: "Default", created_at: "2026-08-17T10:00:00Z", last_used_at: null, revoked_at: null,
+      id: "default", name: "Default", created_at: "2026-08-17T10:00:00Z", last_used_at: null, revoked_at: null, agent_identity: "router",
       request_count: 17, success_count: 16, average_latency_ms: 12, input_tokens: 128, output_tokens: 256, cache_read_tokens: 16, cache_write_tokens: 0, unknown_usage_count: 0, tokens_per_second: 21.3, estimated_cost_usd: 0.012,
       buckets: [{ start: "2026-08-17T10:00:00Z", request_count: 17, input_tokens: 128, output_tokens: 256 }],
       by_model: [{ alias: "assistant", target: "coding", request_count: 17, success_count: 16, average_latency_ms: 12, input_tokens: 32, output_tokens: 64, unknown_usage_count: 0, tokens_per_second: 21.3, estimated_cost_usd: 0.012 }],
@@ -332,7 +332,11 @@ describe("Local AI Router shell", () => {
     expect(screen.getAllByText("Default").length).toBeGreaterThan(0);
     fireEvent.change(screen.getByPlaceholderText("New key name"), { target: { value: "Automation" } });
     fireEvent.click(screen.getByRole("button", { name: "Create key" }));
-    await waitFor(() => expect(command).toHaveBeenCalledWith("create_local_api_key", { name: "Automation" }));
+    await waitFor(() => expect(command).toHaveBeenCalledWith("create_local_api_key", { name: "Automation", agent_identity: "router" }));
+    fireEvent.click(screen.getByRole("button", { name: "Client agent" }));
+    fireEvent.change(screen.getByPlaceholderText("New key name"), { target: { value: "Cursor" } });
+    fireEvent.click(screen.getByRole("button", { name: "Create key" }));
+    await waitFor(() => expect(command).toHaveBeenCalledWith("create_local_api_key", { name: "Cursor", agent_identity: "client" }));
 
     fireEvent.click(screen.getByRole("button", { name: "Request logs" }));
     expect(await screen.findByLabelText("API key")).toBeInTheDocument();
@@ -376,6 +380,9 @@ describe("Local AI Router shell", () => {
     expect(screen.getByText("Theoretical cost")).toBeInTheDocument();
     expect(screen.getByLabelText("tok/s over time")).toBeInTheDocument();
     expect(screen.getByLabelText("USD over time")).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "Agent identity" })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Client agent" }));
+    await waitFor(() => expect(command).toHaveBeenCalledWith("set_local_api_key_agent_identity", { id: "default", agent_identity: "client" }));
   });
 
   it("shows curated catalog categories, RAM badges, locked models, and import paths", async () => {

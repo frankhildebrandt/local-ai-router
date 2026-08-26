@@ -242,12 +242,15 @@ export interface RequestLog {
   api_key_name: string | null;
 }
 
+export type AgentIdentity = "router" | "client";
+
 export interface LocalApiKey {
   id: string;
   name: string;
   created_at: string;
   last_used_at: string | null;
   revoked_at: string | null;
+  agent_identity: AgentIdentity;
 }
 
 export interface LocalApiKeyWithToken extends LocalApiKey {

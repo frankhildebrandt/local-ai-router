@@ -23,8 +23,16 @@ use crate::{
         generate_local_token, local_api_key_account, provider_account, SecretStore,
         CIVITAI_ACCOUNT, HF_ACCOUNT, LOCAL_API_KEY,
     },
-    storage::{LocalApiKey, ModelTarget, Provider, Store},
+    storage::{AgentIdentity, LocalApiKey, ModelTarget, Provider, Store},
 };
+
+pub const ROUTER_USER_AGENT: &str = "LocalAI-Router/0.1";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthorizedLocalKey {
+    pub id: String,
+    pub agent_identity: AgentIdentity,
+}
 
 #[derive(Clone)]
 pub struct AppCore {
@@ -372,7 +380,8 @@ impl AppCore {
         let core = Self::new(store, secrets)?;
         core.migrate_legacy_local_api_key().await?;
         if core.store.local_api_keys().await?.is_empty() {
-            core.create_local_api_key("Default").await?;
+            core.create_local_api_key("Default", AgentIdentity::Router)
+                .await?;
         }
         core.cleanup_revoked_local_api_key_secrets().await;
         crate::identity::bootstrap_operator(&core.store, core.secrets.as_ref()).await?;
@@ -382,7 +391,7 @@ impl AppCore {
     pub fn new(store: Store, secrets: Arc<dyn SecretStore>) -> anyhow::Result<Self> {
         let client = Client::builder()
             .connect_timeout(Duration::from_secs(10))
-            .user_agent("LocalAI-Router/0.1")
+            .user_agent(ROUTER_USER_AGENT)
             .redirect(reqwest::redirect::Policy::none())
             .build()?;
         let oauth = OAuthManager::new(client.clone(), secrets.clone());
@@ -415,6 +424,7 @@ impl AppCore {
             created_at: chrono::Utc::now(),
             last_used_at: None,
             revoked_at: None,
+            agent_identity: AgentIdentity::Router,
         };
         let account = local_api_key_account(&key.id);
         self.secrets.set(&account, &token)?;
@@ -430,7 +440,11 @@ impl AppCore {
         Ok(())
     }
 
-    pub async fn create_local_api_key(&self, name: &str) -> anyhow::Result<(LocalApiKey, String)> {
+    pub async fn create_local_api_key(
+        &self,
+        name: &str,
+        agent_identity: AgentIdentity,
+    ) -> anyhow::Result<(LocalApiKey, String)> {
         let name = validated_key_name(name)?;
         let key = LocalApiKey {
             id: uuid::Uuid::new_v4().to_string(),
@@ -438,6 +452,7 @@ impl AppCore {
             created_at: chrono::Utc::now(),
             last_used_at: None,
             revoked_at: None,
+            agent_identity,
         };
         let token = generate_local_token();
         let account = local_api_key_account(&key.id);
@@ -462,6 +477,24 @@ impl AppCore {
     pub async fn rename_local_api_key(&self, id: &str, name: &str) -> anyhow::Result<LocalApiKey> {
         let name = validated_key_name(name)?;
         if !self.store.rename_local_api_key(id, &name).await? {
+            anyhow::bail!("local API key not found");
+        }
+        self.store
+            .local_api_key(id)
+            .await?
+            .context("local API key not found")
+    }
+
+    pub async fn set_local_api_key_agent_identity(
+        &self,
+        id: &str,
+        agent_identity: AgentIdentity,
+    ) -> anyhow::Result<LocalApiKey> {
+        if !self
+            .store
+            .set_local_api_key_agent_identity(id, agent_identity)
+            .await?
+        {
             anyhow::bail!("local API key not found");
         }
         self.store
@@ -519,26 +552,31 @@ impl AppCore {
 
     pub async fn authorized(&self, authorization: Option<&str>) -> Option<String> {
         let candidate = authorization.and_then(|value| value.strip_prefix("Bearer "))?;
-        self.authorized_token(Some(candidate)).await
+        self.authorized_token(Some(candidate))
+            .await
+            .map(|key| key.id)
     }
 
-    pub async fn authorized_token(&self, candidate: Option<&str>) -> Option<String> {
+    pub async fn authorized_token(&self, candidate: Option<&str>) -> Option<AuthorizedLocalKey> {
         let candidate = candidate?;
         let Ok(keys) = self.store.active_local_api_key_hashes().await else {
             return None;
         };
         let candidate_hash = token_hash(candidate);
         let mut matched = None;
-        for (id, expected_hash) in keys {
+        for key in keys {
             if candidate_hash
                 .as_slice()
-                .ct_eq(expected_hash.as_slice())
+                .ct_eq(key.token_hash.as_slice())
                 .into()
             {
-                matched = Some(id);
+                matched = Some(AuthorizedLocalKey {
+                    id: key.id,
+                    agent_identity: key.agent_identity,
+                });
             }
         }
-        if let Some(id) = matched.as_deref() {
+        if let Some(id) = matched.as_ref().map(|key| key.id.as_str()) {
             let _ = self.store.touch_local_api_key(id).await;
         }
         matched
@@ -614,7 +652,9 @@ impl AppCore {
                     .context("replica is no longer advertised")?;
                 let token = self
                     .secrets
-                    .get(&crate::publish::callback_secret_account(&replica.child_node_id))?
+                    .get(&crate::publish::callback_secret_account(
+                        &replica.child_node_id,
+                    ))?
                     .context("replica session missing")?;
                 Ok((
                     replica.callback_url.trim_end_matches('/').to_owned(),
@@ -968,7 +1008,18 @@ mod tests {
         core.migrate_legacy_local_api_key().await.unwrap();
         core.migrate_legacy_local_api_key().await.unwrap();
         assert_eq!(core.store.local_api_keys().await.unwrap().len(), 1);
-        let (second, second_token) = core.create_local_api_key("Automation").await.unwrap();
+        let (second, second_token) = core
+            .create_local_api_key("Automation", AgentIdentity::Client)
+            .await
+            .unwrap();
+        assert_eq!(second.agent_identity, AgentIdentity::Client);
+        assert_eq!(
+            core.set_local_api_key_agent_identity(&second.id, AgentIdentity::Router)
+                .await
+                .unwrap()
+                .agent_identity,
+            AgentIdentity::Router
+        );
 
         assert_eq!(
             core.authorized(Some("Bearer legacy-token"))
@@ -1109,6 +1160,7 @@ mod tests {
                     created_at: chrono::Utc::now(),
                     last_used_at: None,
                     revoked_at: None,
+                    agent_identity: AgentIdentity::Router,
                 },
                 &[0u8; 32],
             )

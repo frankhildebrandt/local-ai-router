@@ -16,8 +16,8 @@ use crate::routing::{
 };
 use crate::speculative::SpeculativeConfig;
 use crate::storage::{
-    InstallJob, KeyUsageData, LocalApiKey, LogFacets, LogQuery, LogResult, ModelTarget, Provider,
-    ProviderModel, UsageData,
+    AgentIdentity, InstallJob, KeyUsageData, LocalApiKey, LogFacets, LogQuery, LogResult,
+    ModelTarget, Provider, ProviderModel, UsageData,
 };
 
 macro_rules! wrap_async {
@@ -42,9 +42,10 @@ wrap_async!(dashboard() -> Dashboard);
 wrap_async!(cancel_inflight_request(id: String) -> ());
 wrap_async!(cancel_all_inflight_requests() -> ());
 wrap_async!(list_local_api_keys() -> Vec<LocalApiKey>);
-wrap_async!(create_local_api_key(name: String) -> LocalApiKeyWithToken);
+wrap_async!(create_local_api_key(name: String, agent_identity: Option<AgentIdentity>) -> LocalApiKeyWithToken);
 wrap_async!(reveal_local_api_key(id: String) -> String);
 wrap_async!(rename_local_api_key(id: String, name: String) -> LocalApiKey);
+wrap_async!(set_local_api_key_agent_identity(id: String, agent_identity: AgentIdentity) -> LocalApiKey);
 wrap_async!(rotate_local_api_key(id: String) -> String);
 wrap_async!(revoke_local_api_key(id: String) -> ());
 wrap_async!(client_chat(input: ClientChatInput) -> ClientChatResponse);

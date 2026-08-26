@@ -28,8 +28,8 @@ use crate::{
     },
     speculative::{self, SpeculativeConfig},
     storage::{
-        KeyUsageData, LocalApiKey, LogFacets, LogQuery, LogResult, ModelTarget, Provider,
-        ProviderModel, Store, UsageData,
+        AgentIdentity, KeyUsageData, LocalApiKey, LogFacets, LogQuery, LogResult, ModelTarget,
+        Provider, ProviderModel, Store, UsageData,
     },
 };
 
@@ -230,8 +230,13 @@ pub async fn list_local_api_keys(state: &AppServices) -> Result<Vec<LocalApiKey>
 pub async fn create_local_api_key(
     state: &AppServices,
     name: String,
+    agent_identity: Option<AgentIdentity>,
 ) -> Result<LocalApiKeyWithToken, String> {
-    let (key, token) = state.core.create_local_api_key(&name).await.map_err(err)?;
+    let (key, token) = state
+        .core
+        .create_local_api_key(&name, agent_identity.unwrap_or_default())
+        .await
+        .map_err(err)?;
     Ok(LocalApiKeyWithToken { key, token })
 }
 
@@ -257,6 +262,18 @@ pub async fn rename_local_api_key(
     state
         .core
         .rename_local_api_key(&id, &name)
+        .await
+        .map_err(err)
+}
+
+pub async fn set_local_api_key_agent_identity(
+    state: &AppServices,
+    id: String,
+    agent_identity: AgentIdentity,
+) -> Result<LocalApiKey, String> {
+    state
+        .core
+        .set_local_api_key_agent_identity(&id, agent_identity)
         .await
         .map_err(err)
 }

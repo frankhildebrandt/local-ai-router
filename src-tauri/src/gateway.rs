@@ -19,7 +19,7 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::{
-    core::{AppCore, InFlightGuard, InFlightProgress, InFlightRequest},
+    core::{AppCore, InFlightGuard, InFlightProgress, InFlightRequest, ROUTER_USER_AGENT},
     domain::{
         can_retry_same_target, first_byte_timeout_ms, is_fallback_status, is_transient_status,
         supports_capability, RATE_LIMIT_DEFAULT_SECS, SAME_TARGET_RETRY_DELAY_MS,
@@ -36,7 +36,7 @@ use crate::{
         RoutingEvaluation, RoutingMode,
     },
     runtime::RuntimeManager,
-    storage::{RequestLog, TokenUsage},
+    storage::{AgentIdentity, RequestLog, TokenUsage},
 };
 
 #[derive(Clone)]
@@ -100,9 +100,18 @@ fn router_with_state(state: GatewayState) -> Router {
         .route("/uplink/publish", post(uplink_publish))
         .route("/uplink/unpublish", post(uplink_unpublish))
         .route("/uplink/replicas/heartbeat", post(uplink_replica_heartbeat))
-        .route("/uplink/images", get(uplink_images).post(uplink_register_image))
-        .route("/uplink/images/{id}/blob", get(uplink_image_blob).post(uplink_image_blob_upload))
-        .route("/uplink/images/{id}/installed", post(uplink_image_installed))
+        .route(
+            "/uplink/images",
+            get(uplink_images).post(uplink_register_image),
+        )
+        .route(
+            "/uplink/images/{id}/blob",
+            get(uplink_image_blob).post(uplink_image_blob_upload),
+        )
+        .route(
+            "/uplink/images/{id}/installed",
+            post(uplink_image_installed),
+        )
         .with_state(state)
 }
 
@@ -1035,7 +1044,6 @@ async fn proxy(
                     AuthScheme::XGoogApiKey => request.header("x-goog-api-key", credential),
                     AuthScheme::OpenAiSubscription => request
                         .bearer_auth(credential)
-                        .header("originator", "local_ai_router")
                         .header("OpenAI-Beta", "responses=experimental"),
                 };
             }
@@ -1048,16 +1056,24 @@ async fn proxy(
             let is_openrouter = provider
                 .as_ref()
                 .is_some_and(|provider| provider.preset_id == "openrouter");
+            let is_open_ai_subscription = provider
+                .as_ref()
+                .and_then(|provider| provider_preset(&provider.preset_id))
+                .is_some_and(|preset| preset.auth_scheme == AuthScheme::OpenAiSubscription);
             if target.kind == crate::domain::TargetKind::Mlx {
                 request = request.header("x-local-ai-cache-namespace", &api_key_id);
                 if let Some(session_id) = session_id.as_deref() {
                     request = request.header("x-local-ai-session", session_id);
                 }
             }
-            if is_openrouter {
-                request = request
-                    .header("HTTP-Referer", "https://local-ai-router.app")
-                    .header("X-Title", "Local AI Router");
+            if !target.kind.is_uplink() && !target.kind.is_replica() {
+                request = apply_outbound_identity(
+                    request,
+                    caller.agent_identity(),
+                    &headers,
+                    is_open_ai_subscription,
+                    is_openrouter,
+                );
             }
             let attempt_timeout = Duration::from_millis(first_byte_timeout_ms(
                 evaluation.peer_latency_ms,
@@ -2664,8 +2680,11 @@ async fn authenticated_caller(core: &AppCore, headers: &HeaderMap) -> Option<Gat
                 .get("x-goog-api-key")
                 .and_then(|value| value.to_str().ok())
         });
-    if let Some(id) = core.authorized_token(candidate).await {
-        return Some(GatewayCaller::LocalApiKey { id });
+    if let Some(key) = core.authorized_token(candidate).await {
+        return Some(GatewayCaller::LocalApiKey {
+            id: key.id,
+            agent_identity: key.agent_identity,
+        });
     }
     if crate::publish::authenticate_replica_inbound(core, candidate).await {
         return Some(GatewayCaller::ReplicaInbound);
@@ -2677,7 +2696,10 @@ async fn authenticated_caller(core: &AppCore, headers: &HeaderMap) -> Option<Gat
 
 #[derive(Clone)]
 enum GatewayCaller {
-    LocalApiKey { id: String },
+    LocalApiKey {
+        id: String,
+        agent_identity: AgentIdentity,
+    },
     Uplink(crate::uplink::UplinkCaller),
     ReplicaInbound,
 }
@@ -2685,7 +2707,7 @@ enum GatewayCaller {
 impl GatewayCaller {
     fn kv_id(&self) -> String {
         match self {
-            Self::LocalApiKey { id } => id.clone(),
+            Self::LocalApiKey { id, .. } => id.clone(),
             Self::Uplink(caller) => format!("uplink:{}", caller.user_id),
             Self::ReplicaInbound => "replica-inbound".into(),
         }
@@ -2693,8 +2715,15 @@ impl GatewayCaller {
 
     fn api_key_id(&self) -> Option<&str> {
         match self {
-            Self::LocalApiKey { id } => Some(id),
+            Self::LocalApiKey { id, .. } => Some(id),
             Self::Uplink(_) | Self::ReplicaInbound => None,
+        }
+    }
+
+    fn agent_identity(&self) -> AgentIdentity {
+        match self {
+            Self::LocalApiKey { agent_identity, .. } => *agent_identity,
+            Self::Uplink(_) | Self::ReplicaInbound => AgentIdentity::Router,
         }
     }
 
@@ -2704,6 +2733,61 @@ impl GatewayCaller {
             Self::LocalApiKey { .. } | Self::ReplicaInbound => None,
         }
     }
+}
+
+const ROUTER_ORIGINATOR: &str = "local_ai_router";
+const OPENROUTER_REFERER: &str = "https://local-ai-router.app";
+const OPENROUTER_TITLE: &str = "Local AI Router";
+
+fn inbound_header<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+fn apply_outbound_identity(
+    mut request: reqwest::RequestBuilder,
+    identity: AgentIdentity,
+    inbound: &HeaderMap,
+    is_open_ai_subscription: bool,
+    is_openrouter: bool,
+) -> reqwest::RequestBuilder {
+    let user_agent = match identity {
+        AgentIdentity::Client => inbound_header(inbound, header::USER_AGENT.as_str()),
+        AgentIdentity::Router => None,
+    }
+    .unwrap_or(ROUTER_USER_AGENT);
+    request = request.header(header::USER_AGENT, user_agent);
+
+    if is_open_ai_subscription {
+        let originator = match identity {
+            AgentIdentity::Client => inbound_header(inbound, "originator"),
+            AgentIdentity::Router => None,
+        }
+        .unwrap_or(ROUTER_ORIGINATOR);
+        request = request.header("originator", originator);
+    }
+
+    if is_openrouter {
+        let referer = match identity {
+            AgentIdentity::Client => inbound_header(inbound, "http-referer")
+                .or_else(|| inbound_header(inbound, header::REFERER.as_str())),
+            AgentIdentity::Router => None,
+        }
+        .unwrap_or(OPENROUTER_REFERER);
+        let title = match identity {
+            AgentIdentity::Client => inbound_header(inbound, "x-title"),
+            AgentIdentity::Router => None,
+        }
+        .unwrap_or(OPENROUTER_TITLE);
+        request = request
+            .header("HTTP-Referer", referer)
+            .header("X-Title", title);
+    }
+
+    request
 }
 
 async fn hop_http_client(
@@ -2952,7 +3036,10 @@ async fn uplink_publish(
         Err(response) => return response,
     };
     match crate::publish::accept_publish(&state.core, &caller, request).await {
-        Ok(model) => json_response(StatusCode::OK, serde_json::to_value(model).unwrap_or(json!({}))),
+        Ok(model) => json_response(
+            StatusCode::OK,
+            serde_json::to_value(model).unwrap_or(json!({})),
+        ),
         Err(error) => publish_error_response(error),
     }
 }
@@ -2988,9 +3075,10 @@ async fn uplink_replica_heartbeat(
         Err(response) => return response,
     };
     match crate::publish::accept_heartbeat(&state.core, &caller).await {
-        Ok(replicas) => {
-            json_response(StatusCode::OK, serde_json::to_value(replicas).unwrap_or(json!([])))
-        }
+        Ok(replicas) => json_response(
+            StatusCode::OK,
+            serde_json::to_value(replicas).unwrap_or(json!([])),
+        ),
         Err(error) => publish_error_response(error),
     }
 }
@@ -3004,7 +3092,10 @@ async fn uplink_images(State(state): State<GatewayState>, headers: HeaderMap) ->
         );
     }
     match crate::publish::list_shared_images(&state.core.store).await {
-        Ok(images) => json_response(StatusCode::OK, serde_json::to_value(images).unwrap_or(json!([]))),
+        Ok(images) => json_response(
+            StatusCode::OK,
+            serde_json::to_value(images).unwrap_or(json!([])),
+        ),
         Err(error) => publish_error_response(error),
     }
 }
@@ -3019,7 +3110,10 @@ async fn uplink_register_image(
         Err(response) => return response,
     };
     match crate::publish::accept_register_image(&state.core, &caller, input).await {
-        Ok(image) => json_response(StatusCode::OK, serde_json::to_value(image).unwrap_or(json!({}))),
+        Ok(image) => json_response(
+            StatusCode::OK,
+            serde_json::to_value(image).unwrap_or(json!({})),
+        ),
         Err(error) => publish_error_response(error),
     }
 }
@@ -3041,7 +3135,13 @@ async fn uplink_image_blob(
             .status(StatusCode::OK)
             .header(header::CONTENT_TYPE, "application/octet-stream")
             .body(Body::from(bytes))
-            .unwrap_or_else(|_| openai_error(StatusCode::INTERNAL_SERVER_ERROR, "storage_error", "Unable to return catalog blob")),
+            .unwrap_or_else(|_| {
+                openai_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "storage_error",
+                    "Unable to return catalog blob",
+                )
+            }),
         Err(error) => publish_error_response(error),
     }
 }
@@ -3057,7 +3157,10 @@ async fn uplink_image_blob_upload(
         Err(response) => return response,
     };
     match crate::publish::accept_image_blob(&state.core, &caller, &id, &body).await {
-        Ok(image) => json_response(StatusCode::OK, serde_json::to_value(image).unwrap_or(json!({}))),
+        Ok(image) => json_response(
+            StatusCode::OK,
+            serde_json::to_value(image).unwrap_or(json!({})),
+        ),
         Err(error) => publish_error_response(error),
     }
 }
@@ -3071,7 +3174,8 @@ async fn uplink_image_installed(
         Ok(caller) => caller,
         Err(response) => return response,
     };
-    match crate::publish::mark_image_installed(&state.core.store, &id, &caller.child_node_id).await {
+    match crate::publish::mark_image_installed(&state.core.store, &id, &caller.child_node_id).await
+    {
         Ok(()) => json_response(StatusCode::OK, json!({"ok": true})),
         Err(error) => publish_error_response(error),
     }
@@ -3396,11 +3500,11 @@ async fn estimated_logged_cost(
 mod tests {
     use super::*;
     use crate::{
-        core::AppCore,
+        core::{AppCore, ROUTER_USER_AGENT},
         domain::{ModelRoute, RouteRole, RouteTarget, TargetKind},
         providers::AuthMode,
         secrets::{MemorySecrets, SecretStore, LOCAL_API_KEY},
-        storage::{ModelTarget, Provider, Store},
+        storage::{AgentIdentity, ModelTarget, Provider, Store},
     };
     use axum::{
         body::Body,
@@ -3871,6 +3975,87 @@ mod tests {
         format!("http://{address}/v1")
     }
 
+    async fn capturing_upstream() -> (String, Arc<std::sync::Mutex<Vec<HeaderMap>>>) {
+        let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let app = Router::new().fallback({
+            let captured = captured.clone();
+            move |headers: HeaderMap| {
+                let captured = captured.clone();
+                async move {
+                    captured.lock().unwrap().push(headers);
+                    (
+                        StatusCode::OK,
+                        Json(json!({"id":"ok","choices":[{"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]})),
+                    )
+                }
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{address}/v1"), captured)
+    }
+
+    async fn seed_cloud_provider(
+        store: &Store,
+        preset_id: &str,
+        auth_mode: AuthMode,
+        base_url: String,
+    ) {
+        store
+            .upsert_provider(&Provider {
+                id: "provider".into(),
+                name: preset_id.into(),
+                preset_id: preset_id.into(),
+                auth_mode,
+                base_url,
+                enabled: true,
+                has_credential: false,
+            })
+            .await
+            .unwrap();
+        store
+            .upsert_target(&ModelTarget {
+                id: "target".into(),
+                provider_id: Some("provider".into()),
+                name: "Target".into(),
+                kind: TargetKind::Cloud,
+                provider_model: "real".into(),
+                local_path: None,
+                runtime_url: None,
+                wire_protocol: WireProtocol::OpenAiChat,
+                capabilities: vec!["chat".into()],
+                enabled: true,
+                state: "ready".into(),
+                size_bytes: None,
+                local: crate::storage::LocalModelMeta::default(),
+            })
+            .await
+            .unwrap();
+        store
+            .upsert_route(&ModelRoute {
+                alias: "assistant".into(),
+                enabled: true,
+                capabilities: vec!["chat".into()],
+                targets: vec![RouteTarget {
+                    id: "target".into(),
+                    kind: TargetKind::Cloud,
+                    model: "real".into(),
+                    priority: 10,
+                    enabled: true,
+                    ..Default::default()
+                }],
+            })
+            .await
+            .unwrap();
+    }
+
+    fn captured_header<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
+        headers.get(name).and_then(|value| value.to_str().ok())
+    }
+
     #[tokio::test]
     async fn provider_auth_profiles_emit_expected_headers() {
         for (preset_id, auth_mode, expected) in [
@@ -4041,6 +4226,211 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn router_agent_identity_ignores_inbound_user_agent() {
+        let (url, captured) = capturing_upstream().await;
+        let store = Store::memory().await.unwrap();
+        seed_cloud_provider(&store, "openai", AuthMode::ApiKey, url).await;
+        let secrets: Arc<dyn SecretStore> = Arc::new(MemorySecrets::default());
+        secrets.set(LOCAL_API_KEY, "local-key").unwrap();
+        let core = AppCore::new(store, secrets).unwrap();
+        core.migrate_legacy_local_api_key().await.unwrap();
+        core.save_provider_api_key("provider", "provider-key")
+            .unwrap();
+        let response = router(Arc::new(core))
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("authorization", "Bearer local-key")
+                    .header("user-agent", "Cursor/1.0")
+                    .header("x-local-ai-session", "private-session")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"model":"assistant","messages":[{"role":"user","content":"hello"}]}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let headers = captured.lock().unwrap().pop().unwrap();
+        assert_eq!(
+            captured_header(&headers, "user-agent"),
+            Some(ROUTER_USER_AGENT)
+        );
+        assert!(headers.get("x-local-ai-session").is_none());
+        assert_eq!(
+            captured_header(&headers, "authorization"),
+            Some("Bearer provider-key")
+        );
+    }
+
+    #[tokio::test]
+    async fn client_agent_identity_forwards_user_agent_and_falls_back_to_router() {
+        let (url, captured) = capturing_upstream().await;
+        let store = Store::memory().await.unwrap();
+        seed_cloud_provider(&store, "openai", AuthMode::ApiKey, url).await;
+        let secrets: Arc<dyn SecretStore> = Arc::new(MemorySecrets::default());
+        secrets.set(LOCAL_API_KEY, "local-key").unwrap();
+        let core = AppCore::new(store, secrets).unwrap();
+        core.migrate_legacy_local_api_key().await.unwrap();
+        core.save_provider_api_key("provider", "provider-key")
+            .unwrap();
+        let (key, token) = core
+            .create_local_api_key("Cursor", AgentIdentity::Client)
+            .await
+            .unwrap();
+        assert_eq!(key.agent_identity, AgentIdentity::Client);
+
+        let app = router(Arc::new(core));
+        let forwarded = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("authorization", format!("Bearer {token}"))
+                    .header("user-agent", "Cursor/1.0")
+                    .header("x-local-ai-session", "private-session")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"model":"assistant","messages":[{"role":"user","content":"hello"}]}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(forwarded.status(), StatusCode::OK);
+        let headers = captured.lock().unwrap().pop().unwrap();
+        assert_eq!(captured_header(&headers, "user-agent"), Some("Cursor/1.0"));
+        assert!(headers.get("x-local-ai-session").is_none());
+        assert_eq!(
+            captured_header(&headers, "authorization"),
+            Some("Bearer provider-key")
+        );
+
+        let fallback = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("authorization", format!("Bearer {token}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"model":"assistant","messages":[{"role":"user","content":"hello"}]}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(fallback.status(), StatusCode::OK);
+        let headers = captured.lock().unwrap().pop().unwrap();
+        assert_eq!(
+            captured_header(&headers, "user-agent"),
+            Some(ROUTER_USER_AGENT)
+        );
+    }
+
+    #[tokio::test]
+    async fn client_agent_identity_forwards_openrouter_title_and_openai_originator() {
+        let (openrouter_url, openrouter_captured) = capturing_upstream().await;
+        let store = Store::memory().await.unwrap();
+        seed_cloud_provider(&store, "openrouter", AuthMode::ApiKey, openrouter_url).await;
+        let secrets: Arc<dyn SecretStore> = Arc::new(MemorySecrets::default());
+        secrets.set(LOCAL_API_KEY, "local-key").unwrap();
+        let core = AppCore::new(store, secrets).unwrap();
+        core.migrate_legacy_local_api_key().await.unwrap();
+        core.save_provider_api_key("provider", "provider-key")
+            .unwrap();
+        let (_, token) = core
+            .create_local_api_key("Cursor", AgentIdentity::Client)
+            .await
+            .unwrap();
+        let response = router(Arc::new(core))
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("authorization", format!("Bearer {token}"))
+                    .header("user-agent", "Cursor/1.0")
+                    .header("x-title", "Cursor")
+                    .header("referer", "https://cursor.com")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"model":"assistant","messages":[{"role":"user","content":"hello"}]}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let headers = openrouter_captured.lock().unwrap().pop().unwrap();
+        assert_eq!(captured_header(&headers, "user-agent"), Some("Cursor/1.0"));
+        assert_eq!(captured_header(&headers, "x-title"), Some("Cursor"));
+        assert_eq!(
+            captured_header(&headers, "http-referer"),
+            Some("https://cursor.com")
+        );
+
+        let (subscription_url, subscription_captured) = capturing_upstream().await;
+        let store = Store::memory().await.unwrap();
+        seed_cloud_provider(
+            &store,
+            "openai_subscription",
+            AuthMode::OpenAiSubscription,
+            subscription_url,
+        )
+        .await;
+        let secrets: Arc<dyn SecretStore> = Arc::new(MemorySecrets::default());
+        secrets.set(LOCAL_API_KEY, "local-key").unwrap();
+        let credential = crate::oauth::SubscriptionCredential {
+            version: 1,
+            credential_type: "openai_subscription".into(),
+            access_token: "subscription-token".into(),
+            refresh_token: "refresh".into(),
+            expires_at: Utc::now() + chrono::TimeDelta::hours(1),
+            account_id: Some("acct_1".into()),
+        };
+        secrets
+            .set(
+                &crate::secrets::provider_account("provider"),
+                &serde_json::to_string(&credential).unwrap(),
+            )
+            .unwrap();
+        let core = AppCore::new(store, secrets).unwrap();
+        core.migrate_legacy_local_api_key().await.unwrap();
+        let (_, token) = core
+            .create_local_api_key("Codex", AgentIdentity::Client)
+            .await
+            .unwrap();
+        let response = router(Arc::new(core))
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("authorization", format!("Bearer {token}"))
+                    .header("originator", "codex_cli_rs")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"model":"assistant","messages":[{"role":"user","content":"hello"}]}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let headers = subscription_captured.lock().unwrap().pop().unwrap();
+        assert_eq!(
+            captured_header(&headers, "originator"),
+            Some("codex_cli_rs")
+        );
+        assert_eq!(
+            captured_header(&headers, "authorization"),
+            Some("Bearer subscription-token")
+        );
     }
 
     #[tokio::test]

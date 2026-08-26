@@ -111,6 +111,21 @@ pub struct ProviderModel {
     pub cache_write_price_per_million: Option<f64>,
 }
 
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentIdentity {
+    #[default]
+    Router,
+    Client,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalApiKeyAuth {
+    pub id: String,
+    pub token_hash: Vec<u8>,
+    pub agent_identity: AgentIdentity,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LocalApiKey {
     pub id: String,
@@ -118,6 +133,8 @@ pub struct LocalApiKey {
     pub created_at: DateTime<Utc>,
     pub last_used_at: Option<DateTime<Utc>>,
     pub revoked_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub agent_identity: AgentIdentity,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -315,7 +332,7 @@ impl Store {
             "CREATE TABLE IF NOT EXISTS route_targets (alias TEXT NOT NULL, target_id TEXT NOT NULL, priority INTEGER NOT NULL, kind TEXT NOT NULL DEFAULT 'cloud', model TEXT NOT NULL DEFAULT '', enabled INTEGER NOT NULL DEFAULT 1, role TEXT NOT NULL DEFAULT 'primary', PRIMARY KEY(alias, target_id), FOREIGN KEY(alias) REFERENCES routes(alias) ON DELETE CASCADE)",
             "CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
             "CREATE TABLE IF NOT EXISTS provider_models (provider_id TEXT NOT NULL, model_id TEXT NOT NULL, synced_at TEXT NOT NULL, wire_protocol TEXT NOT NULL DEFAULT 'open_ai_chat', capabilities TEXT NOT NULL DEFAULT '[\"chat\",\"streaming\"]', metadata TEXT NOT NULL DEFAULT '{}', PRIMARY KEY(provider_id, model_id), FOREIGN KEY(provider_id) REFERENCES providers(id) ON DELETE CASCADE)",
-            "CREATE TABLE IF NOT EXISTS local_api_keys (id TEXT PRIMARY KEY, name TEXT NOT NULL, token_hash BLOB NOT NULL, created_at TEXT NOT NULL, last_used_at TEXT, revoked_at TEXT)",
+            "CREATE TABLE IF NOT EXISTS local_api_keys (id TEXT PRIMARY KEY, name TEXT NOT NULL, token_hash BLOB NOT NULL, created_at TEXT NOT NULL, last_used_at TEXT, revoked_at TEXT, agent_identity TEXT NOT NULL DEFAULT 'router')",
             "CREATE TABLE IF NOT EXISTS request_logs (id TEXT PRIMARY KEY, created_at TEXT NOT NULL, endpoint TEXT NOT NULL, alias TEXT, target TEXT, attempts INTEGER NOT NULL, status INTEGER NOT NULL, latency_ms INTEGER NOT NULL, input_tokens INTEGER, output_tokens INTEGER, error_code TEXT, error_message TEXT)",
             "CREATE INDEX IF NOT EXISTS request_logs_created_idx ON request_logs(created_at DESC)",
             "CREATE INDEX IF NOT EXISTS local_api_keys_active_idx ON local_api_keys(revoked_at)",
@@ -561,6 +578,19 @@ impl Store {
         sqlx::query("CREATE INDEX IF NOT EXISTS request_logs_user_idx ON request_logs(directory_user_id, created_at DESC)")
             .execute(&self.pool)
             .await?;
+        let local_api_key_columns = sqlx::query("PRAGMA table_info(local_api_keys)")
+            .fetch_all(&self.pool)
+            .await?;
+        if !local_api_key_columns
+            .iter()
+            .any(|column| column.get::<String, _>("name") == "agent_identity")
+        {
+            sqlx::query(
+                "ALTER TABLE local_api_keys ADD COLUMN agent_identity TEXT NOT NULL DEFAULT 'router'",
+            )
+            .execute(&self.pool)
+            .await?;
+        }
         crate::identity::migrate(&self.pool).await?;
         crate::uplink::migrate(&self.pool).await?;
         crate::publish::migrate(&self.pool).await?;
@@ -1207,7 +1237,7 @@ impl Store {
     }
 
     pub async fn local_api_keys(&self) -> anyhow::Result<Vec<LocalApiKey>> {
-        let rows = sqlx::query("SELECT id,name,created_at,last_used_at,revoked_at FROM local_api_keys ORDER BY created_at, name")
+        let rows = sqlx::query("SELECT id,name,created_at,last_used_at,revoked_at,agent_identity FROM local_api_keys ORDER BY created_at, name")
             .fetch_all(&self.pool)
             .await?;
         rows.into_iter().map(row_to_local_api_key).collect()
@@ -1215,7 +1245,7 @@ impl Store {
 
     pub async fn local_api_key(&self, id: &str) -> anyhow::Result<Option<LocalApiKey>> {
         sqlx::query(
-            "SELECT id,name,created_at,last_used_at,revoked_at FROM local_api_keys WHERE id=?",
+            "SELECT id,name,created_at,last_used_at,revoked_at,agent_identity FROM local_api_keys WHERE id=?",
         )
         .bind(id)
         .fetch_optional(&self.pool)
@@ -1229,28 +1259,36 @@ impl Store {
         key: &LocalApiKey,
         token_hash: &[u8],
     ) -> anyhow::Result<()> {
-        sqlx::query("INSERT INTO local_api_keys(id,name,token_hash,created_at,last_used_at,revoked_at) VALUES(?,?,?,?,?,?)")
+        sqlx::query("INSERT INTO local_api_keys(id,name,token_hash,created_at,last_used_at,revoked_at,agent_identity) VALUES(?,?,?,?,?,?,?)")
             .bind(&key.id)
             .bind(&key.name)
             .bind(token_hash)
             .bind(key.created_at.to_rfc3339())
             .bind(key.last_used_at.map(|value| value.to_rfc3339()))
             .bind(key.revoked_at.map(|value| value.to_rfc3339()))
+            .bind(encode_agent_identity(key.agent_identity))
             .execute(&self.pool)
             .await?;
         Ok(())
     }
 
-    pub async fn active_local_api_key_hashes(&self) -> anyhow::Result<Vec<(String, Vec<u8>)>> {
+    pub async fn active_local_api_key_hashes(&self) -> anyhow::Result<Vec<LocalApiKeyAuth>> {
         let rows = sqlx::query(
-            "SELECT id,token_hash FROM local_api_keys WHERE revoked_at IS NULL ORDER BY id",
+            "SELECT id,token_hash,agent_identity FROM local_api_keys WHERE revoked_at IS NULL ORDER BY id",
         )
         .fetch_all(&self.pool)
         .await?;
-        Ok(rows
-            .into_iter()
-            .map(|row| (row.get("id"), row.get("token_hash")))
-            .collect())
+        rows.into_iter()
+            .map(|row| {
+                Ok(LocalApiKeyAuth {
+                    id: row.get("id"),
+                    token_hash: row.get("token_hash"),
+                    agent_identity: decode_agent_identity(
+                        row.get::<String, _>("agent_identity").as_str(),
+                    )?,
+                })
+            })
+            .collect()
     }
 
     pub async fn rename_local_api_key(&self, id: &str, name: &str) -> anyhow::Result<bool> {
@@ -1261,6 +1299,22 @@ impl Store {
             .await?
             .rows_affected()
             == 1)
+    }
+
+    pub async fn set_local_api_key_agent_identity(
+        &self,
+        id: &str,
+        agent_identity: AgentIdentity,
+    ) -> anyhow::Result<bool> {
+        Ok(
+            sqlx::query("UPDATE local_api_keys SET agent_identity=? WHERE id=?")
+                .bind(encode_agent_identity(agent_identity))
+                .bind(id)
+                .execute(&self.pool)
+                .await?
+                .rows_affected()
+                == 1,
+        )
     }
 
     pub async fn rotate_local_api_key(&self, id: &str, token_hash: &[u8]) -> anyhow::Result<bool> {
@@ -2115,6 +2169,7 @@ fn row_to_local_api_key(row: sqlx::sqlite::SqliteRow) -> anyhow::Result<LocalApi
             .get::<Option<String>, _>("revoked_at")
             .map(parse_timestamp)
             .transpose()?,
+        agent_identity: decode_agent_identity(row.get::<String, _>("agent_identity").as_str())?,
     })
 }
 
@@ -2327,6 +2382,20 @@ fn decode_auth_mode(value: &str) -> anyhow::Result<AuthMode> {
         "api_key" => Ok(AuthMode::ApiKey),
         "open_ai_subscription" => Ok(AuthMode::OpenAiSubscription),
         _ => anyhow::bail!("unknown auth mode {value}"),
+    }
+}
+
+fn encode_agent_identity(value: AgentIdentity) -> &'static str {
+    match value {
+        AgentIdentity::Router => "router",
+        AgentIdentity::Client => "client",
+    }
+}
+
+fn decode_agent_identity(value: &str) -> anyhow::Result<AgentIdentity> {
+    match value {
+        "client" => Ok(AgentIdentity::Client),
+        _ => Ok(AgentIdentity::Router),
     }
 }
 
@@ -2686,13 +2755,18 @@ mod tests {
             created_at: Utc::now(),
             last_used_at: None,
             revoked_at: None,
+            agent_identity: AgentIdentity::Router,
         };
         store.insert_local_api_key(&key, &[7; 32]).await.unwrap();
 
-        assert_eq!(store.local_api_keys().await.unwrap(), vec![key]);
+        assert_eq!(store.local_api_keys().await.unwrap(), vec![key.clone()]);
         assert_eq!(
             store.active_local_api_key_hashes().await.unwrap(),
-            vec![("client-one".into(), vec![7; 32])]
+            vec![LocalApiKeyAuth {
+                id: "client-one".into(),
+                token_hash: vec![7; 32],
+                agent_identity: AgentIdentity::Router,
+            }]
         );
 
         store
@@ -2796,6 +2870,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn local_api_key_agent_identity_defaults_to_router_and_can_be_updated() {
+        let store = Store::memory().await.unwrap();
+        let key = LocalApiKey {
+            id: "client-one".into(),
+            name: "Client one".into(),
+            created_at: Utc::now(),
+            last_used_at: None,
+            revoked_at: None,
+            agent_identity: AgentIdentity::Router,
+        };
+        store.insert_local_api_key(&key, &[7; 32]).await.unwrap();
+        assert_eq!(
+            store
+                .local_api_key("client-one")
+                .await
+                .unwrap()
+                .unwrap()
+                .agent_identity,
+            AgentIdentity::Router
+        );
+
+        assert!(store
+            .set_local_api_key_agent_identity("client-one", AgentIdentity::Client)
+            .await
+            .unwrap());
+        let updated = store.local_api_key("client-one").await.unwrap().unwrap();
+        assert_eq!(updated.agent_identity, AgentIdentity::Client);
+        assert_eq!(
+            store.active_local_api_key_hashes().await.unwrap()[0].agent_identity,
+            AgentIdentity::Client
+        );
+        assert!(!store
+            .set_local_api_key_agent_identity("missing", AgentIdentity::Client)
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
     async fn usage_periods_apply_cutoffs_and_hourly_or_daily_buckets() {
         let store = Store::memory().await.unwrap();
         let now = Utc.with_ymd_and_hms(2026, 8, 17, 12, 0, 0).unwrap();
@@ -2848,6 +2960,7 @@ mod tests {
             created_at: now,
             last_used_at: None,
             revoked_at: None,
+            agent_identity: AgentIdentity::Router,
         };
         store.insert_local_api_key(&key, &[7; 32]).await.unwrap();
         store
@@ -2858,6 +2971,7 @@ mod tests {
                     created_at: now,
                     last_used_at: None,
                     revoked_at: None,
+                    agent_identity: AgentIdentity::Router,
                 },
                 &[8; 32],
             )

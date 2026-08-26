@@ -140,6 +140,7 @@ pub fn run() {
             ipc::create_local_api_key,
             ipc::reveal_local_api_key,
             ipc::rename_local_api_key,
+            ipc::set_local_api_key_agent_identity,
             ipc::rotate_local_api_key,
             ipc::revoke_local_api_key,
             ipc::client_chat,
